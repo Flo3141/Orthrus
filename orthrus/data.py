@@ -187,7 +187,7 @@ class Interval(object):
         Return string representation of a transcript
         """
         return "Interval {}:{}-{}:{}".format(
-            self.chromosome, self.start, self.end, self.strand
+            self.chrom, self.start, self.end, self.strand
         )
 
     def overlaps(self, interval):
