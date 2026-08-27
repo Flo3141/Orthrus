@@ -1,0 +1,30 @@
+name: orthrus
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.10
+  - cython
+  - numpy=1.24
+  - pandas
+  - pyfaidx
+  - pytabix
+  - pyranges
+  - jupyter
+  - notebook
+  - tqdm
+  - seaborn
+  - scikit-learn
+  - pyyaml
+  - ninja
+  - packaging
+  - pip
+  - pip:
+      - torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+      - transformers
+      - lightning
+      - wandb
+      - genomekit
+      - causal-conv1d
+      - mamba-ssm
