@@ -26,7 +26,7 @@ with torch.no_grad():
     embedding = model.representation(x, lengths, channel_last=True)
     
     # Positionsspezifische Repräsentation (Unpooled)
-    unpooled = model.representation_unpooled(x, channel_last=True)
+    unpooled = model(x, channel_last=True)
 
 print("Inferenz erfolgreich!")
 print("Pooled Embedding Shape:  ", embedding.shape)  # z.B. (1, 256)
