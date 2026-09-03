@@ -6,3 +6,4 @@ orthrus/_sequence.cpython-310-x86_64-linux-gnu.so
 tests/__pycache__/
 build
 slurm/slurm_out
+__pycache__
