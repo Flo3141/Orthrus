@@ -3,6 +3,14 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import mrna_bench as mb
+
+DATA_DIR = "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench"
+Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+
+# 2. Pfad in mrna-bench registrieren
+mb.update_data_path(DATA_DIR)
+
+
 df_human = mb.load_dataset("rnahl-human").data_df
 df_mouse = mb.load_dataset("rnahl-mouse").data_df
 
