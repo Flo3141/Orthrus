@@ -101,7 +101,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./results",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/results/Orthrus/mRNABench",
         help="Ausgabeverzeichnis fuer Modelle, Metriken und Vorhersagen"
     )
     parser.add_argument(
