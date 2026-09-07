@@ -70,17 +70,13 @@ def load_saluki_npz(file_path: Path, target_col: str) -> dict:
         raise KeyError(f"'embeddings' nicht in NPZ gefunden. Vorhandene Keys: {available_keys}")
 
     # Zielvariable auswaehlen
-    if target_col in data:
-        targets = data[target_col]
-    elif target_col == "half_life_transformed" and "targets" in data:
-        targets = data["targets"]
-    elif target_col == "half_life" and "targets" in data:
-        targets = data["targets"]
-    else:
+    if target_col not in data:
         raise KeyError(
             f"Zielvariable '{target_col}' nicht im NPZ-Archiv vorhanden. "
             f"Verfuegbare Schluessel: {available_keys}"
         )
+
+    targets = data[target_col].astype(np.float32)
 
     # Gene-Spalte fuer Group-Split (bevorzugt hgnc_symbol, sonst ensembl_gene_id)
     if "hgnc_symbol" in data:
@@ -193,6 +189,12 @@ def main():
 
     print(f"Gueltige Proben: {len(y)}, Feature-Dimension: {X.shape[1]}")
     print(f"Anzahl eindeutiger Gene: {len(np.unique(genes))}")
+
+    if len(y) == 0:
+        raise ValueError(
+            f"Keine gueltigen Datenpunkte fuer Zielvariable '{args.target_col}' gefunden. "
+            f"Alle Werte sind NaN! Bitte ueberpruefen Sie die Embedding-Datei oder waehlen Sie --target_col half_life."
+        )
 
     # Split durchfuehren
     if args.split_type == "gene":

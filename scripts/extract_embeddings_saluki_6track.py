@@ -162,7 +162,7 @@ def main():
     parser.add_argument(
         "--data_path",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/saluki/saluki_ej_cds.txt",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/saluki/saluki_ej_cds_transformed.txt",
         help="Pfad zur Saluki Datendatei (tab-separiert)",
     )
     parser.add_argument(
@@ -206,6 +206,16 @@ def main():
     df = pd.read_csv(data_path, sep="\t")
     print(f"Geladene Zeilen: {len(df)}")
     print(f"Spalten: {list(df.columns)}")
+
+    # Sicherstellen, dass half_life_transformed existiert (falls mit Rohdatei saluki_ej_cds.txt aufgerufen)
+    if "half_life_transformed" not in df.columns and "half_life" in df.columns:
+        print("Spalte 'half_life_transformed' nicht vorhanden - berechne aus 'half_life' (Log + Z-Score)...")
+        y_raw = df["half_life"].astype(float)
+        y_log = np.log(y_raw + 0.1)
+        mu_log = float(y_log.mean())
+        sigma_log = float(y_log.std(ddof=1))
+        df["half_life_transformed"] = (y_log - mu_log) / sigma_log
+        print(f"Transformation berechnet: mu={mu_log:.4f}, sigma={sigma_log:.4f}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Verwende Geraet: {device}")
