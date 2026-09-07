@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
 Generierung von kontinuierlichen Trans-Faktor Dichte- und Affinitaets-Tracks (Strategie B)
-fuer den Saluki-Datensatz.
+fuer den Saluki-Datensatz mit inkrementeller Speicherung und O(log N) Vektorisierung.
 
 Kombiniert:
-1. GTF-SQLite-Datenbank (Homo_sapiens.GRCh38.108.gtf.db) fuer das genomische Exon-Mapping
+1. GTF-SQLite-Datenbank (Homo_sapiens.GRCh38.108.gtf.db via gffutils)
 2. TargetScan: miRNA-Bindungsaffinitaeten / Context++ Scores
 3. ENCODE eCLIP: Experimentelle RBP-Peak-Signalwerte
 
-Ergebnis:
-Erweitert die 6 Basis-Tracks (A, C, G, U, CDS, Splice) um 2 kontinuierliche
-Trans-Faktor-Tracks zu einem 8-kanaligen Track-Array der Form (L, 8) fuer jedes Transkript.
+Features:
+- Schnelle binäre Suche (np.searchsorted): Reduziert die Laufzeit drastisch
+- Inkrementelle Speicherung in Chunks (fortsetzbar bei Abbruch)
+- Automatisches Zusammenführen zur finalen NPZ-Datei
 """
 
 import argparse
@@ -23,7 +24,50 @@ from tqdm import tqdm
 
 
 # =============================================================================
-# 1. GTF SQLite Datenbank Zugriff & Koordinaten-Mapping (via gffutils)
+# 1. Schneller Intervall-Index (O(log N) Suche statt O(N) Schleife)
+# =============================================================================
+
+class FastIntervalIndex:
+    """
+    Indexiert genomische Peaks eines Chromosoms/Strangs fuer extrem schnelle
+    Overlap-Abfragen mittels sortierter NumPy-Arrays und np.searchsorted.
+    """
+    def __init__(self, intervals: list):
+        if not intervals:
+            self.empty = True
+            return
+        self.empty = False
+        intervals_sorted = sorted(intervals, key=lambda x: x[0])
+        self.starts = np.array([x[0] for x in intervals_sorted], dtype=np.int64)
+        self.ends = np.array([x[1] for x in intervals_sorted], dtype=np.int64)
+        self.scores = np.array([x[2] for x in intervals_sorted], dtype=np.float32)
+        self.max_peak_len = int(np.max(self.ends - self.starts)) if len(self.ends) > 0 else 500
+
+    def get_overlaps(self, ex_start: int, ex_end: int):
+        if self.empty:
+            return None, None, None
+
+        # Nur Peaks pruefen, deren Start <= ex_end und >= ex_start - max_peak_len liegt
+        left_idx = np.searchsorted(self.starts, ex_start - self.max_peak_len, side="left")
+        right_idx = np.searchsorted(self.starts, ex_end, side="right")
+
+        if left_idx >= right_idx:
+            return None, None, None
+
+        sub_starts = self.starts[left_idx:right_idx]
+        sub_ends = self.ends[left_idx:right_idx]
+        sub_scores = self.scores[left_idx:right_idx]
+
+        # Exakter Schnitt: Peak endet nach ex_start und beginnt vor ex_end
+        mask = (sub_ends >= ex_start) & (sub_starts <= ex_end)
+        if not np.any(mask):
+            return None, None, None
+
+        return sub_starts[mask], sub_ends[mask], sub_scores[mask]
+
+
+# =============================================================================
+# 2. GTF SQLite Datenbank Zugriff & Koordinaten-Mapping (via gffutils)
 # =============================================================================
 
 class GtfDbHelper:
@@ -45,7 +89,6 @@ class GtfDbHelper:
         """
         clean_id = transcript_id.split(".")[0]
 
-        # Suche Transkript nach ID (mit oder ohne Versionsnummer)
         tx = None
         for candidate in [transcript_id, clean_id]:
             try:
@@ -65,7 +108,6 @@ class GtfDbHelper:
         ]
 
         if strand == "-":
-            # Bei Minusstrang: 5' -> 3' entspricht absteigenden genomischen Koordinaten
             exons.reverse()
 
         return {"chrom": chrom, "strand": strand, "exons": exons}
@@ -74,46 +116,33 @@ class GtfDbHelper:
 def map_genomic_intervals_to_transcript(
     exons: list,
     strand: str,
-    peak_intervals: list,
+    peak_index: FastIntervalIndex,
     transcript_len: int,
 ) -> np.ndarray:
     """
-    Mappt genomische Peaks mit Werten (start, end, score) auf ein 1D-Signal der reifen mRNA.
-    
-    Args:
-        exons: Liste von (start, end) Tuplen in 5' -> 3' Reihenfolge.
-        strand: '+' oder '-'
-        peak_intervals: Liste von (p_start, p_end, score)
-        transcript_len: Gesamtlaenge der reifen mRNA
-    
-    Returns:
-        1D-Array der Laenge transcript_len mit kontinuierlichen Dichtewerten.
+    Mappt genomische Peaks hochperformant via Binärsuche auf die reife mRNA.
     """
     track = np.zeros(transcript_len, dtype=np.float32)
-    if not exons or not peak_intervals:
+    if not exons or peak_index.empty:
         return track
 
-    # Berechne relative Transkript-Offsets fuer jedes Exon
     curr_tx_pos = 0
     for ex_start, ex_end in exons:
         ex_len = ex_end - ex_start + 1
+        p_starts, p_ends, p_scores = peak_index.get_overlaps(ex_start, ex_end)
 
-        for p_start, p_end, score in peak_intervals:
-            # Pruefe Ueberlapp zwischen Exon und Peak
-            overlap_start = max(ex_start, p_start)
-            overlap_end = min(ex_end, p_end)
+        if p_starts is not None:
+            for p_start, p_end, score in zip(p_starts, p_ends, p_scores):
+                overlap_start = max(ex_start, int(p_start))
+                overlap_end = min(ex_end, int(p_end))
 
-            if overlap_start <= overlap_end:
                 if strand == "+":
-                    # Plusstrang: Start relativ zu ex_start
                     rel_start = curr_tx_pos + (overlap_start - ex_start)
                     rel_end = curr_tx_pos + (overlap_end - ex_start) + 1
                 else:
-                    # Minusstrang: Start relativ zu ex_end (umgekehrt)
                     rel_start = curr_tx_pos + (ex_end - overlap_end)
                     rel_end = curr_tx_pos + (ex_end - overlap_start) + 1
 
-                # Clamping gegen Rundungs-/Grenzfehler
                 rel_start = max(0, min(rel_start, transcript_len))
                 rel_end = max(0, min(rel_end, transcript_len))
 
@@ -126,16 +155,10 @@ def map_genomic_intervals_to_transcript(
 
 
 # =============================================================================
-# 2. Parser fuer die 3 externen Datenbanken
+# 3. Parser fuer TargetScan und ENCODE eCLIP
 # =============================================================================
 
 def load_targetscan_data(targetscan_path: Path) -> dict:
-    """
-    Laedt TargetScan miRNA-Vorhersagen.
-    Unterstuetzt 'Predicted_Targets_Context_Scores' oder 'Conserved_Site_Context_Scores'.
-    
-    Gibt ein Dict zurueck: {transcript_id: [(utr_start, utr_end, score), ...]}
-    """
     if not targetscan_path.exists():
         print(f"[Hinweis] TargetScan-Datei '{targetscan_path}' nicht gefunden.")
         return {}
@@ -143,7 +166,6 @@ def load_targetscan_data(targetscan_path: Path) -> dict:
     print(f"Lade TargetScan-Daten von: {targetscan_path}...")
     df_ts = pd.read_csv(targetscan_path, sep="\t", low_memory=False)
 
-    # Typische Spaltennamen identifizieren
     tx_col = next((c for c in df_ts.columns if "transcript" in c.lower()), None)
     score_col = next((c for c in df_ts.columns if "context" in c.lower() or "score" in c.lower()), None)
     start_col = next((c for c in df_ts.columns if "start" in c.lower()), None)
@@ -156,9 +178,7 @@ def load_targetscan_data(targetscan_path: Path) -> dict:
     mapping = {}
     for _, row in df_ts.iterrows():
         raw_tx = str(row[tx_col]).split(".")[0]
-        # Context++ Scores sind negativ; je negativer, desto staerker die Repression
         raw_score = float(row[score_col]) if score_col and pd.notnull(row[score_col]) else 1.0
-        # Positive Affinitaet: Absoluter Wert oder -score
         score = abs(raw_score)
 
         start = int(row[start_col]) if start_col and pd.notnull(row[start_col]) else 0
@@ -170,18 +190,16 @@ def load_targetscan_data(targetscan_path: Path) -> dict:
     return mapping
 
 
-def load_bed_intervals_by_chrom(bed_path: Path) -> dict:
+def load_eclip_indexed(bed_path: Path) -> dict:
     """
-    Laedt eine BED / narrowPeak-Datei (z. B. ENCODE eCLIP oder POSTAR3).
-    Gibt ein nach Chromosomen und Strand geschachteltes Dict zurueck:
-    { (chrom, strand): [(start, end, score), ...] }
+    Laedt ENCODE eCLIP Peaks und baut fuer jedes (chrom, strand) einen FastIntervalIndex auf.
     """
     if not bed_path.exists():
         print(f"[Hinweis] Datei '{bed_path}' nicht gefunden.")
         return {}
 
-    print(f"Lade BED-Intervalle von: {bed_path}...")
-    data = {}
+    print(f"Lade ENCODE eCLIP Intervalle von: {bed_path}...")
+    raw_data = {}
     with open(bed_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             if line.startswith("#") or line.startswith("track") or not line.strip():
@@ -194,8 +212,7 @@ def load_bed_intervals_by_chrom(bed_path: Path) -> dict:
             start = int(parts[1])
             end = int(parts[2])
             strand = parts[5] if len(parts) >= 6 and parts[5] in ["+", "-"] else "+"
-            
-            # Score: Falls narrowPeak (Spalte 7 signalValue) oder BED (Spalte 5 score)
+
             score = 1.0
             if len(parts) >= 7 and parts[6] not in [".", "-1"]:
                 try:
@@ -209,23 +226,23 @@ def load_bed_intervals_by_chrom(bed_path: Path) -> dict:
                     score = 1.0
 
             key = (chrom, strand)
-            data.setdefault(key, []).append((start, end, score))
+            raw_data.setdefault(key, []).append((start, end, score))
 
-    total_peaks = sum(len(v) for v in data.values())
-    print(f"BED-Loader: {total_peaks} Intervalle geladen fuer {bed_path.name}.")
-    return data
+    # Erstelle FastIntervalIndex pro Chromosom/Strand
+    indexed_data = {}
+    for key, intervals in raw_data.items():
+        indexed_data[key] = FastIntervalIndex(intervals)
+
+    total_peaks = sum(len(v) for v in raw_data.values())
+    print(f"eCLIP: {total_peaks} Peaks indiziert ueber {len(indexed_data)} (Chrom, Strand)-Kombinationen.")
+    return indexed_data
 
 
 # =============================================================================
-# 3. Saluki 6-Track Basis-Parser (A, C, G, U, CDS, Splice)
+# 4. Saluki 6-Track Basis-Parser
 # =============================================================================
 
 def parse_saluki_base_tracks(raw_seq: str) -> tuple:
-    """
-    Parst die kommagetrennte Saluki-Sequenz in die 6 Standard-Tracks:
-    Returns:
-        (six_track_array, seq_len, utr3_start_idx)
-    """
     tokens = [tok.strip() for tok in raw_seq.split(",") if tok.strip()]
     l = len(tokens)
     if l == 0:
@@ -233,23 +250,18 @@ def parse_saluki_base_tracks(raw_seq: str) -> tuple:
 
     clean_seq = "".join(tok[0] for tok in tokens)
 
-    # 4-Kanal One-Hot
     seq_bytes = np.frombuffer(clean_seq.upper().encode("ascii"), dtype=np.uint8)
     oh = np.zeros((l, 4), dtype=np.float32)
-    oh[seq_bytes == 65, 0] = 1.0  # A
-    oh[seq_bytes == 67, 1] = 1.0  # C
-    oh[seq_bytes == 71, 2] = 1.0  # G
-    oh[(seq_bytes == 84) | (seq_bytes == 85), 3] = 1.0  # T/U
+    oh[seq_bytes == 65, 0] = 1.0
+    oh[seq_bytes == 67, 1] = 1.0
+    oh[seq_bytes == 71, 2] = 1.0
+    oh[(seq_bytes == 84) | (seq_bytes == 85), 3] = 1.0
 
-    # CDS-Track: Grossbuchstaben markieren Frame-0 Codon-Starts
     cds_track = np.array([1.0 if tok[0].isupper() else 0.0 for tok in tokens], dtype=np.float32).reshape(-1, 1)
-
-    # Splice-Track: 'ej' markiert Exon-Junctions
     splice_track = np.array([1.0 if "ej" in tok.lower() else 0.0 for tok in tokens], dtype=np.float32).reshape(-1, 1)
 
     six_track = np.concatenate([oh, cds_track, splice_track], axis=1)
 
-    # Finde Beginn der 3' UTR (Position nach dem letzten Grossbuchstaben der CDS)
     upper_indices = [i for i, tok in enumerate(tokens) if tok[0].isupper()]
     utr3_start = (max(upper_indices) + 3) if upper_indices else 0
     utr3_start = min(utr3_start, l)
@@ -258,14 +270,96 @@ def parse_saluki_base_tracks(raw_seq: str) -> tuple:
 
 
 # =============================================================================
-# 4. Haupt-Pipeline: Multi-Track Extraktion
+# 5. Inkrementelles Chunking & Zusammenfuehrung
+# =============================================================================
+
+def save_chunk(chunk_idx: int, chunk_items: list, chunks_dir: Path):
+    """Speichert einen Block von Transkripten inkrementell als NPZ."""
+    chunk_file = chunks_dir / f"chunk_{chunk_idx:05d}.npz"
+    np.savez_compressed(
+        chunk_file,
+        tracks=np.array([item["track"] for item in chunk_items], dtype=object),
+        ensembl_transcript_id=np.array([item["transcript_id"] for item in chunk_items]),
+        ensembl_gene_id=np.array([item["gene_id"] for item in chunk_items]),
+        hgnc_symbol=np.array([item["gene_symbol"] for item in chunk_items]),
+        half_life_transformed=np.array([item["half_life_transformed"] for item in chunk_items], dtype=np.float32),
+        half_life=np.array([item["half_life"] for item in chunk_items], dtype=np.float32),
+        rate=np.array([item["rate"] for item in chunk_items], dtype=np.float32),
+        seq_lens=np.array([item["length"] for item in chunk_items], dtype=np.int32),
+        has_mirna=np.array([item["has_mirna"] for item in chunk_items], dtype=bool),
+        has_eclip=np.array([item["has_eclip"] for item in chunk_items], dtype=bool),
+        has_gtf=np.array([item["has_gtf"] for item in chunk_items], dtype=bool),
+    )
+
+
+def merge_all_chunks(chunks_dir: Path, output_file: Path):
+    """Fuehrt alle erzeugten Chunks zu der finalen Master-NPZ zusammen."""
+    chunk_files = sorted(chunks_dir.glob("chunk_*.npz"))
+    if not chunk_files:
+        print("[Fehler] Keine Chunks zum Zusammenfuehren gefunden!")
+        return
+
+    print(f"\nFühre {len(chunk_files)} Chunks zu {output_file} zusammen...")
+    all_tracks = []
+    tx_ids = []
+    gene_ids = []
+    gene_symbols = []
+    hl_trans = []
+    hl_raw = []
+    rates = []
+    lens = []
+    mirna_flags = []
+    eclip_flags = []
+    gtf_flags = []
+
+    for cf in tqdm(chunk_files, desc="Chunks mergen"):
+        data = np.load(cf, allow_pickle=True)
+        all_tracks.extend(data["tracks"])
+        tx_ids.extend(data["ensembl_transcript_id"])
+        gene_ids.extend(data["ensembl_gene_id"])
+        gene_symbols.extend(data["hgnc_symbol"])
+        hl_trans.extend(data["half_life_transformed"])
+        hl_raw.extend(data["half_life"])
+        rates.extend(data["rate"])
+        lens.extend(data["seq_lens"])
+        mirna_flags.extend(data["has_mirna"])
+        eclip_flags.extend(data["has_eclip"])
+        gtf_flags.extend(data["has_gtf"])
+
+    np.savez_compressed(
+        output_file,
+        tracks=np.array(all_tracks, dtype=object),
+        ensembl_transcript_id=np.array(tx_ids),
+        ensembl_gene_id=np.array(gene_ids),
+        hgnc_symbol=np.array(gene_symbols),
+        half_life_transformed=np.array(hl_trans, dtype=np.float32),
+        half_life=np.array(hl_raw, dtype=np.float32),
+        rate=np.array(rates, dtype=np.float32),
+        seq_lens=np.array(lens, dtype=np.int32),
+    )
+
+    n = len(tx_ids)
+    print("\n" + "=" * 65)
+    print("             COVERAGE & STATISTIK REPORT             ")
+    print("=" * 65)
+    print(f"Gesamtanzahl Transkripte:            {n}")
+    print(f"Erfolgreich in GTF-DB gemappt:       {sum(gtf_flags)} ({sum(gtf_flags)/n*100:.2f} %)")
+    print(f"Transkripte mit TargetScan miRNAs:   {sum(mirna_flags)} ({sum(mirna_flags)/n*100:.2f} %)")
+    print(f"Transkripte mit ENCODE eCLIP Peaks:  {sum(eclip_flags)} ({sum(eclip_flags)/n*100:.2f} %)")
+    print(f"Track-Dimensionen pro Transkript:    (L, 8)")
+    print(f"Kanalkonfiguration:                  [A, C, G, U, CDS, Splice, TargetScan, eCLIP]")
+    print(f"Finale Datei gespeichert:            {output_file}")
+    print("=" * 65)
+
+
+# =============================================================================
+# 6. Haupt-Pipeline
 # =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generiere kontinuierliche Trans-Faktor Dichte-Tracks (Strategie B) fuer Saluki"
+        description="Generiere kontinuierliche Trans-Faktor Dichte-Tracks fuer Saluki (mit Inkrementeller Speicherung)"
     )
-    # Eingabepfade
     parser.add_argument(
         "--saluki_data",
         type=str,
@@ -297,6 +391,12 @@ def main():
         help="Ausgabedatei fuer das erweiterte NPZ-Archiv",
     )
     parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=500,
+        help="Anzahl der Transkripte pro inkrementellem Speicher-Chunk (Standard: 500)",
+    )
+    parser.add_argument(
         "--max_length",
         type=int,
         default=12288,
@@ -307,113 +407,124 @@ def main():
     out_file = Path(args.output_file)
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
+    chunks_dir = out_file.parent / f"{out_file.stem}_chunks"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+
     print("=" * 75)
     print("   Generierung von Trans-Faktor Dichte-Tracks (TargetScan, ENCODE eCLIP)   ")
     print("=" * 75)
+    print(f"Ausgabedatei:       {out_file}")
+    print(f"Chunk-Verzeichnis:  {chunks_dir} (Chunk-Größe: {args.chunk_size})")
+
+    # Pruefen auf bereits verarbeitete Transkripte fuer nahtlose Wiederaufnahme (Resume)
+    completed_tx_ids = set()
+    existing_chunks = sorted(chunks_dir.glob("chunk_*.npz"))
+    for cf in existing_chunks:
+        try:
+            c_data = np.load(cf, allow_pickle=True)
+            completed_tx_ids.update(c_data["ensembl_transcript_id"])
+        except Exception:
+            continue
+
+    if completed_tx_ids:
+        print(f"[Resume] Bereits {len(completed_tx_ids)} fertige Transkripte in {len(existing_chunks)} Chunks gefunden!")
 
     # 1. Datenbanken & Lookup-Tabellen laden
     gtf_helper = GtfDbHelper(Path(args.gtf_db))
     ts_data = load_targetscan_data(Path(args.targetscan_file))
-    eclip_data = load_bed_intervals_by_chrom(Path(args.encode_eclip_file))
+    eclip_data = load_eclip_indexed(Path(args.encode_eclip_file))
 
     # 2. Saluki Datensatz laden
     saluki_path = Path(args.saluki_data)
     print(f"\nLade Saluki-Datensatz: {saluki_path}...")
     df = pd.read_csv(saluki_path, sep="\t")
-    print(f"Eintraege geladen: {len(df)}")
+    total_samples = len(df)
+    print(f"Gesamteintraege in Saluki: {total_samples}")
 
-    # 3. Iteration ueber alle Transkripte und Konstruktion der 8-Kanal-Tracks:
-    # Kanäle 0-3: A, C, G, U (One-Hot)
-    # Kanal 4:    CDS Track
-    # Kanal 5:    Splice Track
-    # Kanal 6:    miRNA Affinitaets-Track (TargetScan)
-    # Kanal 7:    ENCODE eCLIP RBP Dichte-Track
-    all_tracks = []
-    coverage_stats = {
-        "with_mirna": 0,
-        "with_eclip": 0,
-        "with_gtf_mapping": 0,
-    }
+    # Bestimme naechsten Chunk-Index
+    chunk_idx = len(existing_chunks)
+    current_chunk_items = []
 
-    print("\nGeneriere 8-Kanal Multitrack-Tensoren...")
-    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Transkripte verarbeiten"):
-        raw_seq = str(row["sequence"])
-        tx_id = str(row.get("ensembl_transcript_id", ""))
-        clean_tx = tx_id.split(".")[0]
+    print("\nVerarbeite Transkripte (mit schnellem O(log N) Lookup & Inkrementellem Speichern)...")
+    with tqdm(total=total_samples, desc="Fortschritt", initial=len(completed_tx_ids)) as pbar:
+        for idx, row in df.iterrows():
+            tx_id = str(row.get("ensembl_transcript_id", ""))
+            clean_tx = tx_id.split(".")[0]
 
-        # Basis 6-Tracks
-        six_track, l, utr3_start = parse_saluki_base_tracks(raw_seq)
-        if l > args.max_length:
-            six_track = six_track[:args.max_length, :]
-            l = args.max_length
+            # Bereits fertige Transkripte ueberspringen
+            if tx_id in completed_tx_ids or clean_tx in completed_tx_ids:
+                continue
 
-        # -----------------------------------------------------------------
-        # Kanal 6: TargetScan miRNA Track (kontinuierlich)
-        # -----------------------------------------------------------------
-        mirna_track = np.zeros((l, 1), dtype=np.float32)
-        if clean_tx in ts_data:
-            coverage_stats["with_mirna"] += 1
-            for start, end, score in ts_data[clean_tx]:
-                # Koordinaten in TargetScan sind relativ zum 3' UTR Start
-                abs_start = utr3_start + start
-                abs_end = utr3_start + end
-                if abs_start < l:
-                    clamped_end = min(abs_end, l)
-                    mirna_track[abs_start:clamped_end, 0] += score
+            raw_seq = str(row["sequence"])
 
-        # -----------------------------------------------------------------
-        # GTF Exon-Mapping fuer genomische RBP-Peaks (ENCODE eCLIP)
-        # -----------------------------------------------------------------
-        eclip_track = np.zeros((l, 1), dtype=np.float32)
+            # Basis 6-Tracks
+            six_track, l, utr3_start = parse_saluki_base_tracks(raw_seq)
+            if l > args.max_length:
+                six_track = six_track[:args.max_length, :]
+                l = args.max_length
 
-        tx_info = gtf_helper.get_transcript_exons(clean_tx)
-        if tx_info is not None:
-            coverage_stats["with_gtf_mapping"] += 1
-            chrom = str(tx_info["chrom"]).replace("chr", "")
-            strand = tx_info["strand"]
-            exons = tx_info["exons"]
-            key = (chrom, strand)
+            # Kanal 6: TargetScan miRNA
+            mirna_track = np.zeros((l, 1), dtype=np.float32)
+            has_mirna = False
+            if clean_tx in ts_data:
+                for start, end, score in ts_data[clean_tx]:
+                    abs_start = utr3_start + start
+                    abs_end = utr3_start + end
+                    if abs_start < l:
+                        clamped_end = min(abs_end, l)
+                        mirna_track[abs_start:clamped_end, 0] += score
+                        has_mirna = True
 
-            # Kanal 7: ENCODE eCLIP
-            if key in eclip_data:
-                eclip_1d = map_genomic_intervals_to_transcript(exons, strand, eclip_data[key], l)
-                if np.any(eclip_1d > 0):
-                    coverage_stats["with_eclip"] += 1
-                    eclip_track[:, 0] = eclip_1d
+            # Kanal 7: ENCODE eCLIP via schnellem Index
+            eclip_track = np.zeros((l, 1), dtype=np.float32)
+            has_eclip = False
+            has_gtf = False
 
-        # -----------------------------------------------------------------
-        # Zusammenfuegen zu (L, 8)
-        # -----------------------------------------------------------------
-        multi_track = np.concatenate([six_track, mirna_track, eclip_track], axis=1)
-        all_tracks.append(multi_track)
+            tx_info = gtf_helper.get_transcript_exons(clean_tx)
+            if tx_info is not None:
+                has_gtf = True
+                chrom = str(tx_info["chrom"]).replace("chr", "")
+                strand = tx_info["strand"]
+                exons = tx_info["exons"]
+                key = (chrom, strand)
 
-    # 4. Speichern im Ziel-Archiv
-    print(f"\nSpeichere Multitrack-Archiv nach: {out_file}...")
-    np.savez_compressed(
-        out_file,
-        tracks=np.array(all_tracks, dtype=object),
-        ensembl_transcript_id=df["ensembl_transcript_id"].values.astype(str),
-        ensembl_gene_id=df["ensembl_gene_id"].values.astype(str),
-        hgnc_symbol=df["hgnc_symbol"].values.astype(str),
-        half_life_transformed=df["half_life_transformed"].values.astype(np.float32) if "half_life_transformed" in df.columns else df["half_life"].values.astype(np.float32),
-        half_life=df["half_life"].values.astype(np.float32) if "half_life" in df.columns else np.nan,
-        rate=df["rate"].values.astype(np.float32) if "rate" in df.columns else np.nan,
-        seq_lens=np.array([t.shape[0] for t in all_tracks], dtype=np.int32),
-    )
+                if key in eclip_data:
+                    eclip_1d = map_genomic_intervals_to_transcript(exons, strand, eclip_data[key], l)
+                    if np.any(eclip_1d > 0):
+                        has_eclip = True
+                        eclip_track[:, 0] = eclip_1d
 
-    # 5. Zusammenfassung & Coverage Report
-    n = len(df)
-    print("\n" + "=" * 65)
-    print("             COVERAGE & STATISTIK REPORT             ")
-    print("=" * 65)
-    print(f"Gesamtanzahl Transkripte:            {n}")
-    print(f"Erfolgreich in GTF-DB gemappt:       {coverage_stats['with_gtf_mapping']} ({coverage_stats['with_gtf_mapping']/n*100:.2f} %)")
-    print(f"Transkripte mit TargetScan miRNAs:   {coverage_stats['with_mirna']} ({coverage_stats['with_mirna']/n*100:.2f} %)")
-    print(f"Transkripte mit ENCODE eCLIP Peaks:  {coverage_stats['with_eclip']} ({coverage_stats['with_eclip']/n*100:.2f} %)")
-    print(f"Track-Dimensionen pro Transkript:    (L, 8)")
-    print(f"Kanalkonfiguration:                  [A, C, G, U, CDS, Splice, TargetScan, eCLIP]")
-    print(f"Datei erfolgreich gespeichert:       {out_file}")
-    print("=" * 65)
+            # Zusammenfuegen zu (L, 8)
+            multi_track = np.concatenate([six_track, mirna_track, eclip_track], axis=1)
+
+            # Zu aktuellem Chunk hinzufuegen
+            current_chunk_items.append({
+                "track": multi_track,
+                "transcript_id": tx_id,
+                "gene_id": str(row.get("ensembl_gene_id", "")),
+                "gene_symbol": str(row.get("hgnc_symbol", "")),
+                "half_life_transformed": float(row.get("half_life_transformed", np.nan)),
+                "half_life": float(row.get("half_life", np.nan)),
+                "rate": float(row.get("rate", np.nan)),
+                "length": l,
+                "has_mirna": has_mirna,
+                "has_eclip": has_eclip,
+                "has_gtf": has_gtf,
+            })
+            pbar.update(1)
+
+            # Inkrementelles Speichern nach jeweils chunk_size Transkripten
+            if len(current_chunk_items) >= args.chunk_size:
+                save_chunk(chunk_idx, current_chunk_items, chunks_dir)
+                chunk_idx += 1
+                current_chunk_items = []
+
+        # Letzten unvollstaendigen Chunk speichern
+        if current_chunk_items:
+            save_chunk(chunk_idx, current_chunk_items, chunks_dir)
+
+    # 3. Alle Chunks zusammenfuehren zur finalen Datei
+    merge_all_chunks(chunks_dir, out_file)
 
 
 if __name__ == "__main__":
