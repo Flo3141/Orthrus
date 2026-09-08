@@ -449,6 +449,63 @@ def main():
     saluki_path = Path(args.saluki_data)
     print(f"\nLade Saluki-Datensatz: {saluki_path}...")
     df = pd.read_csv(saluki_path, sep="\t")
+
+        # =========================================================================
+    # TEST: Stop-Codon & UTR3-Übergang prüfen
+    # =========================================================================
+    STOP_CODONS = {"TAA", "TAG", "TGA", "UAA", "UAG", "UGA"}
+    
+    stop_in_uppercase = 0
+    stop_in_lowercase = 0
+    neither = 0
+    
+    print("\n--- Analysiere Stop-Codons im Saluki-Datensatz ---")
+    examples_shown = 0
+    
+    for idx, row in df.head(1000).iterrows():
+        raw_seq = str(row["sequence"])
+        tokens = [tok.strip() for tok in raw_seq.split(",") if tok.strip()]
+        chars = [tok[0] for tok in tokens]
+        
+        upper_indices = [i for i, c in enumerate(chars) if c.isupper()]
+        if not upper_indices:
+            continue  # Kein CDS vorhanden (z. B. lncRNA)
+            
+        last_idx = max(upper_indices)
+        
+        # Die letzten 3 Großbuchstaben
+        last_3_upper = "".join(chars[last_idx - 2 : last_idx + 1]).upper()
+        # Die ersten 3 Kleinbuchstaben direkt danach
+        first_3_lower = "".join(chars[last_idx + 1 : last_idx + 4]).upper()
+        
+        is_upper = last_3_upper in STOP_CODONS
+        is_lower = first_3_lower in STOP_CODONS
+        
+        if is_upper:
+            stop_in_uppercase += 1
+        elif is_lower:
+            stop_in_lowercase += 1
+        else:
+            neither += 1
+            
+        # Zeige die ersten 3 konkreten Beispiele
+        if examples_shown < 3 and (is_upper or is_lower):
+            context = "".join(chars[max(0, last_idx - 6) : min(len(chars), last_idx + 7)])
+            print(f"Beispiel {examples_shown + 1} (Tx: {row.get('ensembl_transcript_id', 'N/A')}):")
+            print(f"  Ausschnitt (CDS=GROSS, UTR=klein): ...{context}...")
+            print(f"  Letzte 3 CDS-Basen: '{last_3_upper}' -> Stop-Codon? {is_upper}")
+            print(f"  Erste 3 UTR-Basen:  '{first_3_lower}' -> Stop-Codon? {is_lower}\n")
+            examples_shown += 1
+
+    print("Ergebnis über die ersten 1000 Transkripte:")
+    print(f"  Stop-Codon GROSSGESCHRIEBEN (am Ende der CDS): {stop_in_uppercase}")
+    print(f"  Stop-Codon KLEINGESCHRIEBEN (am Anfang der UTR): {stop_in_lowercase}")
+    print(f"  Anderes / Unklar:                              {neither}")
+    print("=" * 60)
+    exit()
+    # =========================================================================
+
+
     total_samples = len(df)
     print(f"Gesamteintraege in Saluki: {total_samples}")
 
