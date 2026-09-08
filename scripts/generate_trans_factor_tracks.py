@@ -462,7 +462,7 @@ def main():
     print("\n--- Analysiere Stop-Codons im Saluki-Datensatz ---")
     examples_shown = 0
     
-    for idx, row in df.iterrows():
+    for idx, row in df.head(1000).iterrows():
         raw_seq = str(row["sequence"])
         tokens = [tok.strip() for tok in raw_seq.split(",") if tok.strip()]
         chars = [tok[0] for tok in tokens]
@@ -470,7 +470,10 @@ def main():
         if not upper_indices:
             continue  # Kein CDS vorhanden (z. B. lncRNA)
         last_idx = max(upper_indices)
-        
+        print(tokens[last_idx-2:last_idx+5])
+        print(tokens[min(upper_indices)-2:max(upper_indices)+1])
+        exit()
+
         # Die letzten 3 Großbuchstaben
         last_3_upper = "".join(chars[last_idx - 2 : last_idx + 1]).upper()
         # Die ersten 3 Kleinbuchstaben direkt danach
