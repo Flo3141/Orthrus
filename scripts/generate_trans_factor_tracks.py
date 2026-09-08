@@ -168,25 +168,29 @@ def load_targetscan_data(targetscan_path: Path) -> dict:
     df_ts = pd.read_csv(targetscan_path, sep="\t", low_memory=False)
     pd.set_option('display.max_columns', None)
     print(df_ts.columns)
-    print(df_ts.head(5))
+    print(min(df_ts["UTR_start"]))
+    print(max(df_ts["UTR_start"]))
+    print(min(df_ts["UTR end"]))
+    print(max(df_ts["UTR end"]))
     exit()
-    tx_col = next((c for c in df_ts.columns if "transcript" in c.lower()), None)
-    score_col = next((c for c in df_ts.columns if "context" in c.lower() or "score" in c.lower()), None)
-    start_col = next((c for c in df_ts.columns if "start" in c.lower()), None)
-    end_col = next((c for c in df_ts.columns if "end" in c.lower()), None)
-
-    if not tx_col:
-        print("[Warnung] Keine Transkript-Spalte in TargetScan gefunden.")
-        return {}
+    tx_col = "Transcript ID"
+    score_col = "weighted context++ score"
+    # Die beiden sind nicht gleich genamed
+    start_col = "UTR_start"
+    end_col = "UTR end"
+    # Ungültige Zeilen ohne Start, End oder Score entfernen
+    df_ts = df_ts.dropna(subset=[tx_col, start_col, end_col, score_col])
 
     mapping = {}
     for _, row in df_ts.iterrows():
         raw_tx = str(row[tx_col]).split(".")[0]
-        raw_score = float(row[score_col]) if score_col and pd.notnull(row[score_col]) else 1.0
-        score = abs(raw_score)
+        score = abs(float(row[score_col]))
 
-        start = int(row[start_col]) if start_col and pd.notnull(row[start_col]) else 0
-        end = int(row[end_col]) if end_col and pd.notnull(row[end_col]) else start + 7
+        start = int(row[start_col])
+        end = int(row[end_col])
+
+        if start >= end:
+            continue
 
         mapping.setdefault(raw_tx, []).append((start, end, score))
 
