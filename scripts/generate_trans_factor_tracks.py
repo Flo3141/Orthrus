@@ -340,6 +340,9 @@ def merge_all_chunks(chunks_dir: Path, output_file: Path):
         half_life=np.array(hl_raw, dtype=np.float32),
         rate=np.array(rates, dtype=np.float32),
         seq_lens=np.array(lens, dtype=np.int32),
+        has_mirna=np.array(mirna_flags, dtype=bool),
+        has_eclip=np.array(eclip_flags, dtype=bool),
+        has_gtf=np.array(gtf_flags, dtype=bool),
     )
 
     n = len(tx_ids)
