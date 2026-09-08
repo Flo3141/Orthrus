@@ -166,6 +166,7 @@ def load_targetscan_data(targetscan_path: Path) -> dict:
 
     print(f"Lade TargetScan-Daten von: {targetscan_path}...")
     df_ts = pd.read_csv(targetscan_path, sep="\t", low_memory=False)
+    pd.set_option('display.max_columns', None)
     print(df_ts.columns)
     print(df_ts.head(5))
     exit()
