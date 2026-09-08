@@ -166,13 +166,6 @@ def load_targetscan_data(targetscan_path: Path) -> dict:
 
     print(f"Lade TargetScan-Daten von: {targetscan_path}...")
     df_ts = pd.read_csv(targetscan_path, sep="\t", low_memory=False)
-    pd.set_option('display.max_columns', None)
-    print(df_ts.columns)
-    print(min(df_ts["UTR_start"]))
-    print(max(df_ts["UTR_start"]))
-    print(min(df_ts["UTR end"]))
-    print(max(df_ts["UTR end"]))
-    exit()
     tx_col = "Transcript ID"
     score_col = "weighted context++ score"
     # Die beiden sind nicht gleich genamed
@@ -210,15 +203,16 @@ def load_eclip_indexed(bed_path: Path) -> dict:
     raw_data = {}
     with open(bed_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
+            print(line)
             if line.startswith("#") or line.startswith("track") or not line.strip():
                 continue
             parts = line.strip().split("\t")
             if len(parts) < 3:
                 continue
-
+            exit()
             chrom = parts[0].replace("chr", "")
-            start = int(parts[1])
-            end = int(parts[2])
+            start = int(parts[1]) + 1   # BED 0-basiert -> 1-basiert (wie GTF)
+            end = int(parts[2])         # BED end ist bereits exklusiv, entspricht also 1-basiert inklusiv
             strand = parts[5] if len(parts) >= 6 and parts[5] in ["+", "-"] else "+"
 
             score = 1.0
@@ -476,7 +470,7 @@ def main():
             has_mirna = False
             if clean_tx in ts_data:
                 for start, end, score in ts_data[clean_tx]:
-                    abs_start = utr3_start + start
+                    abs_start = utr3_start + (start - 1)
                     abs_end = utr3_start + end
                     if abs_start < l:
                         clamped_end = min(abs_end, l)
