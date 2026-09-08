@@ -471,14 +471,15 @@ def main():
             continue  # Kein CDS vorhanden (z. B. lncRNA)
         last_idx = max(upper_indices)
         print(tokens[last_idx-2:last_idx+5])
-        print(tokens[min(upper_indices)-2:max(upper_indices)+1])
-        exit()
+        print(tokens[min(upper_indices)-2:max(upper_indices)+5])
 
         # Die letzten 3 Großbuchstaben
         last_3_upper = "".join(chars[last_idx - 2 : last_idx + 1]).upper()
         # Die ersten 3 Kleinbuchstaben direkt danach
         first_3_lower = "".join(chars[last_idx + 1 : last_idx + 4]).upper()
-        
+        print(last_3_upper)
+        print(first_3_lower)
+        exit()  
         is_upper = last_3_upper in STOP_CODONS
         is_lower = first_3_lower in STOP_CODONS
         
