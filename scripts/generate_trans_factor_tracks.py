@@ -14,6 +14,7 @@ Features:
 - Automatisches Zusammenführen zur finalen NPZ-Datei
 """
 
+from pandas._libs import properties
 import argparse
 import os
 from pathlib import Path
@@ -165,7 +166,9 @@ def load_targetscan_data(targetscan_path: Path) -> dict:
 
     print(f"Lade TargetScan-Daten von: {targetscan_path}...")
     df_ts = pd.read_csv(targetscan_path, sep="\t", low_memory=False)
-
+    print(df_ts.columns)
+    print(df_ts.head(5))
+    exit()
     tx_col = next((c for c in df_ts.columns if "transcript" in c.lower()), None)
     score_col = next((c for c in df_ts.columns if "context" in c.lower() or "score" in c.lower()), None)
     start_col = next((c for c in df_ts.columns if "start" in c.lower()), None)
