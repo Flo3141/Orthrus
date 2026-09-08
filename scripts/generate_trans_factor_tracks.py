@@ -442,8 +442,8 @@ def main():
 
     # 1. Datenbanken & Lookup-Tabellen laden
     gtf_helper = GtfDbHelper(Path(args.gtf_db))
-    ts_data = load_targetscan_data(Path(args.targetscan_file))
-    eclip_data = load_eclip_indexed(Path(args.encode_eclip_file))
+    # ts_data = load_targetscan_data(Path(args.targetscan_file))
+    # eclip_data = load_eclip_indexed(Path(args.encode_eclip_file))
 
     # 2. Saluki Datensatz laden
     saluki_path = Path(args.saluki_data)
