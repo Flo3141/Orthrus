@@ -466,7 +466,9 @@ def main():
         raw_seq = str(row["sequence"])
         tokens = [tok.strip() for tok in raw_seq.split(",") if tok.strip()]
         chars = [tok[0] for tok in tokens]
-        
+        print(tokens)
+        print(chars)
+        exit()
         upper_indices = [i for i, c in enumerate(chars) if c.isupper()]
         if not upper_indices:
             continue  # Kein CDS vorhanden (z. B. lncRNA)
