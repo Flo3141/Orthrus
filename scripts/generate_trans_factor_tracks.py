@@ -203,29 +203,33 @@ def load_eclip_indexed(bed_path: Path) -> dict:
     raw_data = {}
     with open(bed_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
-            print(line)
             if line.startswith("#") or line.startswith("track") or not line.strip():
                 continue
             parts = line.strip().split("\t")
-            if len(parts) < 3:
+            if len(parts) < 7:
                 continue
-            exit()
-            chrom = parts[0].replace("chr", "")
-            start = int(parts[1]) + 1   # BED 0-basiert -> 1-basiert (wie GTF)
-            end = int(parts[2])         # BED end ist bereits exklusiv, entspricht also 1-basiert inklusiv
-            strand = parts[5] if len(parts) >= 6 and parts[5] in ["+", "-"] else "+"
 
-            score = 1.0
-            if len(parts) >= 7 and parts[6] not in [".", "-1"]:
-                try:
-                    score = float(parts[6])
-                except ValueError:
-                    score = 1.0
-            elif len(parts) >= 5 and parts[4] not in [".", "-1"]:
-                try:
-                    score = float(parts[4])
-                except ValueError:
-                    score = 1.0
+            chrom = parts[0].replace("chr", "")
+            try:
+                start = int(parts[1]) + 1   # BED 0-basiert -> 1-basiert (wie GTF)
+                end = int(parts[2])         # BED end ist bereits exklusiv, entspricht also 1-basiert inklusiv
+            except ValueError:
+                continue
+
+            if start >= end:
+                continue
+
+            strand = parts[5]
+            if strand not in ["+", "-"]:
+                continue
+
+            # SignalValue (parts[6]) muss vorhanden und eine gültige Zahl sein (kein Fallback)
+            if parts[6] in [".", "-1", "nan", "NaN", ""]:
+                continue
+            try:
+                score = float(parts[6])
+            except ValueError:
+                continue
 
             key = (chrom, strand)
             raw_data.setdefault(key, []).append((start, end, score))
@@ -246,6 +250,11 @@ def load_eclip_indexed(bed_path: Path) -> dict:
 
 def parse_saluki_base_tracks(raw_seq: str) -> tuple:
     tokens = [tok.strip() for tok in raw_seq.split(",") if tok.strip()]
+    upper_indices = [i for i, tok in enumerate(tokens) if tok[0].isupper()]
+    last_idx = max(upper_indices)
+    print("Letzte CDS-Basen:", "".join(tok[0] for tok in tokens[last_idx-5:last_idx+1]))
+    print("Folgende Basen:", "".join(tok[0] for tok in tokens[last_idx+1:last_idx+7]))
+    exit()
     l = len(tokens)
     if l == 0:
         return np.zeros((0, 6), dtype=np.float32), 0, 0
