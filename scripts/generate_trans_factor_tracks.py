@@ -161,8 +161,7 @@ def map_genomic_intervals_to_transcript(
 
 def load_targetscan_data(targetscan_path: Path) -> dict:
     if not targetscan_path.exists():
-        print(f"[Hinweis] TargetScan-Datei '{targetscan_path}' nicht gefunden.")
-        return {}
+        raise FileNotFoundError(f"TargetScan-Datei '{targetscan_path}' nicht gefunden.")
 
     print(f"Lade TargetScan-Daten von: {targetscan_path}...")
     df_ts = pd.read_csv(targetscan_path, sep="\t", low_memory=False)
@@ -196,8 +195,7 @@ def load_eclip_indexed(bed_path: Path) -> dict:
     Laedt ENCODE eCLIP Peaks und baut fuer jedes (chrom, strand) einen FastIntervalIndex auf.
     """
     if not bed_path.exists():
-        print(f"[Hinweis] Datei '{bed_path}' nicht gefunden.")
-        return {}
+        raise FileNotFoundError(f"ENCODE eCLIP Datei '{bed_path}' nicht gefunden.")
 
     print(f"Lade ENCODE eCLIP Intervalle von: {bed_path}...")
     raw_data = {}
@@ -250,14 +248,9 @@ def load_eclip_indexed(bed_path: Path) -> dict:
 
 def parse_saluki_base_tracks(raw_seq: str) -> tuple:
     tokens = [tok.strip() for tok in raw_seq.split(",") if tok.strip()]
-    upper_indices = [i for i, tok in enumerate(tokens) if tok[0].isupper()]
-    last_idx = max(upper_indices)
-    print("Letzte CDS-Basen:", "".join(tok[0] for tok in tokens[last_idx-5:last_idx+1]))
-    print("Folgende Basen:", "".join(tok[0] for tok in tokens[last_idx+1:last_idx+7]))
-    exit()
     l = len(tokens)
     if l == 0:
-        return np.zeros((0, 6), dtype=np.float32), 0, 0
+        return np.zeros((0, 6), dtype=np.float32), 0, 0, []
 
     clean_seq = "".join(tok[0] for tok in tokens)
 
@@ -277,7 +270,7 @@ def parse_saluki_base_tracks(raw_seq: str) -> tuple:
     utr3_start = (max(upper_indices) + 3) if upper_indices else 0
     utr3_start = min(utr3_start, l)
 
-    return six_track, l, utr3_start
+    return six_track, l, utr3_start, upper_indices
 
 
 # =============================================================================
@@ -413,6 +406,11 @@ def main():
         default=12288,
         help="Maximale Sequenzlaenge (Standard: 12288 bp)",
     )
+    parser.add_argument(
+        "--recreate",
+        action="store_true",
+        help="Erzwingt das Neugenerieren aller Chunks und ueberschreibt/loescht bestehende Chunks.",
+    )
     args = parser.parse_args()
 
     out_file = Path(args.output_file)
@@ -427,86 +425,38 @@ def main():
     print(f"Ausgabedatei:       {out_file}")
     print(f"Chunk-Verzeichnis:  {chunks_dir} (Chunk-Größe: {args.chunk_size})")
 
-    # Pruefen auf bereits verarbeitete Transkripte fuer nahtlose Wiederaufnahme (Resume)
+    # Pruefen auf bereits verarbeitete Transkripte fuer nahtlose Wiederaufnahme (Resume) oder Recreate
     completed_tx_ids = set()
     existing_chunks = sorted(chunks_dir.glob("chunk_*.npz"))
-    for cf in existing_chunks:
-        try:
-            c_data = np.load(cf, allow_pickle=True)
-            completed_tx_ids.update(c_data["ensembl_transcript_id"])
-        except Exception:
-            continue
 
-    if completed_tx_ids:
-        print(f"[Resume] Bereits {len(completed_tx_ids)} fertige Transkripte in {len(existing_chunks)} Chunks gefunden!")
+    if args.recreate:
+        print(f"[Recreate] Flag --recreate aktiv: Entferne {len(existing_chunks)} existierende Chunks für vollständigen Neustart...")
+        for cf in existing_chunks:
+            try:
+                cf.unlink()
+            except Exception as e:
+                print(f"[Warnung] Konnte {cf.name} nicht löschen: {e}")
+        existing_chunks = []
+    else:
+        for cf in existing_chunks:
+            try:
+                c_data = np.load(cf, allow_pickle=True)
+                completed_tx_ids.update(c_data["ensembl_transcript_id"])
+            except Exception:
+                continue
+
+        if completed_tx_ids:
+            print(f"[Resume] Bereits {len(completed_tx_ids)} fertige Transkripte in {len(existing_chunks)} Chunks gefunden!")
 
     # 1. Datenbanken & Lookup-Tabellen laden
     gtf_helper = GtfDbHelper(Path(args.gtf_db))
-    # ts_data = load_targetscan_data(Path(args.targetscan_file))
-    # eclip_data = load_eclip_indexed(Path(args.encode_eclip_file))
+    ts_data = load_targetscan_data(Path(args.targetscan_file))
+    eclip_data = load_eclip_indexed(Path(args.encode_eclip_file))
 
     # 2. Saluki Datensatz laden
     saluki_path = Path(args.saluki_data)
     print(f"\nLade Saluki-Datensatz: {saluki_path}...")
     df = pd.read_csv(saluki_path, sep="\t")
-
-        # =========================================================================
-    # TEST: Stop-Codon & UTR3-Übergang prüfen
-    # =========================================================================
-    STOP_CODONS = {"TAA", "TAG", "TGA", "UAA", "UAG", "UGA"}
-    
-    stop_in_uppercase = 0
-    stop_in_lowercase = 0
-    neither = 0
-    
-    print("\n--- Analysiere Stop-Codons im Saluki-Datensatz ---")
-    examples_shown = 0
-    
-    for idx, row in df.head(1000).iterrows():
-        raw_seq = str(row["sequence"])
-        tokens = [tok.strip() for tok in raw_seq.split(",") if tok.strip()]
-        chars = [tok[0] for tok in tokens]
-        upper_indices = [i for i, c in enumerate(chars) if c.isupper()]
-        if not upper_indices:
-            continue  # Kein CDS vorhanden (z. B. lncRNA)
-        last_idx = max(upper_indices)
-        print(tokens[last_idx-2:last_idx+5])
-        print(tokens[min(upper_indices)-2:max(upper_indices)+5])
-
-        # Die letzten 3 Großbuchstaben
-        last_3_upper = "".join(chars[last_idx - 2 : last_idx + 1]).upper()
-        # Die ersten 3 Kleinbuchstaben direkt danach
-        first_3_lower = "".join(chars[last_idx + 1 : last_idx + 4]).upper()
-        print(last_3_upper)
-        print(first_3_lower)
-        exit()  
-        is_upper = last_3_upper in STOP_CODONS
-        is_lower = first_3_lower in STOP_CODONS
-        
-        if is_upper:
-            stop_in_uppercase += 1
-        elif is_lower:
-            stop_in_lowercase += 1
-        else:
-            neither += 1
-            
-        # Zeige die ersten 3 konkreten Beispiele
-        if examples_shown < 3 and (is_upper or is_lower):
-            context = "".join(chars[max(0, last_idx - 6) : min(len(chars), last_idx + 7)])
-            print(f"Beispiel {examples_shown + 1} (Tx: {row.get('ensembl_transcript_id', 'N/A')}):")
-            print(f"  Ausschnitt (CDS=GROSS, UTR=klein): ...{context}...")
-            print(f"  Letzte 3 CDS-Basen: '{last_3_upper}' -> Stop-Codon? {is_upper}")
-            print(f"  Erste 3 UTR-Basen:  '{first_3_lower}' -> Stop-Codon? {is_lower}\n")
-            examples_shown += 1
-
-    print("Ergebnis über die ersten 1000 Transkripte:")
-    print(f"  Stop-Codon GROSSGESCHRIEBEN (am Ende der CDS): {stop_in_uppercase}")
-    print(f"  Stop-Codon KLEINGESCHRIEBEN (am Anfang der UTR): {stop_in_lowercase}")
-    print(f"  Anderes / Unklar:                              {neither}")
-    print("=" * 60)
-    exit()
-    # =========================================================================
-
 
     total_samples = len(df)
     print(f"Gesamteintraege in Saluki: {total_samples}")
@@ -528,7 +478,7 @@ def main():
             raw_seq = str(row["sequence"])
 
             # Basis 6-Tracks
-            six_track, l, utr3_start = parse_saluki_base_tracks(raw_seq)
+            six_track, l, utr3_start, upper_indices = parse_saluki_base_tracks(raw_seq)
             if l > args.max_length:
                 six_track = six_track[:args.max_length, :]
                 l = args.max_length
@@ -536,7 +486,7 @@ def main():
             # Kanal 6: TargetScan miRNA
             mirna_track = np.zeros((l, 1), dtype=np.float32)
             has_mirna = False
-            if clean_tx in ts_data:
+            if clean_tx in ts_data and upper_indices:
                 for start, end, score in ts_data[clean_tx]:
                     abs_start = utr3_start + (start - 1)
                     abs_end = utr3_start + end
