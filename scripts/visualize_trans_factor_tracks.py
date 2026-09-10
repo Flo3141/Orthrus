@@ -102,19 +102,25 @@ def load_candidates_from_npz(input_path: Path, target_tx_id: str = None, max_can
                         p_start = pos
                     elif score == 0 and in_peak:
                         in_peak = False
+                        peak_scores = ts_track[p_start:pos]
                         ts_intervals.append({
                             "start": p_start,
                             "end": pos,
-                            "score": round(float(ts_track[p_start]), 4),
+                            "max_score": round(float(np.max(peak_scores)), 4),
+                            "mean_score": round(float(np.mean(peak_scores)), 4),
+                            "score": round(float(np.max(peak_scores)), 4),
                             "length": pos - p_start,
                             "rel_utr_start": p_start - utr3_start if utr3_start else None,
                             "rel_utr_end": pos - utr3_start if utr3_start else None,
                         })
                 if in_peak:
+                    peak_scores = ts_track[p_start:l]
                     ts_intervals.append({
                         "start": p_start,
                         "end": l,
-                        "score": round(float(ts_track[p_start]), 4),
+                        "max_score": round(float(np.max(peak_scores)), 4),
+                        "mean_score": round(float(np.mean(peak_scores)), 4),
+                        "score": round(float(np.max(peak_scores)), 4),
                         "length": l - p_start,
                         "rel_utr_start": p_start - utr3_start if utr3_start else None,
                         "rel_utr_end": l - utr3_start if utr3_start else None,
@@ -678,7 +684,7 @@ def generate_html_viewer(candidates: list, output_html_path: Path):
                 tsUtrCheckEl.style.color = "#f87171";
             }}
 
-            const maxTsScore = c.ts_intervals.length > 0 ? Math.max(...c.ts_intervals.map(t => t.score)) : 0;
+            const maxTsScore = c.ts_intervals.length > 0 ? Math.max(...c.ts_intervals.map(t => t.max_score || t.score)) : 0;
             document.getElementById("infoTsMaxScore").textContent = maxTsScore.toFixed(4);
             document.getElementById("infoTsFirst").textContent = c.ts_intervals.length > 0 ? `Pos ${{c.ts_intervals[0].start}}..${{c.ts_intervals[0].end}}` : "Keine";
 
@@ -701,7 +707,8 @@ def generate_html_viewer(candidates: list, output_html_path: Path):
                 navEl.innerHTML += `<button class="nav-btn" style="border-color: var(--color-u);" onclick="scrollToPos(${{c.last_upper}})">🛑 Stop-Codon (${{c.last_upper}})</button>`;
             }}
             c.ts_intervals.forEach((ts, i) => {{
-                navEl.innerHTML += `<button class="nav-btn" style="border-color: var(--color-ts); color: var(--color-ts);" onclick="scrollToPos(${{ts.start}})">🎯 TargetScan #${{i+1}} (${{ts.start}})</button>`;
+                const sInfo = ts.max_score !== undefined ? `Max: ${{ts.max_score}}` : ts.score;
+                navEl.innerHTML += `<button class="nav-btn" style="border-color: var(--color-ts); color: var(--color-ts);" onclick="scrollToPos(${{ts.start}})">🎯 TargetScan #${{i+1}} (${{ts.start}}, ${{sInfo}})</button>`;
             }});
             c.eclip_intervals.forEach((ec, i) => {{
                 navEl.innerHTML += `<button class="nav-btn" style="border-color: var(--color-eclip); color: var(--color-eclip);" onclick="scrollToPos(${{ec.start}})">⚡ eCLIP #${{i+1}} (${{ec.start}})</button>`;
@@ -804,22 +811,6 @@ def generate_html_viewer(candidates: list, output_html_path: Path):
             const frag = document.createDocumentFragment();
             const seq = c.sequence;
             const l = c.length;
-
-            // Set fuer schnellen Lookup
-            const tsMap = new Map();
-            c.ts_intervals.forEach(ts => {{
-                for (let pos = ts.start; pos < ts.end; pos++) {{
-                    tsMap.set(pos, ts.score);
-                }}
-            }});
-
-            const eclipMap = new Map();
-            c.eclip_intervals.forEach(ec => {{
-                for (let pos = ec.start; pos < ec.end; pos++) {{
-                    eclipMap.set(pos, ec.max_score);
-                }}
-            }});
-
             const spliceSet = new Set(c.splice_indices);
 
             for (let i = 0; i < l; i++) {{
@@ -828,8 +819,10 @@ def generate_html_viewer(candidates: list, output_html_path: Path):
                 cell.id = `nt_${{i}}`;
                 cell.className = "nucleotide-cell";
 
-                const isTs = tsMap.has(i);
-                const isEclip = eclipMap.has(i);
+                const tsVal = (c.ts_track && c.ts_track[i] !== undefined) ? c.ts_track[i] : 0;
+                const eclipVal = (c.eclip_track && c.eclip_track[i] !== undefined) ? c.eclip_track[i] : 0;
+                const isTs = tsVal > 0;
+                const isEclip = eclipVal > 0;
                 const isStop = (c.last_upper !== null && i >= c.last_upper && i < c.last_upper + 3);
 
                 if (isTs && isEclip) cell.classList.add("cell-both");
@@ -850,8 +843,8 @@ def generate_html_viewer(candidates: list, output_html_path: Path):
                     </div>
                 `;
 
-                // Hover Tooltip
-                cell.onmouseenter = (e) => showTooltip(e, i, nt, c, tsMap.get(i), eclipMap.get(i), spliceSet.has(i));
+                // Hover Tooltip: Zeigt den tatsächlichen basengenaue Score
+                cell.onmouseenter = (e) => showTooltip(e, i, nt, c, isTs ? tsVal : undefined, isEclip ? eclipVal : undefined, spliceSet.has(i));
                 cell.onmouseleave = hideTooltip;
 
                 frag.appendChild(cell);
