@@ -221,11 +221,15 @@ def load_eclip_indexed(bed_path: Path) -> dict:
             if strand not in ["+", "-"]:
                 continue
 
-            # SignalValue (parts[6]) muss vorhanden und eine gültige Zahl sein (kein Fallback)
+            # SignalValue (parts[6]) muss vorhanden, positiv und eine gültige Zahl sein
             if parts[6] in [".", "-1", "nan", "NaN", ""]:
                 continue
             try:
                 score = float(parts[6])
+                # Negative SignalValues bedeuten De-Enrichment (weniger Signal als Input-Kontrolle)
+                # und stellen keine RBP-Bindung dar
+                if score <= 0.0:
+                    continue
             except ValueError:
                 continue
 
@@ -295,6 +299,10 @@ def normalize_trans_factor_tracks(
           - Bei minmax_mode='global': x / max_val (geclippt auf [0, 1])
           - Bei minmax_mode='sample': x / (max(x) if max(x) > 0 else 1.0)
     """
+    # Negative Werte (De-Enrichment / Rauschen) vor der Transformation sauber auf 0 klammern
+    mirna_track = np.maximum(0.0, mirna_track)
+    eclip_track = np.maximum(0.0, eclip_track)
+
     if norm_method == "none":
         return mirna_track, eclip_track
 
