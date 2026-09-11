@@ -274,10 +274,57 @@ def parse_saluki_base_tracks(raw_seq: str) -> tuple:
 
 
 # =============================================================================
-# 5. Inkrementelles Chunking & Zusammenfuehrung
+# 5. Normalisierung fuer kontinuierliche Trans-Faktor Tracks (Kanäle 6 & 7)
 # =============================================================================
 
-def save_chunk(chunk_idx: int, chunk_items: list, chunks_dir: Path):
+def normalize_trans_factor_tracks(
+    mirna_track: np.ndarray,
+    eclip_track: np.ndarray,
+    norm_method: str,
+    mirna_max: float = 5.0,
+    eclip_max: float = 600.0,
+    minmax_mode: str = "global",
+) -> tuple:
+    """
+    Normalisiert die kontinuierlichen Kanäle 6 (miRNA) und 7 (eCLIP).
+    
+    Methoden:
+      - 'none': Unverändert lassen (Rohwerte)
+      - 'log': np.log1p(x) -> log(1 + x)
+      - 'minmax':
+          - Bei minmax_mode='global': x / max_val (geclippt auf [0, 1])
+          - Bei minmax_mode='sample': x / (max(x) if max(x) > 0 else 1.0)
+    """
+    if norm_method == "none":
+        return mirna_track, eclip_track
+
+    if norm_method == "log":
+        # log1p behaelt Sparsity (0.0 -> 0.0) bei und staucht Extrema zusammen
+        norm_mirna = np.log1p(mirna_track)
+        norm_eclip = np.log1p(eclip_track)
+        return norm_mirna, norm_eclip
+
+    if norm_method in ["minmax", "min_max"]:
+        if minmax_mode == "sample":
+            # Per-Transkript Min-Max-Skalierung
+            m_max = float(np.max(mirna_track))
+            e_max = float(np.max(eclip_track))
+            norm_mirna = (mirna_track / m_max) if m_max > 0 else mirna_track
+            norm_eclip = (eclip_track / e_max) if e_max > 0 else eclip_track
+        else:
+            # Globale Referenz-Skalierung auf [0, 1]
+            norm_mirna = np.clip(mirna_track / float(mirna_max), 0.0, 1.0)
+            norm_eclip = np.clip(eclip_track / float(eclip_max), 0.0, 1.0)
+        return norm_mirna, norm_eclip
+
+    raise ValueError(f"Unbekannte Normalisierungsmethode: '{norm_method}' (erlaubt: 'none', 'log', 'minmax')")
+
+
+# =============================================================================
+# 6. Inkrementelles Chunking & Zusammenfuehrung
+# =============================================================================
+
+def save_chunk(chunk_idx: int, chunk_items: list, chunks_dir: Path, normalization: str = "none"):
     """Speichert einen Block von Transkripten inkrementell als NPZ."""
     chunk_file = chunks_dir / f"chunk_{chunk_idx:05d}.npz"
     np.savez_compressed(
@@ -293,10 +340,11 @@ def save_chunk(chunk_idx: int, chunk_items: list, chunks_dir: Path):
         has_mirna=np.array([item["has_mirna"] for item in chunk_items], dtype=bool),
         has_eclip=np.array([item["has_eclip"] for item in chunk_items], dtype=bool),
         has_gtf=np.array([item["has_gtf"] for item in chunk_items], dtype=bool),
+        normalization=str(normalization),
     )
 
 
-def merge_all_chunks(chunks_dir: Path, output_file: Path):
+def merge_all_chunks(chunks_dir: Path, output_file: Path, normalization: str = "none"):
     """Fuehrt alle erzeugten Chunks zu der finalen Master-NPZ zusammen."""
     chunk_files = sorted(chunks_dir.glob("chunk_*.npz"))
     if not chunk_files:
@@ -343,6 +391,7 @@ def merge_all_chunks(chunks_dir: Path, output_file: Path):
         has_mirna=np.array(mirna_flags, dtype=bool),
         has_eclip=np.array(eclip_flags, dtype=bool),
         has_gtf=np.array(gtf_flags, dtype=bool),
+        normalization=str(normalization),
     )
 
     n = len(tx_ids)
@@ -353,6 +402,7 @@ def merge_all_chunks(chunks_dir: Path, output_file: Path):
     print(f"Erfolgreich in GTF-DB gemappt:       {sum(gtf_flags)} ({sum(gtf_flags)/n*100:.2f} %)")
     print(f"Transkripte mit TargetScan miRNAs:   {sum(mirna_flags)} ({sum(mirna_flags)/n*100:.2f} %)")
     print(f"Transkripte mit ENCODE eCLIP Peaks:  {sum(eclip_flags)} ({sum(eclip_flags)/n*100:.2f} %)")
+    print(f"Normalisierung der Trans-Faktoren:   {normalization.upper()}")
     print(f"Track-Dimensionen pro Transkript:    (L, 8)")
     print(f"Kanalkonfiguration:                  [A, C, G, U, CDS, Splice, TargetScan, eCLIP]")
     print(f"Finale Datei gespeichert:            {output_file}")
@@ -395,7 +445,33 @@ def main():
         "--output_file",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/saluki/saluki_multitrack_with_trans_factors.npz",
-        help="Ausgabedatei fuer das erweiterte NPZ-Archiv",
+        help="Ausgabedatei fuer das erweiterte NPZ-Archiv (wird bei Normalisierung automatisch mit Suffix ergaenzt)",
+    )
+    parser.add_argument(
+        "--normalization",
+        type=str,
+        default="none",
+        choices=["none", "log", "minmax"],
+        help="Normalisierungsmethode fuer die Trans-Faktor Tracks (Kanäle 6 & 7): 'none', 'log' (np.log1p) oder 'minmax' (Skalierung auf [0, 1])",
+    )
+    parser.add_argument(
+        "--minmax_mode",
+        type=str,
+        default="global",
+        choices=["global", "sample"],
+        help="Modus fuer 'minmax': 'global' (nutzt Referenzmaxima mirna_max/eclip_max) oder 'sample' (pro Transkript separat)",
+    )
+    parser.add_argument(
+        "--mirna_max",
+        type=float,
+        default=5.0,
+        help="Referenzmaximum fuer miRNA-Kanal bei globalem minmax (Standard: 5.0)",
+    )
+    parser.add_argument(
+        "--eclip_max",
+        type=float,
+        default=600.0,
+        help="Referenzmaximum fuer eCLIP-Kanal bei globalem minmax (Standard: 600.0)",
     )
     parser.add_argument(
         "--chunk_size",
@@ -416,7 +492,16 @@ def main():
     )
     args = parser.parse_args()
 
+    norm_method = args.normalization.lower()
     out_file = Path(args.output_file)
+
+    # Dateiname und Chunk-Ordner dynamisch gemaess der Normalisierung anpassen
+    if norm_method != "none":
+        stem = out_file.stem
+        # Nur anhaengen, wenn der Suffix nicht bereits im Namen steht
+        if not stem.endswith(f"_{norm_method}"):
+            out_file = out_file.parent / f"{stem}_{norm_method}{out_file.suffix}"
+
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
     chunks_dir = out_file.parent / f"{out_file.stem}_chunks"
@@ -425,6 +510,7 @@ def main():
     print("=" * 75)
     print("   Generierung von Trans-Faktor Dichte-Tracks (TargetScan, ENCODE eCLIP)   ")
     print("=" * 75)
+    print(f"Normalisierung:     {norm_method.upper()} " + (f"(Modus: {args.minmax_mode})" if norm_method == "minmax" else ""))
     print(f"Ausgabedatei:       {out_file}")
     print(f"Chunk-Verzeichnis:  {chunks_dir} (Chunk-Größe: {args.chunk_size})")
 
@@ -517,6 +603,16 @@ def main():
                         has_eclip = True
                         eclip_track[:, 0] = eclip_1d
 
+            # Trans-Faktor Normalisierung (Kanäle 6 & 7) anwenden
+            mirna_track, eclip_track = normalize_trans_factor_tracks(
+                mirna_track,
+                eclip_track,
+                norm_method=norm_method,
+                mirna_max=args.mirna_max,
+                eclip_max=args.eclip_max,
+                minmax_mode=args.minmax_mode,
+            )
+
             # Zusammenfuegen zu (L, 8)
             multi_track = np.concatenate([six_track, mirna_track, eclip_track], axis=1)
 
@@ -538,16 +634,16 @@ def main():
 
             # Inkrementelles Speichern nach jeweils chunk_size Transkripten
             if len(current_chunk_items) >= args.chunk_size:
-                save_chunk(chunk_idx, current_chunk_items, chunks_dir)
+                save_chunk(chunk_idx, current_chunk_items, chunks_dir, normalization=norm_method)
                 chunk_idx += 1
                 current_chunk_items = []
 
         # Letzten unvollstaendigen Chunk speichern
         if current_chunk_items:
-            save_chunk(chunk_idx, current_chunk_items, chunks_dir)
+            save_chunk(chunk_idx, current_chunk_items, chunks_dir, normalization=norm_method)
 
     # 3. Alle Chunks zusammenfuehren zur finalen Datei
-    merge_all_chunks(chunks_dir, out_file)
+    merge_all_chunks(chunks_dir, out_file, normalization=norm_method)
 
 
 if __name__ == "__main__":
