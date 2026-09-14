@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Interaktiver HTML-Viewer zur Verifizierung von Trans-Faktor Tracks (TargetScan, ENCODE eCLIP)
-sowie der Sequenz-, CDS- und Splice-Annotationen fuer den Saluki-Datensatz.
+sowie der Sequenz-, CDS- und Splice-Annotationen fuer den hIPSC_CM-Datensatz.
 
 Findet automatisch Transkripte in einer NPZ-Datei (oder einem Chunks-Ordner),
 die SOWOHL TargetScan miRNA-Bindestellen ALS AUCH ENCODE eCLIP RBP-Peaks besitzen,
@@ -922,7 +922,7 @@ def main():
     parser.add_argument(
         "--input",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/saluki_multitrack_with_trans_factors_chunks",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_multitrack_with_trans_factors_chunks",
         help="Pfad zur Master-NPZ, einem Chunk (.npz) oder dem Chunks-Ordner",
     )
     parser.add_argument(

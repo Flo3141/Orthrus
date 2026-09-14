@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Generierung von kontinuierlichen Trans-Faktor Dichte- und Affinitaets-Tracks (Strategie B)
-fuer den Saluki-Datensatz mit inkrementeller Speicherung und O(log N) Vektorisierung.
+fuer den hIPSC_CM-Datensatz mit inkrementeller Speicherung und O(log N) Vektorisierung.
 
 Kombiniert:
 1. GTF-SQLite-Datenbank (Homo_sapiens.GRCh38.108.gtf.db via gffutils)
@@ -423,13 +423,15 @@ def merge_all_chunks(chunks_dir: Path, output_file: Path, normalization: str = "
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generiere kontinuierliche Trans-Faktor Dichte-Tracks fuer Saluki (mit Inkrementeller Speicherung)"
+        description="Generiere kontinuierliche Trans-Faktor Dichte-Tracks fuer hIPSC_CM (mit Inkrementeller Speicherung)"
     )
     parser.add_argument(
         "--saluki_data",
+        "--data_path",
+        dest="saluki_data",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/saluki_ej_cds_transformed.txt",
-        help="Pfad zur Saluki-Datendatei (tab-separiert)",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_ej_cds_transformed.txt",
+        help="Pfad zur hIPSC_CM-Datendatei (tab-separiert)",
     )
     parser.add_argument(
         "--gtf_db",
@@ -452,7 +454,7 @@ def main():
     parser.add_argument(
         "--output_file",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/saluki_multitrack_with_trans_factors.npz",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_multitrack_with_trans_factors.npz",
         help="Ausgabedatei fuer das erweiterte NPZ-Archiv (wird bei Normalisierung automatisch mit Suffix ergaenzt)",
     )
     parser.add_argument(
@@ -550,13 +552,13 @@ def main():
     ts_data = load_targetscan_data(Path(args.targetscan_file))
     eclip_data = load_eclip_indexed(Path(args.encode_eclip_file))
 
-    # 2. Saluki Datensatz laden
-    saluki_path = Path(args.saluki_data)
-    print(f"\nLade Saluki-Datensatz: {saluki_path}...")
-    df = pd.read_csv(saluki_path, sep="\t")
+    # 2. hIPSC_CM Datensatz laden
+    data_path = Path(args.saluki_data)
+    print(f"\nLade hIPSC_CM-Datensatz: {data_path}...")
+    df = pd.read_csv(data_path, sep="\t")
 
     total_samples = len(df)
-    print(f"Gesamteintraege in Saluki: {total_samples}")
+    print(f"Gesamteintraege in hIPSC_CM: {total_samples}")
 
     # Bestimme naechsten Chunk-Index
     chunk_idx = len(existing_chunks)

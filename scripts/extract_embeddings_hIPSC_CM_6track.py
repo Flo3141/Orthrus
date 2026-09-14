@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Extraktion von Orthrus 6-Track Embeddings fuer den Saluki-Datensatz (saluki_ej_cds.txt).
+Extraktion von Orthrus 6-Track Embeddings fuer den hIPSC_CM-Datensatz (hIPSC_CM_ej_cds.txt).
 Laeuft auf dem GPU-Cluster.
 
-Track-Konstruktion aus Saluki-Tokens:
+Track-Konstruktion aus hIPSC_CM-Tokens:
 - Kanäle 0-3: A, C, G, T/U (4-Kanal One-Hot Encoding)
 - Kanal 4:    CDS Track (1.0 an Großbuchstaben wie 'A' in 'A,t,t', entspricht exakt dem Frame-0-Codon-Start cds[0::3]=1 in Orthrus)
 - Kanal 5:    Splice Track (1.0 an Tokens mit 'ej' Suffix, markiert die Exon-Junction-Grenzen)
@@ -65,7 +65,7 @@ def parse_saluki_sequence_to_six_track(raw_seq: str) -> np.ndarray:
     return six_track
 
 
-def extract_embeddings_for_saluki(
+def extract_embeddings_for_hIPSC_CM(
     df: pd.DataFrame,
     model: torch.nn.Module,
     device: torch.device,
@@ -73,9 +73,9 @@ def extract_embeddings_for_saluki(
     max_length: int = 12288,
 ) -> dict:
     """
-    Extrahiert Orthrus 6-Track Embeddings fuer den Saluki DataFrame mit dynamischem Laengen-Batching.
+    Extrahiert Orthrus 6-Track Embeddings fuer den hIPSC_CM DataFrame mit dynamischem Laengen-Batching.
     """
-    print(f"Verarbeite Saluki-Datensatz mit {len(df)} Eintraegen...")
+    print(f"Verarbeite hIPSC_CM-Datensatz mit {len(df)} Eintraegen...")
 
     sample_data = []
     skipped_count = 0
@@ -158,12 +158,12 @@ def extract_embeddings_for_saluki(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extrahiere Orthrus 6-Track Embeddings fuer Saluki")
+    parser = argparse.ArgumentParser(description="Extrahiere Orthrus 6-Track Embeddings fuer hIPSC_CM")
     parser.add_argument(
         "--data_path",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/saluki_ej_cds_transformed.txt",
-        help="Pfad zur Saluki Datendatei (tab-separiert)",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_ej_cds_transformed.txt",
+        help="Pfad zur hIPSC_CM Datendatei (tab-separiert)",
     )
     parser.add_argument(
         "--output_dir",
@@ -174,7 +174,7 @@ def main():
     parser.add_argument(
         "--output_filename",
         type=str,
-        default="orthrus_6track_embeddings_saluki.npz",
+        default="orthrus_6track_embeddings_hIPSC_CM.npz",
         help="Dateiname fuer das gespeicherte NPZ-Archiv",
     )
     parser.add_argument(
@@ -202,12 +202,12 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     save_file = output_dir / args.output_filename
 
-    print(f"Lade Saluki-Datensatz von: {data_path}")
+    print(f"Lade hIPSC_CM-Datensatz von: {data_path}")
     df = pd.read_csv(data_path, sep="\t")
     print(f"Geladene Zeilen: {len(df)}")
     print(f"Spalten: {list(df.columns)}")
 
-    # Sicherstellen, dass half_life_transformed existiert (falls mit Rohdatei saluki_ej_cds.txt aufgerufen)
+    # Sicherstellen, dass half_life_transformed existiert (falls mit Rohdatei hIPSC_CM_ej_cds.txt aufgerufen)
     if "half_life_transformed" not in df.columns and "half_life" in df.columns:
         print("Spalte 'half_life_transformed' nicht vorhanden - berechne aus 'half_life' (Log + Z-Score)...")
         y_raw = df["half_life"].astype(float)
@@ -226,7 +226,7 @@ def main():
     model.eval()
     print("Modell erfolgreich geladen.")
 
-    result = extract_embeddings_for_saluki(
+    result = extract_embeddings_for_hIPSC_CM(
         df=df,
         model=model,
         device=device,

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ridge-Regression Training & Evaluierung auf extrahierten Orthrus 6-Track Embeddings fuer den Saluki-Datensatz.
+Ridge-Regression Training & Evaluierung auf extrahierten Orthrus 6-Track Embeddings fuer den hIPSC_CM-Datensatz.
 Unterstuetzt sowohl 'half_life_transformed' als auch 'half_life' und 'rate'.
 Laeuft auf dem Cluster (CPU oder GPU-Node).
 """
@@ -58,8 +58,8 @@ def print_metrics(metrics: dict, title: str):
             print(f"  {k:24s}: {v:.4f}")
 
 
-def load_saluki_npz(file_path: Path, target_col: str) -> dict:
-    """Laedt eine NPZ-Datei mit Saluki-Embeddings und Metadaten."""
+def load_hIPSC_CM_npz(file_path: Path, target_col: str) -> dict:
+    """Laedt eine NPZ-Datei mit hIPSC_CM-Embeddings und Metadaten."""
     if not file_path.exists():
         raise FileNotFoundError(f"Embedding-Datei nicht gefunden: {file_path}")
 
@@ -105,18 +105,18 @@ def load_saluki_npz(file_path: Path, target_col: str) -> dict:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Ridge Regression Head auf Orthrus Saluki-Embeddings trainieren und evaluieren"
+        description="Ridge Regression Head auf Orthrus hIPSC_CM-Embeddings trainieren und evaluieren"
     )
     parser.add_argument(
         "--embeddings_path",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus_6track_embeddings_saluki.npz",
-        help="Pfad zur NPZ-Datei mit Saluki-Embeddings",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus_6track_embeddings_hIPSC_CM.npz",
+        help="Pfad zur NPZ-Datei mit hIPSC_CM-Embeddings",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/results/Orthrus/saluki",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/results/Orthrus/hIPSC_CM",
         help="Ausgabeverzeichnis fuer Modelle, Metriken, Plots und Vorhersagen",
     )
     parser.add_argument(
@@ -160,7 +160,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print("      Orthrus 6-Track Ridge Regression: Saluki Evaluierung      ")
+    print("      Orthrus 6-Track Ridge Regression: hIPSC_CM Evaluierung      ")
     print("=" * 70)
     print(f"Embeddings-Datei: {emb_path}")
     print(f"Zielvariable:     {args.target_col}")
@@ -170,7 +170,7 @@ def main():
     print(f"Ausgabeordner:    {out_dir}")
 
     print(f"\nLade Embeddings und Zielvariablen...")
-    data = load_saluki_npz(emb_path, target_col=args.target_col)
+    data = load_hIPSC_CM_npz(emb_path, target_col=args.target_col)
 
     X = data["embeddings"]
     y = data["targets"]
@@ -234,7 +234,7 @@ def main():
     print_metrics(test_metrics, f"Test-Metriken ({args.target_col})")
 
     # 1. Speichern des trainierten Modells
-    model_file = out_dir / f"ridge_model_saluki_{args.target_col}.joblib"
+    model_file = out_dir / f"ridge_model_hIPSC_CM_{args.target_col}.joblib"
     joblib.dump(model, model_file)
     print(f"\nModell gespeichert unter: {model_file}")
 
@@ -246,13 +246,13 @@ def main():
         "predicted_target": y_test_pred,
         "residual": y_test - y_test_pred,
     })
-    pred_file = out_dir / f"predictions_saluki_{args.target_col}.csv"
+    pred_file = out_dir / f"predictions_hIPSC_CM_{args.target_col}.csv"
     pred_df.to_csv(pred_file, index=False)
     print(f"Vorhersagen gespeichert unter: {pred_file}")
 
     # 3. Speichern der Metriken als JSON
     all_metrics = {
-        "dataset": "saluki",
+        "dataset": "hIPSC_CM",
         "target_col": args.target_col,
         "split_type": args.split_type,
         "best_alpha": float(model.alpha_),
@@ -263,7 +263,7 @@ def main():
         **train_metrics,
         **test_metrics,
     }
-    metrics_file = out_dir / f"metrics_saluki_{args.target_col}.json"
+    metrics_file = out_dir / f"metrics_hIPSC_CM_{args.target_col}.json"
     with open(metrics_file, "w", encoding="utf-8") as f:
         json.dump(all_metrics, f, indent=4)
     print(f"Metriken gespeichert unter: {metrics_file}")
@@ -278,7 +278,7 @@ def main():
             r2 = test_metrics["test_r2"]
 
             ax.set_title(
-                f"Orthrus 6-Track -> Saluki ({args.target_col})\n"
+                f"Orthrus 6-Track -> hIPSC_CM ({args.target_col})\n"
                 f"Pearson R = {p_r:.3f} | Spearman Rho = {s_rho:.3f} | R² = {r2:.3f}",
                 fontsize=11,
             )
@@ -294,7 +294,7 @@ def main():
             ax.grid(True, linestyle="--", alpha=0.5)
 
             plt.tight_layout()
-            plot_file = out_dir / f"scatter_saluki_{args.target_col}.png"
+            plot_file = out_dir / f"scatter_hIPSC_CM_{args.target_col}.png"
             fig.savefig(plot_file, dpi=300)
             plt.close(fig)
             print(f"Streudiagramm gespeichert unter: {plot_file}")
@@ -303,6 +303,6 @@ def main():
 
     print("\nEvaluierung erfolgreich abgeschlossen!")
 
-
+# hIPSC_CM
 if __name__ == "__main__":
     main()
