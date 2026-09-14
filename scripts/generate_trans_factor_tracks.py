@@ -428,7 +428,7 @@ def main():
     parser.add_argument(
         "--saluki_data",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/saluki/saluki_ej_cds_transformed.txt",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/saluki_ej_cds_transformed.txt",
         help="Pfad zur Saluki-Datendatei (tab-separiert)",
     )
     parser.add_argument(
@@ -452,7 +452,7 @@ def main():
     parser.add_argument(
         "--output_file",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/saluki/saluki_multitrack_with_trans_factors.npz",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/saluki_multitrack_with_trans_factors.npz",
         help="Ausgabedatei fuer das erweiterte NPZ-Archiv (wird bei Normalisierung automatisch mit Suffix ergaenzt)",
     )
     parser.add_argument(

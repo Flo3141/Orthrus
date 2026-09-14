@@ -110,7 +110,7 @@ def parse_args():
     parser.add_argument(
         "--embeddings_path",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/saluki/orthrus_6track_embeddings_saluki.npz",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus_6track_embeddings_saluki.npz",
         help="Pfad zur NPZ-Datei mit Saluki-Embeddings",
     )
     parser.add_argument(

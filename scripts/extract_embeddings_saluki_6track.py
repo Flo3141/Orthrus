@@ -162,13 +162,13 @@ def main():
     parser.add_argument(
         "--data_path",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/saluki/saluki_ej_cds_transformed.txt",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/saluki_ej_cds_transformed.txt",
         help="Pfad zur Saluki Datendatei (tab-separiert)",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/saluki",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM",
         help="Verzeichnis zum Speichern der Embeddings",
     )
     parser.add_argument(

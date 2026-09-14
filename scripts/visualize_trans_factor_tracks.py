@@ -922,7 +922,7 @@ def main():
     parser.add_argument(
         "--input",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/saluki/saluki_multitrack_with_trans_factors_chunks",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/saluki_multitrack_with_trans_factors_chunks",
         help="Pfad zur Master-NPZ, einem Chunk (.npz) oder dem Chunks-Ordner",
     )
     parser.add_argument(
