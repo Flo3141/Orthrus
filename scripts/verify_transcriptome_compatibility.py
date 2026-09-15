@@ -67,6 +67,18 @@ for idx, row in df.iterrows():
     if clean_tx in ts_transcripts:
         ts_match_count += 1
 
+    # Fügen Sie diesen kurzen Block in die Transkript-Schleife ein:
+    ts_matches_for_tx = ts_df[ts_df["Transcript ID"].str.startswith(clean_tx)]
+    overflows = 0
+    total_sites = 0
+
+    for _, site in ts_matches_for_tx.iterrows():
+        total_sites += 1
+        # UTR end darf die 3' UTR Länge im Datensatz nicht überschreiten
+        if int(site["UTR end"]) > utr3_len:
+            overflows += 1
+
+
 print("\n" + "=" * 60)
 print("             ERGEBNIS DER KOMPATIBILITAETSPRUEFUNG           ")
 print("=" * 60)
