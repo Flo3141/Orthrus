@@ -393,7 +393,7 @@ def normalize_trans_factor_tracks(
         norm_eclip = np.log1p(eclip_track)
         return norm_mirna, norm_eclip
 
-    if norm_method in ["robust_quantile", "quantile", "log_quantile", "minmax", "min_max"]:
+    if norm_method in ["minmax", "min_max"]:
         # Global robust quantile scaling: x_scaled = min(1.0, log(1 + x) / log(1 + q_99))
         denom_mirna = np.log1p(float(mirna_q99))
         denom_eclip = np.log1p(float(eclip_q99))
@@ -411,7 +411,7 @@ def normalize_trans_factor_tracks(
 
     raise ValueError(
         f"Unknown normalization method: '{norm_method}' "
-        "(allowed: 'none', 'log', 'robust_quantile', 'minmax')"
+        "(allowed: 'none', 'log', 'minmax')"
     )
 
 
@@ -569,8 +569,8 @@ def main():
         "--normalization",
         type=str,
         default="none",
-        choices=["none", "log", "robust_quantile", "quantile", "minmax"],
-        help="Normalization method for trans-factor tracks (channels 6 & 7): 'none', 'log' (np.log1p), 'robust_quantile' (log-transform with robust quantile scaling to [0, 1]), or 'minmax' (alias for robust_quantile)",
+        choices=["none", "log", "minmax"],
+        help="Normalization method for trans-factor tracks (channels 6 & 7): 'none' (raw values), 'log' (np.log1p(x)), or 'minmax' (Log-transformation with robust quantile scaling to [0, 1]: min(1.0, log(1 + x) / log(1 + q99)) using dynamically estimated dataset q99 bounds)",
     )
     parser.add_argument(
         "--mirna_q99",
@@ -681,7 +681,7 @@ def main():
     mirna_q99 = args.mirna_q99
     eclip_q99 = args.eclip_q99
 
-    if norm_method in ["robust_quantile", "quantile", "minmax"]:
+    if norm_method in ["minmax", "min_max"]:
         # Check existing chunks for saved quantiles (to ensure consistency across resume)
         if not args.recreate and existing_chunks:
             for cf in existing_chunks:
