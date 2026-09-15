@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Ridge-Regression Training & Evaluierung auf extrahierten Orthrus 6-Track Embeddings fuer den hIPSC_CM-Datensatz.
-Unterstuetzt sowohl 'half_life_transformed' als auch 'half_life' und 'rate'.
-Laeuft auf dem Cluster (CPU oder GPU-Node).
+Ridge regression training & evaluation on extracted Orthrus 6-track embeddings for the hIPSC_CM dataset.
+Supports 'half_life_transformed' as well as 'half_life' and 'rate'.
+Runs on cluster (CPU or GPU node).
 """
 
 import argparse
@@ -16,18 +16,18 @@ from sklearn.linear_model import RidgeCV
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
-# Headless Backend fuer Cluster-Server ohne X11/Display
+# Headless backend for cluster servers without X11/display
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-# Alpha-Raster gemaess linear_probe_eval.py aus dem Orthrus-Paper
+# Alpha grid according to linear_probe_eval.py from the Orthrus paper
 DEFAULT_ALPHAS = [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0]
 
 
 def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray, prefix: str = "") -> dict:
-    """Berechnet Regressions-Metriken inklusive Korrelationen."""
+    """Calculates regression metrics including correlations."""
     p_corr, p_val = pearsonr(y_true, y_pred)
     s_corr, s_val = spearmanr(y_true, y_pred)
     mse = mean_squared_error(y_true, y_pred)
@@ -49,7 +49,7 @@ def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray, prefix: str = "") 
 
 
 def print_metrics(metrics: dict, title: str):
-    """Formatierte Konsolenausgabe fuer Metriken."""
+    """Formatted console output for metrics."""
     print(f"\n--- {title} ---")
     for k, v in metrics.items():
         if "pvalue" in k:
@@ -59,26 +59,26 @@ def print_metrics(metrics: dict, title: str):
 
 
 def load_hIPSC_CM_npz(file_path: Path, target_col: str) -> dict:
-    """Laedt eine NPZ-Datei mit hIPSC_CM-Embeddings und Metadaten."""
+    """Loads an NPZ file containing hIPSC_CM embeddings and metadata."""
     if not file_path.exists():
-        raise FileNotFoundError(f"Embedding-Datei nicht gefunden: {file_path}")
+        raise FileNotFoundError(f"Embedding file not found: {file_path}")
 
     data = np.load(file_path, allow_pickle=True)
     available_keys = list(data.keys())
 
     if "embeddings" not in data:
-        raise KeyError(f"'embeddings' nicht in NPZ gefunden. Vorhandene Keys: {available_keys}")
+        raise KeyError(f"'embeddings' not found in NPZ. Available keys: {available_keys}")
 
-    # Zielvariable auswaehlen
+    # Select target variable
     if target_col not in data:
         raise KeyError(
-            f"Zielvariable '{target_col}' nicht im NPZ-Archiv vorhanden. "
-            f"Verfuegbare Schluessel: {available_keys}"
+            f"Target variable '{target_col}' not found in NPZ archive. "
+            f"Available keys: {available_keys}"
         )
 
     targets = data[target_col].astype(np.float32)
 
-    # Gene-Spalte fuer Group-Split (bevorzugt hgnc_symbol, sonst ensembl_gene_id)
+    # Gene column for group split (prefer hgnc_symbol, else ensembl_gene_id)
     if "hgnc_symbol" in data:
         genes = data["hgnc_symbol"].astype(str)
     elif "ensembl_gene_id" in data:
@@ -88,7 +88,7 @@ def load_hIPSC_CM_npz(file_path: Path, target_col: str) -> dict:
     else:
         genes = np.array([f"gene_{i}" for i in range(len(targets))])
 
-    # Transkript-IDs
+    # Transcript IDs
     if "ensembl_transcript_id" in data:
         transcript_ids = data["ensembl_transcript_id"].astype(str)
     else:
@@ -105,50 +105,50 @@ def load_hIPSC_CM_npz(file_path: Path, target_col: str) -> dict:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Ridge Regression Head auf Orthrus hIPSC_CM-Embeddings trainieren und evaluieren"
+        description="Train and evaluate Ridge regression head on Orthrus hIPSC_CM embeddings"
     )
     parser.add_argument(
         "--embeddings_path",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus_6track_embeddings_hIPSC_CM.npz",
-        help="Pfad zur NPZ-Datei mit hIPSC_CM-Embeddings",
+        help="Path to NPZ file containing hIPSC_CM embeddings",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/results/Orthrus/hIPSC_CM",
-        help="Ausgabeverzeichnis fuer Modelle, Metriken, Plots und Vorhersagen",
+        help="Output directory for models, metrics, plots, and predictions",
     )
     parser.add_argument(
         "--target_col",
         type=str,
         default="half_life_transformed",
         choices=["half_life_transformed", "half_life", "rate"],
-        help="Zu lernende Zielvariable (Standard: half_life_transformed)",
+        help="Target variable to train on (default: half_life_transformed)",
     )
     parser.add_argument(
         "--split_type",
         type=str,
         choices=["gene", "random"],
         default="gene",
-        help="'gene' (GroupShuffleSplit gegen Leakage von Isoformen desselben Gens) oder 'random'",
+        help="'gene' (GroupShuffleSplit against leakage of isoforms from the same gene) or 'random'",
     )
     parser.add_argument(
         "--test_size",
         type=float,
         default=0.2,
-        help="Anteil des Test-Splits (Standard: 0.2)",
+        help="Fraction of test split (default: 0.2)",
     )
     parser.add_argument(
         "--random_state",
         type=int,
         default=42,
-        help="Zufallssamen fuer Reproduzierbarkeit",
+        help="Random seed for reproducibility",
     )
     parser.add_argument(
         "--plot",
         action="store_true",
-        help="Optional: Erstelle Streudiagramm (y_true vs. y_pred) als PNG",
+        help="Optional: create scatter plot (y_true vs. y_pred) as PNG",
     )
     return parser.parse_args()
 
@@ -160,16 +160,16 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print("      Orthrus 6-Track Ridge Regression: hIPSC_CM Evaluierung      ")
+    print("      Orthrus 6-Track Ridge Regression: hIPSC_CM Evaluation      ")
     print("=" * 70)
-    print(f"Embeddings-Datei: {emb_path}")
-    print(f"Zielvariable:     {args.target_col}")
-    print(f"Split-Typ:        {args.split_type}")
-    print(f"Test-Groesse:     {args.test_size}")
-    print(f"Random State:     {args.random_state}")
-    print(f"Ausgabeordner:    {out_dir}")
+    print(f"Embeddings file:  {emb_path}")
+    print(f"Target variable:  {args.target_col}")
+    print(f"Split type:       {args.split_type}")
+    print(f"Test size:        {args.test_size}")
+    print(f"Random state:     {args.random_state}")
+    print(f"Output directory: {out_dir}")
 
-    print(f"\nLade Embeddings und Zielvariablen...")
+    print("\nLoading embeddings and target variables...")
     data = load_hIPSC_CM_npz(emb_path, target_col=args.target_col)
 
     X = data["embeddings"]
@@ -177,32 +177,32 @@ def main():
     genes = data["genes"]
     transcript_ids = data["transcript_ids"]
 
-    # Pruefen auf NaN-Werte im Target
+    # Check for NaN values in target
     valid_mask = ~np.isnan(y)
     if not np.all(valid_mask):
         num_invalid = np.sum(~valid_mask)
-        print(f"Achtung: {num_invalid} Proben mit NaN im Target wurden entfernt.")
+        print(f"Warning: {num_invalid} samples with NaN in target were removed.")
         X = X[valid_mask]
         y = y[valid_mask]
         genes = genes[valid_mask]
         transcript_ids = transcript_ids[valid_mask]
 
-    print(f"Gueltige Proben: {len(y)}, Feature-Dimension: {X.shape[1]}")
-    print(f"Anzahl eindeutiger Gene: {len(np.unique(genes))}")
+    print(f"Valid samples: {len(y)}, Feature dimension: {X.shape[1]}")
+    print(f"Number of unique genes: {len(np.unique(genes))}")
 
     if len(y) == 0:
         raise ValueError(
-            f"Keine gueltigen Datenpunkte fuer Zielvariable '{args.target_col}' gefunden. "
-            f"Alle Werte sind NaN! Bitte ueberpruefen Sie die Embedding-Datei oder waehlen Sie --target_col half_life."
+            f"No valid data points found for target variable '{args.target_col}'. "
+            f"All values are NaN! Please check the embedding file or select --target_col half_life."
         )
 
-    # Split durchfuehren
+    # Perform split
     if args.split_type == "gene":
-        print("Fuehre gen-basierten Split (GroupShuffleSplit) durch...")
+        print("Performing gene-based split (GroupShuffleSplit)...")
         gss = GroupShuffleSplit(n_splits=1, test_size=args.test_size, random_state=args.random_state)
         train_idx, test_idx = next(gss.split(X, y, groups=genes))
     else:
-        print("Fuehre zufaelligen Split (train_test_split) durch...")
+        print("Performing random split (train_test_split)...")
         train_idx, test_idx = train_test_split(
             np.arange(len(y)), test_size=args.test_size, random_state=args.random_state
         )
@@ -213,32 +213,32 @@ def main():
     train_genes, test_genes = genes[train_idx], genes[test_idx]
     test_tx = transcript_ids[test_idx]
 
-    print(f"Trainings-Set: {len(y_train)} Proben ({len(np.unique(train_genes))} unique Gene)")
-    print(f"Test-Set:      {len(y_test)} Proben ({len(np.unique(test_genes))} unique Gene)")
+    print(f"Training set: {len(y_train)} samples ({len(np.unique(train_genes))} unique genes)")
+    print(f"Test set:     {len(y_test)} samples ({len(np.unique(test_genes))} unique genes)")
 
-    # RidgeCV trainieren
-    print(f"\nTrainiere RidgeCV mit 5-Fold CV ueber Alphas {DEFAULT_ALPHAS}...")
+    # Train RidgeCV
+    print(f"\nTraining RidgeCV with 5-fold CV over alphas {DEFAULT_ALPHAS}...")
     model = RidgeCV(alphas=DEFAULT_ALPHAS, cv=5)
     model.fit(X_train, y_train)
 
-    print(f"Optimales Alpha: {model.alpha_}")
+    print(f"Optimal alpha: {model.alpha_}")
 
-    # Vorhersagen berechnen
+    # Compute predictions
     y_train_pred = model.predict(X_train)
     y_test_pred = model.predict(X_test)
 
     train_metrics = calculate_metrics(y_train, y_train_pred, prefix="train")
     test_metrics = calculate_metrics(y_test, y_test_pred, prefix="test")
 
-    print_metrics(train_metrics, f"Trainings-Metriken ({args.target_col})")
-    print_metrics(test_metrics, f"Test-Metriken ({args.target_col})")
+    print_metrics(train_metrics, f"Training Metrics ({args.target_col})")
+    print_metrics(test_metrics, f"Test Metrics ({args.target_col})")
 
-    # 1. Speichern des trainierten Modells
+    # 1. Save trained model
     model_file = out_dir / f"ridge_model_hIPSC_CM_{args.target_col}.joblib"
     joblib.dump(model, model_file)
-    print(f"\nModell gespeichert unter: {model_file}")
+    print(f"\nModel saved to: {model_file}")
 
-    # 2. Speichern der Vorhersagen als CSV
+    # 2. Save predictions as CSV
     pred_df = pd.DataFrame({
         "transcript_id": test_tx,
         "gene": test_genes,
@@ -248,9 +248,9 @@ def main():
     })
     pred_file = out_dir / f"predictions_hIPSC_CM_{args.target_col}.csv"
     pred_df.to_csv(pred_file, index=False)
-    print(f"Vorhersagen gespeichert unter: {pred_file}")
+    print(f"Predictions saved to: {pred_file}")
 
-    # 3. Speichern der Metriken als JSON
+    # 3. Save metrics as JSON
     all_metrics = {
         "dataset": "hIPSC_CM",
         "target_col": args.target_col,
@@ -266,9 +266,9 @@ def main():
     metrics_file = out_dir / f"metrics_hIPSC_CM_{args.target_col}.json"
     with open(metrics_file, "w", encoding="utf-8") as f:
         json.dump(all_metrics, f, indent=4)
-    print(f"Metriken gespeichert unter: {metrics_file}")
+    print(f"Metrics saved to: {metrics_file}")
 
-    # 4. Streudiagramm (y_true vs. y_pred) speichern
+    # 4. Save scatter plot (y_true vs. y_pred)
     if args.plot:
         try:
             fig, ax = plt.subplots(figsize=(7, 6))
@@ -282,10 +282,10 @@ def main():
                 f"Pearson R = {p_r:.3f} | Spearman Rho = {s_rho:.3f} | R² = {r2:.3f}",
                 fontsize=11,
             )
-            ax.set_xlabel(f"Wahrer Wert ({args.target_col})")
-            ax.set_ylabel(f"Vorhergesagter Wert ({args.target_col})")
+            ax.set_xlabel(f"True Value ({args.target_col})")
+            ax.set_ylabel(f"Predicted Value ({args.target_col})")
 
-            # Diagonale Referenzlinie (Ideal)
+            # Diagonal reference line (Ideal)
             min_val = min(float(np.min(y_test)), float(np.min(y_test_pred)))
             max_val = max(float(np.max(y_test)), float(np.max(y_test_pred)))
             margin = (max_val - min_val) * 0.05
@@ -297,12 +297,12 @@ def main():
             plot_file = out_dir / f"scatter_hIPSC_CM_{args.target_col}.png"
             fig.savefig(plot_file, dpi=300)
             plt.close(fig)
-            print(f"Streudiagramm gespeichert unter: {plot_file}")
+            print(f"Scatter plot saved to: {plot_file}")
         except Exception as e:
-            print(f"Hinweis: Plot konnte nicht erstellt werden: {e}")
+            print(f"Notice: Plot could not be created: {e}")
 
-    print("\nEvaluierung erfolgreich abgeschlossen!")
+    print("\nEvaluation successfully completed!")
 
-# hIPSC_CM
+
 if __name__ == "__main__":
     main()

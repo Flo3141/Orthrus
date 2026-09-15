@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Extraktion von Orthrus 6-Track Embeddings fuer den hIPSC_CM-Datensatz (hIPSC_CM_ej_cds.txt).
-Laeuft auf dem GPU-Cluster.
+Extraction of Orthrus 6-track embeddings for the hIPSC_CM dataset (hIPSC_CM_ej_cds.txt).
+Runs on GPU cluster.
 
-Track-Konstruktion aus hIPSC_CM-Tokens:
-- Kanäle 0-3: A, C, G, T/U (4-Kanal One-Hot Encoding)
-- Kanal 4:    CDS Track (1.0 an Großbuchstaben wie 'A' in 'A,t,t', entspricht exakt dem Frame-0-Codon-Start cds[0::3]=1 in Orthrus)
-- Kanal 5:    Splice Track (1.0 an Tokens mit 'ej' Suffix, markiert die Exon-Junction-Grenzen)
+Track construction from hIPSC_CM tokens:
+- Channels 0-3: A, C, G, T/U (4-channel one-hot encoding)
+- Channel 4:    CDS track (1.0 on uppercase letters such as 'A' in 'A,t,t', corresponds exactly to frame-0 codon start cds[0::3]=1 in Orthrus)
+- Channel 5:    Splice track (1.0 on tokens with 'ej' suffix, marks exon junction boundaries)
 """
 
 import argparse
@@ -20,45 +20,45 @@ from transformers import AutoModel
 
 def seq_to_one_hot(seq: str) -> np.ndarray:
     """
-    Konvertiert eine RNA/DNA-Sequenz in ein 4-Kanal One-Hot-Encoding.
-    Konform mit dem Orthrus Paper:
-      Kanal 0: A (Adenin)
-      Kanal 1: C (Cytosin)
-      Kanal 2: G (Guanin)
-      Kanal 3: T / U (Thymin / Uracil)
-      Alle anderen Zeichen (z.B. 'N') -> [0, 0, 0, 0]
+    Converts an RNA/DNA sequence into a 4-channel one-hot encoding.
+    Conforms to the Orthrus paper:
+      Channel 0: A (Adenine)
+      Channel 1: C (Cytosine)
+      Channel 2: G (Guanine)
+      Channel 3: T / U (Thymine / Uracil)
+      All other characters (e.g. 'N') -> [0, 0, 0, 0]
     
     Returns:
-        np.ndarray der Form (L, 4) mit dtype float32.
+        np.ndarray of shape (L, 4) with dtype float32.
     """
     seq_bytes = np.frombuffer(seq.upper().encode("ascii"), dtype=np.uint8)
     oh = np.zeros((len(seq_bytes), 4), dtype=np.float32)
     oh[seq_bytes == 65, 0] = 1.0  # 'A'
     oh[seq_bytes == 67, 1] = 1.0  # 'C'
     oh[seq_bytes == 71, 2] = 1.0  # 'G'
-    oh[(seq_bytes == 84) | (seq_bytes == 85), 3] = 1.0  # 'T' (84) oder 'U' (85)
+    oh[(seq_bytes == 84) | (seq_bytes == 85), 3] = 1.0  # 'T' (84) or 'U' (85)
     return oh
 
 
 def parse_saluki_sequence_to_six_track(raw_seq: str) -> np.ndarray:
     """
-    Parst die kommagetrennte Saluki-Sequenz und erzeugt ein (L, 6) Array:
-      - Tracks 0-3: A, C, G, T/U One-Hot
-      - Track 4:    CDS-Marker (1.0 bei Großbuchstaben, 0.0 bei Kleinbuchstaben)
-      - Track 5:    Splice-Marker (1.0 bei 'ej' Tokens, 0.0 sonst)
+    Parses the comma-separated Saluki sequence and produces an (L, 6) array:
+      - Tracks 0-3: A, C, G, T/U one-hot
+      - Track 4:    CDS marker (1.0 on uppercase letters, 0.0 on lowercase letters)
+      - Track 5:    Splice marker (1.0 on 'ej' tokens, 0.0 otherwise)
     """
     tokens = [tok.strip() for tok in raw_seq.split(",") if tok.strip()]
     if not tokens:
         return np.zeros((0, 6), dtype=np.float32)
 
-    # 1. Basenfolge extrahieren (erstes Zeichen jedes Tokens)
+    # 1. Extract nucleotide sequence (first character of each token)
     clean_seq = "".join(tok[0] for tok in tokens)
     seq_oh = seq_to_one_hot(clean_seq)  # (L, 4)
 
-    # 2. CDS-Track: Großbuchstabe = Codon-Start (1. Base des Codons)
+    # 2. CDS track: uppercase letter = codon start (1st base of codon)
     cds_track = np.array([1.0 if tok[0].isupper() else 0.0 for tok in tokens], dtype=np.float32).reshape(-1, 1)
 
-    # 3. Splice-Track: 'ej' im Token = Exon-Junction
+    # 3. Splice track: 'ej' in token = exon junction
     splice_track = np.array([1.0 if "ej" in tok.lower() else 0.0 for tok in tokens], dtype=np.float32).reshape(-1, 1)
 
     six_track = np.concatenate([seq_oh, cds_track, splice_track], axis=1)
@@ -73,9 +73,9 @@ def extract_embeddings_for_hIPSC_CM(
     max_length: int = 12288,
 ) -> dict:
     """
-    Extrahiert Orthrus 6-Track Embeddings fuer den hIPSC_CM DataFrame mit dynamischem Laengen-Batching.
+    Extracts Orthrus 6-track embeddings for the hIPSC_CM DataFrame using dynamic length batching.
     """
-    print(f"Verarbeite hIPSC_CM-Datensatz mit {len(df)} Eintraegen...")
+    print(f"Processing hIPSC_CM dataset with {len(df)} entries...")
 
     sample_data = []
     skipped_count = 0
@@ -102,19 +102,19 @@ def extract_embeddings_for_hIPSC_CM(
         })
 
     if skipped_count > 0:
-        print(f"Hinweis: {skipped_count} Sequenzen wurden auf max_length={max_length} Nukleotide gekuerzt.")
+        print(f"Notice: {skipped_count} sequences were truncated to max_length={max_length} nucleotides.")
 
-    # Sortieren nach Laenge, um Padding im Batch zu minimieren
+    # Sort by length to minimize padding within batches
     sorted_samples = sorted(sample_data, key=lambda x: x["length"])
     embeddings_list = [None] * len(sample_data)
 
-    print(f"Starte Embedding-Extraktion mit Batch-Groesse {batch_size}...")
-    for i in tqdm(range(0, len(sorted_samples), batch_size), desc="Extrahiere Embeddings"):
+    print(f"Starting embedding extraction with batch size {batch_size}...")
+    for i in tqdm(range(0, len(sorted_samples), batch_size), desc="Extracting embeddings"):
         batch = sorted_samples[i : i + batch_size]
         b_lens = [s["length"] for s in batch]
         max_b_len = max(b_lens)
 
-        # Padded Batch Tensor (Batch, max_b_len, 6)
+        # Padded batch tensor (batch, max_b_len, 6)
         batch_arr = np.zeros((len(batch), max_b_len, 6), dtype=np.float32)
         for b_idx, s in enumerate(batch):
             l = s["length"]
@@ -124,7 +124,7 @@ def extract_embeddings_for_hIPSC_CM(
         lengths_tensor = torch.tensor(b_lens, dtype=torch.long, device=device)
 
         with torch.no_grad():
-            # channel_last=True erwartet (B, L, C) mit C=6
+            # channel_last=True expects (B, L, C) with C=6
             batch_emb = model.representation(x_tensor, lengths_tensor, channel_last=True)
             batch_emb_np = batch_emb.cpu().numpy()
 
@@ -134,7 +134,7 @@ def extract_embeddings_for_hIPSC_CM(
 
     all_embeddings = np.stack(embeddings_list, axis=0)
 
-    # Metadaten in urspruenglicher DataFrame-Reihenfolge
+    # Metadata in original DataFrame order
     transcript_ids = np.array([s["transcript_id"] for s in sample_data])
     gene_ids = np.array([s["gene_id"] for s in sample_data])
     gene_symbols = np.array([s["gene_symbol"] for s in sample_data])
@@ -158,42 +158,42 @@ def extract_embeddings_for_hIPSC_CM(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extrahiere Orthrus 6-Track Embeddings fuer hIPSC_CM")
+    parser = argparse.ArgumentParser(description="Extract Orthrus 6-track embeddings for hIPSC_CM")
     parser.add_argument(
         "--data_path",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_ej_cds_transformed.txt",
-        help="Pfad zur hIPSC_CM Datendatei (tab-separiert)",
+        help="Path to hIPSC_CM data file (tab-separated)",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM",
-        help="Verzeichnis zum Speichern der Embeddings",
+        help="Directory to save embeddings",
     )
     parser.add_argument(
         "--output_filename",
         type=str,
         default="orthrus_6track_embeddings_hIPSC_CM.npz",
-        help="Dateiname fuer das gespeicherte NPZ-Archiv",
+        help="Filename for the saved NPZ archive",
     )
     parser.add_argument(
         "--model_name",
         type=str,
         default="quietflamingo/orthrus-large-6-track",
-        help="Hugging Face Modell-Identifier",
+        help="Hugging Face model identifier",
     )
     parser.add_argument(
         "--batch_size",
         type=int,
         default=16,
-        help="Batch-Groesse fuer Inferenz",
+        help="Batch size for inference",
     )
     parser.add_argument(
         "--max_length",
         type=int,
         default=12288,
-        help="Maximale Sequenzlaenge gemaess Orthrus Paper (Standard: 12288)",
+        help="Maximum sequence length according to the Orthrus paper (default: 12288)",
     )
     args = parser.parse_args()
 
@@ -202,29 +202,29 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     save_file = output_dir / args.output_filename
 
-    print(f"Lade hIPSC_CM-Datensatz von: {data_path}")
+    print(f"Loading hIPSC_CM dataset from: {data_path}")
     df = pd.read_csv(data_path, sep="\t")
-    print(f"Geladene Zeilen: {len(df)}")
-    print(f"Spalten: {list(df.columns)}")
+    print(f"Loaded rows: {len(df)}")
+    print(f"Columns: {list(df.columns)}")
 
-    # Sicherstellen, dass half_life_transformed existiert (falls mit Rohdatei hIPSC_CM_ej_cds.txt aufgerufen)
+    # Ensure half_life_transformed exists (if called with raw hIPSC_CM_ej_cds.txt)
     if "half_life_transformed" not in df.columns and "half_life" in df.columns:
-        print("Spalte 'half_life_transformed' nicht vorhanden - berechne aus 'half_life' (Log + Z-Score)...")
+        print("Column 'half_life_transformed' not found - computing from 'half_life' (Log + Z-Score)...")
         y_raw = df["half_life"].astype(float)
         y_log = np.log(y_raw + 0.1)
         mu_log = float(y_log.mean())
         sigma_log = float(y_log.std(ddof=1))
         df["half_life_transformed"] = (y_log - mu_log) / sigma_log
-        print(f"Transformation berechnet: mu={mu_log:.4f}, sigma={sigma_log:.4f}")
+        print(f"Transformation computed: mu={mu_log:.4f}, sigma={sigma_log:.4f}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Verwende Geraet: {device}")
+    print(f"Using device: {device}")
 
-    print(f"Lade Orthrus 6-Track Modell '{args.model_name}'...")
+    print(f"Loading Orthrus 6-track model '{args.model_name}'...")
     model = AutoModel.from_pretrained(args.model_name, trust_remote_code=True)
     model = model.to(device)
     model.eval()
-    print("Modell erfolgreich geladen.")
+    print("Model loaded successfully.")
 
     result = extract_embeddings_for_hIPSC_CM(
         df=df,
@@ -234,7 +234,7 @@ def main():
         max_length=args.max_length,
     )
 
-    print(f"\nSpeichere Embeddings nach: {save_file}")
+    print(f"\nSaving embeddings to: {save_file}")
     np.savez_compressed(
         save_file,
         embeddings=result["embeddings"],
@@ -248,8 +248,8 @@ def main():
         seq_lens=result["seq_lens"],
     )
 
-    print(f"Erfolgreich gespeichert!")
-    print(f"Embedding Shape: {result['embeddings'].shape}")
+    print("Successfully saved!")
+    print(f"Embedding shape: {result['embeddings'].shape}")
 
 
 if __name__ == "__main__":

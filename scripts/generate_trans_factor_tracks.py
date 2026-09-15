@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """
-Generierung von kontinuierlichen Trans-Faktor Dichte- und Affinitaets-Tracks (Strategie B)
-fuer den hIPSC_CM-Datensatz mit inkrementeller Speicherung und O(log N) Vektorisierung.
+Generation of continuous trans-factor density and affinity tracks (Strategy B)
+for the hIPSC_CM dataset with incremental saving and O(log N) vectorization.
 
-Kombiniert:
-1. GTF-SQLite-Datenbank (Homo_sapiens.GRCh38.108.gtf.db via gffutils)
-2. TargetScan: miRNA-Bindungsaffinitaeten / Context++ Scores
-3. ENCODE eCLIP: Experimentelle RBP-Peak-Signalwerte
+Combines:
+1. GTF SQLite database (Homo_sapiens.GRCh38.108.gtf.db via gffutils)
+2. TargetScan: miRNA binding affinities / context++ scores
+3. ENCODE eCLIP: Experimental RBP peak signal values
 
 Features:
-- Schnelle binäre Suche (np.searchsorted): Reduziert die Laufzeit drastisch
-- Inkrementelle Speicherung in Chunks (fortsetzbar bei Abbruch)
-- Automatisches Zusammenführen zur finalen NPZ-Datei
+- Fast binary search (np.searchsorted): Drastically reduces runtime
+- Incremental storage in chunks (resumable upon interruption)
+- Automatic merging into the final NPZ file
 """
 
-from pandas._libs import properties
 import argparse
 import os
 from pathlib import Path
@@ -25,13 +24,13 @@ from tqdm import tqdm
 
 
 # =============================================================================
-# 1. Schneller Intervall-Index (O(log N) Suche statt O(N) Schleife)
+# 1. Fast Interval Index (O(log N) search instead of O(N) loop)
 # =============================================================================
 
 class FastIntervalIndex:
     """
-    Indexiert genomische Peaks eines Chromosoms/Strangs fuer extrem schnelle
-    Overlap-Abfragen mittels sortierter NumPy-Arrays und np.searchsorted.
+    Indexes genomic peaks of a chromosome/strand for extremely fast
+    overlap queries using sorted NumPy arrays and np.searchsorted.
     """
     def __init__(self, intervals: list):
         if not intervals:
@@ -48,7 +47,7 @@ class FastIntervalIndex:
         if self.empty:
             return None, None, None
 
-        # Nur Peaks pruefen, deren Start <= ex_end und >= ex_start - max_peak_len liegt
+        # Only check peaks whose start <= ex_end and >= ex_start - max_peak_len
         left_idx = np.searchsorted(self.starts, ex_start - self.max_peak_len, side="left")
         right_idx = np.searchsorted(self.starts, ex_end, side="right")
 
@@ -59,7 +58,7 @@ class FastIntervalIndex:
         sub_ends = self.ends[left_idx:right_idx]
         sub_scores = self.scores[left_idx:right_idx]
 
-        # Exakter Schnitt: Peak endet nach ex_start und beginnt vor ex_end
+        # Exact intersection: peak ends after ex_start and begins before ex_end
         mask = (sub_ends >= ex_start) & (sub_starts <= ex_end)
         if not np.any(mask):
             return None, None, None
@@ -68,25 +67,25 @@ class FastIntervalIndex:
 
 
 # =============================================================================
-# 2. GTF SQLite Datenbank Zugriff & Koordinaten-Mapping (via gffutils)
+# 2. GTF SQLite Database Access & Coordinate Mapping (via gffutils)
 # =============================================================================
 
 class GtfDbHelper:
     """
-    Kapselt den Zugriff auf die GTF-FeatureDB via gffutils.
+    Encapsulates access to the GTF FeatureDB via gffutils.
     """
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
         if not self.db_path.exists():
-            print(f"[Warnung] GTF-DB Datei '{self.db_path}' lokal nicht gefunden (laeuft auf Cluster).")
+            print(f"[Warning] GTF-DB file '{self.db_path}' not found locally (runs on cluster).")
 
-        print(f"[GTF-DB] Lade gffutils.FeatureDB: {self.db_path.name}")
+        print(f"[GTF-DB] Loading gffutils.FeatureDB: {self.db_path.name}")
         self.db = gffutils.FeatureDB(str(self.db_path))
 
     def get_transcript_exons(self, transcript_id: str) -> dict:
         """
-        Gibt Chromosom, Strang und eine nach Transkriptionsrichtung (5' -> 3')
-        geordnete Liste von Exon-Intervallen (start, end) zurueck.
+        Returns chromosome, strand, and a list of exon intervals (start, end)
+        ordered in transcription direction (5' -> 3').
         """
         clean_id = transcript_id.split(".")[0]
 
@@ -121,7 +120,7 @@ def map_genomic_intervals_to_transcript(
     transcript_len: int,
 ) -> np.ndarray:
     """
-    Mappt genomische Peaks hochperformant via Binärsuche auf die reife mRNA.
+    Maps genomic peaks to mature mRNA with high performance via binary search.
     """
     track = np.zeros(transcript_len, dtype=np.float32)
     if not exons or peak_index.empty:
@@ -156,21 +155,21 @@ def map_genomic_intervals_to_transcript(
 
 
 # =============================================================================
-# 3. Parser fuer TargetScan und ENCODE eCLIP
+# 3. Parser for TargetScan and ENCODE eCLIP
 # =============================================================================
 
 def load_targetscan_data(targetscan_path: Path) -> dict:
     if not targetscan_path.exists():
-        raise FileNotFoundError(f"TargetScan-Datei '{targetscan_path}' nicht gefunden.")
+        raise FileNotFoundError(f"TargetScan file '{targetscan_path}' not found.")
 
-    print(f"Lade TargetScan-Daten von: {targetscan_path}...")
+    print(f"Loading TargetScan data from: {targetscan_path}...")
     df_ts = pd.read_csv(targetscan_path, sep="\t", low_memory=False)
     tx_col = "Transcript ID"
     score_col = "weighted context++ score"
-    # Die beiden sind nicht gleich genamed
+    # The two column names have different naming conventions
     start_col = "UTR_start"
     end_col = "UTR end"
-    # Ungültige Zeilen ohne Start, End oder Score entfernen
+    # Remove invalid rows without start, end, or score
     df_ts = df_ts.dropna(subset=[tx_col, start_col, end_col, score_col])
 
     mapping = {}
@@ -186,18 +185,18 @@ def load_targetscan_data(targetscan_path: Path) -> dict:
 
         mapping.setdefault(raw_tx, []).append((start, end, score))
 
-    print(f"TargetScan: Bindungsstellen fuer {len(mapping)} einzigartige Transkripte geladen.")
+    print(f"TargetScan: Loaded binding sites for {len(mapping)} unique transcripts.")
     return mapping
 
 
 def load_eclip_indexed(bed_path: Path) -> dict:
     """
-    Laedt ENCODE eCLIP Peaks und baut fuer jedes (chrom, strand) einen FastIntervalIndex auf.
+    Loads ENCODE eCLIP peaks and builds a FastIntervalIndex for each (chrom, strand).
     """
     if not bed_path.exists():
-        raise FileNotFoundError(f"ENCODE eCLIP Datei '{bed_path}' nicht gefunden.")
+        raise FileNotFoundError(f"ENCODE eCLIP file '{bed_path}' not found.")
 
-    print(f"Lade ENCODE eCLIP Intervalle von: {bed_path}...")
+    print(f"Loading ENCODE eCLIP intervals from: {bed_path}...")
     raw_data = {}
     with open(bed_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -209,8 +208,8 @@ def load_eclip_indexed(bed_path: Path) -> dict:
 
             chrom = parts[0].replace("chr", "")
             try:
-                start = int(parts[1]) + 1   # BED 0-basiert -> 1-basiert (wie GTF)
-                end = int(parts[2])         # BED end ist bereits exklusiv, entspricht also 1-basiert inklusiv
+                start = int(parts[1]) + 1   # BED 0-based -> 1-based (like GTF)
+                end = int(parts[2])         # BED end is already exclusive, thus corresponds to 1-based inclusive
             except ValueError:
                 continue
 
@@ -221,13 +220,13 @@ def load_eclip_indexed(bed_path: Path) -> dict:
             if strand not in ["+", "-"]:
                 continue
 
-            # SignalValue (parts[6]) muss vorhanden, positiv und eine gültige Zahl sein
+            # SignalValue (parts[6]) must be present, positive, and a valid number
             if parts[6] in [".", "-1", "nan", "NaN", ""]:
                 continue
             try:
                 score = float(parts[6])
-                # Negative SignalValues bedeuten De-Enrichment (weniger Signal als Input-Kontrolle)
-                # und stellen keine RBP-Bindung dar
+                # Negative signal values indicate de-enrichment (less signal than input control)
+                # and do not represent RBP binding
                 if score <= 0.0:
                     continue
             except ValueError:
@@ -236,18 +235,18 @@ def load_eclip_indexed(bed_path: Path) -> dict:
             key = (chrom, strand)
             raw_data.setdefault(key, []).append((start, end, score))
 
-    # Erstelle FastIntervalIndex pro Chromosom/Strand
+    # Create FastIntervalIndex per chromosome/strand
     indexed_data = {}
     for key, intervals in raw_data.items():
         indexed_data[key] = FastIntervalIndex(intervals)
 
     total_peaks = sum(len(v) for v in raw_data.values())
-    print(f"eCLIP: {total_peaks} Peaks indiziert ueber {len(indexed_data)} (Chrom, Strand)-Kombinationen.")
+    print(f"eCLIP: Indexed {total_peaks} peaks across {len(indexed_data)} (chrom, strand) combinations.")
     return indexed_data
 
 
 # =============================================================================
-# 4. Saluki 6-Track Basis-Parser
+# 4. Saluki 6-Track Base Parser
 # =============================================================================
 
 def parse_saluki_base_tracks(raw_seq: str) -> tuple:
@@ -278,7 +277,7 @@ def parse_saluki_base_tracks(raw_seq: str) -> tuple:
 
 
 # =============================================================================
-# 5. Normalisierung fuer kontinuierliche Trans-Faktor Tracks (Kanäle 6 & 7)
+# 5. Normalization for Continuous Trans-Factor Tracks (Channels 6 & 7)
 # =============================================================================
 
 def normalize_trans_factor_tracks(
@@ -290,16 +289,16 @@ def normalize_trans_factor_tracks(
     minmax_mode: str = "global",
 ) -> tuple:
     """
-    Normalisiert die kontinuierlichen Kanäle 6 (miRNA) und 7 (eCLIP).
+    Normalizes the continuous channels 6 (miRNA) and 7 (eCLIP).
     
-    Methoden:
-      - 'none': Unverändert lassen (Rohwerte)
+    Methods:
+      - 'none': Keep unchanged (raw values)
       - 'log': np.log1p(x) -> log(1 + x)
       - 'minmax':
-          - Bei minmax_mode='global': x / max_val (geclippt auf [0, 1])
-          - Bei minmax_mode='sample': x / (max(x) if max(x) > 0 else 1.0)
+          - With minmax_mode='global': x / max_val (clipped to [0, 1])
+          - With minmax_mode='sample': x / (max(x) if max(x) > 0 else 1.0)
     """
-    # Negative Werte (De-Enrichment / Rauschen) vor der Transformation sauber auf 0 klammern
+    # Clamp negative values (de-enrichment / noise) cleanly to 0 before transformation
     mirna_track = np.maximum(0.0, mirna_track)
     eclip_track = np.maximum(0.0, eclip_track)
 
@@ -307,33 +306,33 @@ def normalize_trans_factor_tracks(
         return mirna_track, eclip_track
 
     if norm_method == "log":
-        # log1p behaelt Sparsity (0.0 -> 0.0) bei und staucht Extrema zusammen
+        # log1p preserves sparsity (0.0 -> 0.0) and compresses extreme values
         norm_mirna = np.log1p(mirna_track)
         norm_eclip = np.log1p(eclip_track)
         return norm_mirna, norm_eclip
 
     if norm_method in ["minmax", "min_max"]:
         if minmax_mode == "sample":
-            # Per-Transkript Min-Max-Skalierung
+            # Per-transcript min-max scaling
             m_max = float(np.max(mirna_track))
             e_max = float(np.max(eclip_track))
             norm_mirna = (mirna_track / m_max) if m_max > 0 else mirna_track
             norm_eclip = (eclip_track / e_max) if e_max > 0 else eclip_track
         else:
-            # Globale Referenz-Skalierung auf [0, 1]
+            # Global reference scaling to [0, 1]
             norm_mirna = np.clip(mirna_track / float(mirna_max), 0.0, 1.0)
             norm_eclip = np.clip(eclip_track / float(eclip_max), 0.0, 1.0)
         return norm_mirna, norm_eclip
 
-    raise ValueError(f"Unbekannte Normalisierungsmethode: '{norm_method}' (erlaubt: 'none', 'log', 'minmax')")
+    raise ValueError(f"Unknown normalization method: '{norm_method}' (allowed: 'none', 'log', 'minmax')")
 
 
 # =============================================================================
-# 6. Inkrementelles Chunking & Zusammenfuehrung
+# 6. Incremental Chunking & Merging
 # =============================================================================
 
 def save_chunk(chunk_idx: int, chunk_items: list, chunks_dir: Path, normalization: str = "none"):
-    """Speichert einen Block von Transkripten inkrementell als NPZ."""
+    """Saves a block of transcripts incrementally as NPZ."""
     chunk_file = chunks_dir / f"chunk_{chunk_idx:05d}.npz"
     np.savez_compressed(
         chunk_file,
@@ -353,13 +352,13 @@ def save_chunk(chunk_idx: int, chunk_items: list, chunks_dir: Path, normalizatio
 
 
 def merge_all_chunks(chunks_dir: Path, output_file: Path, normalization: str = "none"):
-    """Fuehrt alle erzeugten Chunks zu der finalen Master-NPZ zusammen."""
+    """Merges all generated chunks into the final master NPZ."""
     chunk_files = sorted(chunks_dir.glob("chunk_*.npz"))
     if not chunk_files:
-        print("[Fehler] Keine Chunks zum Zusammenfuehren gefunden!")
+        print("[Error] No chunks found to merge!")
         return
 
-    print(f"\nFühre {len(chunk_files)} Chunks zu {output_file} zusammen...")
+    print(f"\nMerging {len(chunk_files)} chunks into {output_file}...")
     all_tracks = []
     tx_ids = []
     gene_ids = []
@@ -372,7 +371,7 @@ def merge_all_chunks(chunks_dir: Path, output_file: Path, normalization: str = "
     eclip_flags = []
     gtf_flags = []
 
-    for cf in tqdm(chunk_files, desc="Chunks mergen"):
+    for cf in tqdm(chunk_files, desc="Merging chunks"):
         data = np.load(cf, allow_pickle=True)
         all_tracks.extend(data["tracks"])
         tx_ids.extend(data["ensembl_transcript_id"])
@@ -404,26 +403,26 @@ def merge_all_chunks(chunks_dir: Path, output_file: Path, normalization: str = "
 
     n = len(tx_ids)
     print("\n" + "=" * 65)
-    print("             COVERAGE & STATISTIK REPORT             ")
+    print("             COVERAGE & STATISTICS REPORT             ")
     print("=" * 65)
-    print(f"Gesamtanzahl Transkripte:            {n}")
-    print(f"Erfolgreich in GTF-DB gemappt:       {sum(gtf_flags)} ({sum(gtf_flags)/n*100:.2f} %)")
-    print(f"Transkripte mit TargetScan miRNAs:   {sum(mirna_flags)} ({sum(mirna_flags)/n*100:.2f} %)")
-    print(f"Transkripte mit ENCODE eCLIP Peaks:  {sum(eclip_flags)} ({sum(eclip_flags)/n*100:.2f} %)")
-    print(f"Normalisierung der Trans-Faktoren:   {normalization.upper()}")
-    print(f"Track-Dimensionen pro Transkript:    (L, 8)")
-    print(f"Kanalkonfiguration:                  [A, C, G, U, CDS, Splice, TargetScan, eCLIP]")
-    print(f"Finale Datei gespeichert:            {output_file}")
+    print(f"Total transcripts:                   {n}")
+    print(f"Successfully mapped in GTF DB:       {sum(gtf_flags)} ({sum(gtf_flags)/n*100:.2f} %)")
+    print(f"Transcripts with TargetScan miRNAs:  {sum(mirna_flags)} ({sum(mirna_flags)/n*100:.2f} %)")
+    print(f"Transcripts with ENCODE eCLIP peaks: {sum(eclip_flags)} ({sum(eclip_flags)/n*100:.2f} %)")
+    print(f"Trans-factor normalization:          {normalization.upper()}")
+    print(f"Track dimensions per transcript:     (L, 8)")
+    print(f"Channel configuration:               [A, C, G, U, CDS, Splice, TargetScan, eCLIP]")
+    print(f"Final file saved:                    {output_file}")
     print("=" * 65)
 
 
 # =============================================================================
-# 6. Haupt-Pipeline
+# 7. Main Pipeline
 # =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generiere kontinuierliche Trans-Faktor Dichte-Tracks fuer hIPSC_CM (mit Inkrementeller Speicherung)"
+        description="Generate continuous trans-factor density tracks for hIPSC_CM (with incremental saving)"
     )
     parser.add_argument(
         "--saluki_data",
@@ -431,84 +430,84 @@ def main():
         dest="saluki_data",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_ej_cds_transformed.txt",
-        help="Pfad zur hIPSC_CM-Datendatei (tab-separiert)",
+        help="Path to hIPSC_CM data file (tab-separated)",
     )
     parser.add_argument(
         "--gtf_db",
         type=str,
         default="/beegfs/prj/RNA_NLP/AlphaGenome/data/Homo_sapiens.GRCh38.108.gtf.db",
-        help="Pfad zur GTF SQLite DB",
+        help="Path to GTF SQLite DB",
     )
     parser.add_argument(
         "--targetscan_file",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/targetscan/Predicted_Targets_Context_Scores.default_predictions.txt",
-        help="Pfad zur TargetScan Voraussage-Tabelle",
+        help="Path to TargetScan prediction table",
     )
     parser.add_argument(
         "--encode_eclip_file",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/eclip/all_rbp_peaks_merged.bed",
-        help="Pfad zur ENCODE eCLIP BED/narrowPeak-Datei",
+        help="Path to ENCODE eCLIP BED/narrowPeak file",
     )
     parser.add_argument(
         "--output_file",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_multitrack_with_trans_factors.npz",
-        help="Ausgabedatei fuer das erweiterte NPZ-Archiv (wird bei Normalisierung automatisch mit Suffix ergaenzt)",
+        help="Output file for the augmented NPZ archive (automatically appended with normalization suffix)",
     )
     parser.add_argument(
         "--normalization",
         type=str,
         default="none",
         choices=["none", "log", "minmax"],
-        help="Normalisierungsmethode fuer die Trans-Faktor Tracks (Kanäle 6 & 7): 'none', 'log' (np.log1p) oder 'minmax' (Skalierung auf [0, 1])",
+        help="Normalization method for trans-factor tracks (channels 6 & 7): 'none', 'log' (np.log1p), or 'minmax' (scaled to [0, 1])",
     )
     parser.add_argument(
         "--minmax_mode",
         type=str,
         default="global",
         choices=["global", "sample"],
-        help="Modus fuer 'minmax': 'global' (nutzt Referenzmaxima mirna_max/eclip_max) oder 'sample' (pro Transkript separat)",
+        help="Mode for 'minmax': 'global' (uses reference maxima mirna_max/eclip_max) or 'sample' (separately per transcript)",
     )
     parser.add_argument(
         "--mirna_max",
         type=float,
         default=5.0,
-        help="Referenzmaximum fuer miRNA-Kanal bei globalem minmax (Standard: 5.0)",
+        help="Reference maximum for miRNA channel with global minmax (default: 5.0)",
     )
     parser.add_argument(
         "--eclip_max",
         type=float,
         default=600.0,
-        help="Referenzmaximum fuer eCLIP-Kanal bei globalem minmax (Standard: 600.0)",
+        help="Reference maximum for eCLIP channel with global minmax (default: 600.0)",
     )
     parser.add_argument(
         "--chunk_size",
         type=int,
         default=500,
-        help="Anzahl der Transkripte pro inkrementellem Speicher-Chunk (Standard: 500)",
+        help="Number of transcripts per incremental storage chunk (default: 500)",
     )
     parser.add_argument(
         "--max_length",
         type=int,
         default=12288,
-        help="Maximale Sequenzlaenge (Standard: 12288 bp)",
+        help="Maximum sequence length (default: 12288 bp)",
     )
     parser.add_argument(
         "--recreate",
         action="store_true",
-        help="Erzwingt das Neugenerieren aller Chunks und ueberschreibt/loescht bestehende Chunks.",
+        help="Forces regeneration of all chunks and overwrites/deletes existing chunks.",
     )
     args = parser.parse_args()
 
     norm_method = args.normalization.lower()
     out_file = Path(args.output_file)
 
-    # Dateiname und Chunk-Ordner dynamisch gemaess der Normalisierung anpassen
+    # Dynamically adjust filename and chunk folder according to normalization
     if norm_method != "none":
         stem = out_file.stem
-        # Nur anhaengen, wenn der Suffix nicht bereits im Namen steht
+        # Only append if suffix is not already in the stem
         if not stem.endswith(f"_{norm_method}"):
             out_file = out_file.parent / f"{stem}_{norm_method}{out_file.suffix}"
 
@@ -518,23 +517,23 @@ def main():
     chunks_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 75)
-    print("   Generierung von Trans-Faktor Dichte-Tracks (TargetScan, ENCODE eCLIP)   ")
+    print("   Generation of Trans-Factor Density Tracks (TargetScan, ENCODE eCLIP)   ")
     print("=" * 75)
-    print(f"Normalisierung:     {norm_method.upper()} " + (f"(Modus: {args.minmax_mode})" if norm_method == "minmax" else ""))
-    print(f"Ausgabedatei:       {out_file}")
-    print(f"Chunk-Verzeichnis:  {chunks_dir} (Chunk-Größe: {args.chunk_size})")
+    print(f"Normalization:      {norm_method.upper()} " + (f"(Mode: {args.minmax_mode})" if norm_method == "minmax" else ""))
+    print(f"Output file:        {out_file}")
+    print(f"Chunk directory:    {chunks_dir} (Chunk size: {args.chunk_size})")
 
-    # Pruefen auf bereits verarbeitete Transkripte fuer nahtlose Wiederaufnahme (Resume) oder Recreate
+    # Check for already processed transcripts for seamless resume or recreate
     completed_tx_ids = set()
     existing_chunks = sorted(chunks_dir.glob("chunk_*.npz"))
 
     if args.recreate:
-        print(f"[Recreate] Flag --recreate aktiv: Entferne {len(existing_chunks)} existierende Chunks für vollständigen Neustart...")
+        print(f"[Recreate] Flag --recreate active: Removing {len(existing_chunks)} existing chunks for a complete restart...")
         for cf in existing_chunks:
             try:
                 cf.unlink()
             except Exception as e:
-                print(f"[Warnung] Konnte {cf.name} nicht löschen: {e}")
+                print(f"[Warning] Could not delete {cf.name}: {e}")
         existing_chunks = []
     else:
         for cf in existing_chunks:
@@ -545,44 +544,44 @@ def main():
                 continue
 
         if completed_tx_ids:
-            print(f"[Resume] Bereits {len(completed_tx_ids)} fertige Transkripte in {len(existing_chunks)} Chunks gefunden!")
+            print(f"[Resume] Found {len(completed_tx_ids)} already processed transcripts in {len(existing_chunks)} chunks!")
 
-    # 1. Datenbanken & Lookup-Tabellen laden
+    # 1. Load databases & lookup tables
     gtf_helper = GtfDbHelper(Path(args.gtf_db))
     ts_data = load_targetscan_data(Path(args.targetscan_file))
     eclip_data = load_eclip_indexed(Path(args.encode_eclip_file))
 
-    # 2. hIPSC_CM Datensatz laden
+    # 2. Load hIPSC_CM dataset
     data_path = Path(args.saluki_data)
-    print(f"\nLade hIPSC_CM-Datensatz: {data_path}...")
+    print(f"\nLoading hIPSC_CM dataset: {data_path}...")
     df = pd.read_csv(data_path, sep="\t")
 
     total_samples = len(df)
-    print(f"Gesamteintraege in hIPSC_CM: {total_samples}")
+    print(f"Total entries in hIPSC_CM: {total_samples}")
 
-    # Bestimme naechsten Chunk-Index
+    # Determine next chunk index
     chunk_idx = len(existing_chunks)
     current_chunk_items = []
 
-    print("\nVerarbeite Transkripte (mit schnellem O(log N) Lookup & Inkrementellem Speichern)...")
-    with tqdm(total=total_samples, desc="Fortschritt", initial=len(completed_tx_ids)) as pbar:
+    print("\nProcessing transcripts (with fast O(log N) lookup & incremental saving)...")
+    with tqdm(total=total_samples, desc="Progress", initial=len(completed_tx_ids)) as pbar:
         for idx, row in df.iterrows():
             tx_id = str(row.get("ensembl_transcript_id", ""))
             clean_tx = tx_id.split(".")[0]
 
-            # Bereits fertige Transkripte ueberspringen
+            # Skip already completed transcripts
             if tx_id in completed_tx_ids or clean_tx in completed_tx_ids:
                 continue
 
             raw_seq = str(row["sequence"])
 
-            # Basis 6-Tracks
+            # Base 6-tracks
             six_track, l, utr3_start, upper_indices = parse_saluki_base_tracks(raw_seq)
             if l > args.max_length:
                 six_track = six_track[:args.max_length, :]
                 l = args.max_length
 
-            # Kanal 6: TargetScan miRNA
+            # Channel 6: TargetScan miRNA
             mirna_track = np.zeros((l, 1), dtype=np.float32)
             has_mirna = False
             if clean_tx in ts_data and upper_indices:
@@ -594,7 +593,7 @@ def main():
                         mirna_track[abs_start:clamped_end, 0] += score
                         has_mirna = True
 
-            # Kanal 7: ENCODE eCLIP via schnellem Index
+            # Channel 7: ENCODE eCLIP via fast index
             eclip_track = np.zeros((l, 1), dtype=np.float32)
             has_eclip = False
             has_gtf = False
@@ -613,7 +612,7 @@ def main():
                         has_eclip = True
                         eclip_track[:, 0] = eclip_1d
 
-            # Trans-Faktor Normalisierung (Kanäle 6 & 7) anwenden
+            # Apply trans-factor normalization (channels 6 & 7)
             mirna_track, eclip_track = normalize_trans_factor_tracks(
                 mirna_track,
                 eclip_track,
@@ -623,10 +622,10 @@ def main():
                 minmax_mode=args.minmax_mode,
             )
 
-            # Zusammenfuegen zu (L, 8)
+            # Concatenate to (L, 8)
             multi_track = np.concatenate([six_track, mirna_track, eclip_track], axis=1)
 
-            # Zu aktuellem Chunk hinzufuegen
+            # Add to current chunk
             current_chunk_items.append({
                 "track": multi_track,
                 "transcript_id": tx_id,
@@ -642,17 +641,17 @@ def main():
             })
             pbar.update(1)
 
-            # Inkrementelles Speichern nach jeweils chunk_size Transkripten
+            # Save incrementally after every chunk_size transcripts
             if len(current_chunk_items) >= args.chunk_size:
                 save_chunk(chunk_idx, current_chunk_items, chunks_dir, normalization=norm_method)
                 chunk_idx += 1
                 current_chunk_items = []
 
-        # Letzten unvollstaendigen Chunk speichern
+        # Save last incomplete chunk
         if current_chunk_items:
             save_chunk(chunk_idx, current_chunk_items, chunks_dir, normalization=norm_method)
 
-    # 3. Alle Chunks zusammenfuehren zur finalen Datei
+    # 3. Merge all chunks into final file
     merge_all_chunks(chunks_dir, out_file, normalization=norm_method)
 
 

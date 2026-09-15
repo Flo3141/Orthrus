@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 import pandas as pd
 
-# Pfad zur heruntergeladenen eCLIP BED-Datei
+# Path to downloaded eCLIP BED file
 bed_path = Path.home() / "Downloads" / "rer1_eclip_peaks.bed"
 if not bed_path.exists():
     bed_path = Path("rer1_eclip_peaks.bed")
@@ -10,10 +10,10 @@ if not bed_path.exists():
 output_all_csv = "eclip_rer1_peaks_all.csv"
 output_exonic_csv = "eclip_rer1_exonic_peaks.csv"
 
-print(f"Lese eCLIP BED-Datei: {bed_path}...")
+print(f"Reading eCLIP BED file: {bed_path}...")
 
-# Exon-Koordinaten fuer RER1 (ENST00000378512 / GRCh38, Plus-Strang)
-# Exon 1..7 (1-basiert geschlossen im Genom)
+# Exon coordinates for RER1 (ENST00000378512 / GRCh38, plus strand)
+# Exon 1..7 (1-based closed in genome)
 RER1_EXONS = [
     {"exon": 1, "start": 2391763, "end": 2391958, "region": "5' UTR / Exon 1"},
     {"exon": 2, "start": 2395784, "end": 2395871, "region": "CDS / Exon 2"},
@@ -27,23 +27,23 @@ RER1_EXONS = [
 rows = []
 with open(bed_path, "r", encoding="utf-8", errors="ignore") as f:
     for line in f:
-        # Header / Metadaten überspringen
+        # Skip header / metadata
         if line.startswith("track") or line.startswith("#") or not line.strip():
             continue
         parts = line.strip().split("\t")
         if len(parts) >= 6:
             rows.append(parts)
 
-print(f"Gefundene eCLIP-Einträge: {len(rows)}")
+print(f"Found eCLIP entries: {len(rows)}")
 
-# narrowPeak Spalten
+# narrowPeak columns
 columns = [
     "chrom", "chromStart", "chromEnd", "name", "score", "strand",
     "signalValue", "pValue", "qValue", "peak"
 ]
 df = pd.DataFrame([r[:10] for r in rows], columns=columns[:len(rows[0])])
 
-# Numerische Spalten umwandeln
+# Convert numeric columns
 df["chromStart"] = pd.to_numeric(df["chromStart"], errors="coerce")
 df["chromEnd"] = pd.to_numeric(df["chromEnd"], errors="coerce")
 df["peak_length"] = df["chromEnd"] - df["chromStart"]
@@ -55,7 +55,7 @@ if "signalValue" in df.columns:
 if "pValue" in df.columns:
     df["pValue"] = pd.to_numeric(df["pValue"], errors="coerce")
 
-# RBP und Zelllinie aus Spalte 'name' extrahieren (z. B. 'NONO_K562_rep01')
+# Extract RBP and cell line from 'name' column (e.g. 'NONO_K562_rep01')
 def parse_rbp_name(val):
     if not val or val == ".":
         return "Unknown", "", ""
@@ -70,18 +70,18 @@ df["RBP"] = [p[0] for p in parsed]
 df["Cell_Line"] = [p[1] for p in parsed]
 df["Replicate"] = [p[2] for p in parsed]
 
-# Nach Genom-Koordinaten sortieren
+# Sort by genomic coordinates
 df = df.sort_values(by=["chromStart", "chromEnd"])
 
-# 1. Alle Peaks speichern
+# 1. Save all peaks
 df.to_csv(output_all_csv, index=False)
-print(f"Alle Peaks gespeichert als: {output_all_csv}")
+print(f"All peaks saved as: {output_all_csv}")
 
-# 2. Exonische Overlaps fuer RER1 (Plus-Strang) ermitteln
-# Das sind genau die Peaks, die generate_trans_factor_tracks.py auf die mRNA mappt!
+# 2. Determine exonic overlaps for RER1 (plus strand)
+# These are precisely the peaks mapped onto the mRNA by generate_trans_factor_tracks.py!
 exonic_records = []
 
-# Kumulative mRNA-Position berechnen (5' -> 3')
+# Calculate cumulative mRNA position (5' -> 3')
 curr_tx_offset = 0
 for ex in RER1_EXONS:
     ex["tx_start"] = curr_tx_offset
@@ -90,16 +90,16 @@ for ex in RER1_EXONS:
     curr_tx_offset += ex_len
 
 for _, row in df.iterrows():
-    # RER1 liegt auf dem Plus-Strang
+    # RER1 is on the plus strand
     if row["strand"] != "+":
         continue
 
-    p_start = row["chromStart"] + 1  # 0-basiert -> 1-basiert
+    p_start = row["chromStart"] + 1  # 0-based -> 1-based
     p_end = row["chromEnd"]
     sig = row.get("signalValue", 0.0)
 
     for ex in RER1_EXONS:
-        # Prüfen auf Schnittmenge mit Exon
+        # Check for intersection with exon
         if p_end >= ex["start"] and p_start <= ex["end"]:
             overlap_start = max(p_start, ex["start"])
             overlap_end = min(p_end, ex["end"])
@@ -121,29 +121,29 @@ df_exonic = pd.DataFrame(exonic_records)
 if not df_exonic.empty:
     df_exonic = df_exonic.sort_values(by=["mRNA_rel_start", "signalValue"], ascending=[True, False])
     df_exonic.to_csv(output_exonic_csv, index=False)
-    print(f"Exonische Peaks (auf RER1 gemappt) gespeichert als: {output_exonic_csv}")
+    print(f"Exonic peaks (mapped to RER1) saved as: {output_exonic_csv}")
 
 # =============================================================================
-# Übersicht & Statistik ausgeben
+# Summary & statistics output
 # =============================================================================
 print("\n" + "=" * 70)
-print("             eCLIP PEAK STATISTIK FÜR RER1-REGION             ")
+print("             eCLIP PEAK STATISTICS FOR RER1 REGION            ")
 print("=" * 70)
-print(f"Gesamt-Peaks im Fenster:            {len(df)}")
-print(f"Peaks auf Plus-Strang (+):          {sum(df['strand'] == '+')}")
-print(f"Peaks auf Minus-Strang (-):         {sum(df['strand'] == '-')}")
-print(f"Peaks mit direktem Exon-Overlap:    {len(df_exonic)}")
+print(f"Total peaks in window:              {len(df)}")
+print(f"Peaks on plus strand (+):           {sum(df['strand'] == '+')}")
+print(f"Peaks on minus strand (-):          {sum(df['strand'] == '-')}")
+print(f"Peaks with direct exon overlap:     {len(df_exonic)}")
 
 if not df_exonic.empty:
-    print("\nVerteilung der eCLIP-Peaks über die Exons von RER1:")
+    print("\nDistribution of eCLIP peaks across exons of RER1:")
     print(df_exonic["Exon_Region"].value_counts().to_string())
 
-    print("\nTop 15 RBPs mit höchstem SignalValue auf RER1:")
+    print("\nTop 15 RBPs with highest signalValue on RER1:")
     top_rbps = df_exonic.groupby("RBP")["signalValue"].max().sort_values(ascending=False).head(15)
     for rbp, val in top_rbps.items():
         print(f"  - {rbp:<16}: max SignalValue = {val:.3f}")
 
-    print("\nErste 15 exonische Peaks (sortiert nach relativer mRNA-Position):")
+    print("\nFirst 15 exonic peaks (sorted by relative mRNA position):")
     preview_cols = ["Exon", "RBP", "Cell_Line", "mRNA_rel_start", "mRNA_rel_end", "signalValue", "Overlap_Length_nt"]
     print(df_exonic[[c for c in preview_cols if c in df_exonic.columns]].head(15).to_string(index=False))
 print("=" * 70)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Ridge-Regression Training & Evaluierung auf extrahierten Orthrus 6-Track Embeddings.
-Laeuft auf dem Cluster (CPU oder GPU-Node).
+Ridge regression training & evaluation on extracted Orthrus 6-track embeddings.
+Runs on cluster (CPU or GPU node).
 """
 
 import argparse
@@ -16,12 +16,12 @@ from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 
-# Alpha-Raster gemaess linear_probe_eval.py aus dem Orthrus-Paper
+# Alpha grid according to linear_probe_eval.py from the Orthrus paper
 DEFAULT_ALPHAS = [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0]
 
 
 def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray, prefix: str = "") -> dict:
-    """Berechnet Regressions-Metriken inklusive Korrelationen."""
+    """Calculates regression metrics including correlations."""
     p_corr, p_val = pearsonr(y_true, y_pred)
     s_corr, s_val = spearmanr(y_true, y_pred)
     mse = mean_squared_error(y_true, y_pred)
@@ -43,7 +43,7 @@ def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray, prefix: str = "") 
 
 
 def print_metrics(metrics: dict, title: str):
-    """Formatierte Konsolenausgabe fuer Metriken."""
+    """Formatted console output for metrics."""
     print(f"\n--- {title} ---")
     for k, v in metrics.items():
         if "pvalue" in k:
@@ -53,9 +53,9 @@ def print_metrics(metrics: dict, title: str):
 
 
 def load_npz(file_path: Path) -> dict:
-    """Laedt eine NPZ-Datei mit Embeddings und Metadaten."""
+    """Loads an NPZ file containing embeddings and metadata."""
     if not file_path.exists():
-        raise FileNotFoundError(f"Embedding-Datei nicht gefunden: {file_path}")
+        raise FileNotFoundError(f"Embedding file not found: {file_path}")
     data = np.load(file_path, allow_pickle=True)
     return {
         "embeddings": data["embeddings"],
@@ -67,7 +67,7 @@ def load_npz(file_path: Path) -> dict:
 
 
 def resolve_embedding_file(species: str, embeddings_dir: Path | None, data_dir: Path | None) -> Path:
-    """Findet den Pfad zur Embedding-Datei anhand von data_dir oder embeddings_dir."""
+    """Finds the path to the embedding file based on data_dir or embeddings_dir."""
     candidates = []
     if data_dir is not None:
         candidates.append(data_dir / f"rnahl-{species}" / "embeddings" / "orthrus_6track_embeddings.npz")
@@ -80,60 +80,60 @@ def resolve_embedding_file(species: str, embeddings_dir: Path | None, data_dir: 
         if c.exists():
             return c
             
-    # Default falls noch nicht existiert (fuer Fehlermeldung)
+    # Default if not yet existing (for error message)
     return candidates[0] if candidates else Path(f"orthrus_6track_embeddings_{species}.npz")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ridge Regression auf Orthrus Embeddings trainieren und evaluieren")
+    parser = argparse.ArgumentParser(description="Train and evaluate Ridge regression on Orthrus embeddings")
     parser.add_argument(
         "--data_dir",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench",
-        help="Pfad zum mrna_bench Datenverzeichnis (sucht in <data_dir>/rnahl-<species>/embeddings/)"
+        help="Path to mrna_bench data directory (looks in <data_dir>/rnahl-<species>/embeddings/)"
     )
     parser.add_argument(
         "--embeddings_dir",
         type=str,
         default=None,
-        help="Optionaler alternativer Pfad zu einem zentralen Embeddings-Verzeichnis"
+        help="Optional alternative path to a central embeddings directory"
     )
     parser.add_argument(
         "--output_dir",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/results/Orthrus/mRNABench",
-        help="Ausgabeverzeichnis fuer Modelle, Metriken und Vorhersagen"
+        help="Output directory for models, metrics, and predictions"
     )
     parser.add_argument(
         "--species",
         type=str,
         choices=["human", "mouse", "cross_species"],
         default="human",
-        help="Trainingsmodus: 'human', 'mouse' oder 'cross_species' (Train: Human, Test: Mouse)"
+        help="Training mode: 'human', 'mouse', or 'cross_species' (Train: Human, Test: Mouse)"
     )
     parser.add_argument(
         "--split_type",
         type=str,
         choices=["gene", "random"],
         default="gene",
-        help="'gene' (GroupShuffleSplit nach Genen gegen Leakage von Isoformen) oder 'random' (zufaelliger Split)"
+        help="'gene' (GroupShuffleSplit by gene against leakage of isoforms) or 'random' (random split)"
     )
     parser.add_argument(
         "--test_size",
         type=float,
         default=0.2,
-        help="Anteil des Test-Splits (Default: 0.2)"
+        help="Fraction of test split (default: 0.2)"
     )
     parser.add_argument(
         "--random_state",
         type=int,
         default=42,
-        help="Zufallssamen fuer Reproduzierbarkeit"
+        help="Random seed for reproducibility"
     )
     parser.add_argument(
         "--plot",
         action="store_true",
-        help="Optional: Erstelle Streudiagramm (y_true vs. y_pred) als PNG"
+        help="Optional: create scatter plot (y_true vs. y_pred) as PNG"
     )
     args = parser.parse_args()
 
@@ -143,31 +143,31 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=================================================================")
-    print("        Orthrus 6-Track Ridge Regression Evaluierung             ")
+    print("        Orthrus 6-Track Ridge Regression Evaluation              ")
     print("=================================================================")
-    print(f"Modus:        {args.species}")
-    print(f"Split-Typ:    {args.split_type}")
-    print(f"Test-Groesse: {args.test_size}")
-    print(f"Random State: {args.random_state}")
+    print(f"Mode:         {args.species}")
+    print(f"Split type:   {args.split_type}")
+    print(f"Test size:    {args.test_size}")
+    print(f"Random state: {args.random_state}")
 
     if args.species in ["human", "mouse"]:
         file_path = resolve_embedding_file(args.species, emb_dir, data_dir)
-        print(f"\nLade Daten: {file_path}")
+        print(f"\nLoading data: {file_path}")
         data = load_npz(file_path)
 
         X = data["embeddings"]
         y = data["targets"]
         genes = data["genes"]
 
-        print(f"Eintraege: {len(y)}, Feature-Dimension: {X.shape[1]}")
+        print(f"Entries: {len(y)}, Feature dimension: {X.shape[1]}")
 
-        # Split durchfuehren
+        # Perform split
         if args.split_type == "gene":
-            print("Fuehre gen-basierten Split (GroupShuffleSplit) durch...")
+            print("Performing gene-based split (GroupShuffleSplit)...")
             gss = GroupShuffleSplit(n_splits=1, test_size=args.test_size, random_state=args.random_state)
             train_idx, test_idx = next(gss.split(X, y, groups=genes))
         else:
-            print("Fuehre zufaelligen Split durch...")
+            print("Performing random split...")
             train_idx, test_idx = train_test_split(
                 np.arange(len(y)), test_size=args.test_size, random_state=args.random_state
             )
@@ -176,32 +176,32 @@ def main():
         X_test, y_test = X[test_idx], y[test_idx]
         test_genes = genes[test_idx]
 
-        print(f"Trainings-Set: {len(y_train)} Proben")
-        print(f"Test-Set:      {len(y_test)} Proben")
+        print(f"Training set: {len(y_train)} samples")
+        print(f"Test set:     {len(y_test)} samples")
 
-        # RidgeCV fitten
-        print(f"\nTrainiere RidgeCV mit 5-Fold Cross-Validation ueber Alphas {DEFAULT_ALPHAS}...")
+        # Fit RidgeCV
+        print(f"\nTraining RidgeCV with 5-fold cross-validation over alphas {DEFAULT_ALPHAS}...")
         model = RidgeCV(alphas=DEFAULT_ALPHAS, cv=5)
         model.fit(X_train, y_train)
 
-        print(f"Optimales Alpha: {model.alpha_}")
+        print(f"Optimal alpha: {model.alpha_}")
 
-        # Vorhersagen
+        # Predictions
         y_train_pred = model.predict(X_train)
         y_test_pred = model.predict(X_test)
 
         train_metrics = calculate_metrics(y_train, y_train_pred, prefix="train")
         test_metrics = calculate_metrics(y_test, y_test_pred, prefix="test")
 
-        print_metrics(train_metrics, f"Trainings-Metriken ({args.species})")
-        print_metrics(test_metrics, f"Test-Metriken ({args.species})")
+        print_metrics(train_metrics, f"Training Metrics ({args.species})")
+        print_metrics(test_metrics, f"Test Metrics ({args.species})")
 
-        # Speichern des Modells
+        # Save model
         model_file = out_dir / f"ridge_model_{args.species}.joblib"
         joblib.dump(model, model_file)
-        print(f"\nModell gespeichert unter: {model_file}")
+        print(f"\nModel saved to: {model_file}")
 
-        # Speichern der Vorhersagen
+        # Save predictions
         pred_df = pd.DataFrame({
             "gene": test_genes,
             "true_target": y_test,
@@ -209,9 +209,9 @@ def main():
         })
         pred_file = out_dir / f"predictions_{args.species}.csv"
         pred_df.to_csv(pred_file, index=False)
-        print(f"Vorhersagen gespeichert unter: {pred_file}")
+        print(f"Predictions saved to: {pred_file}")
 
-        # Speichern der Metriken als JSON
+        # Save metrics as JSON
         all_metrics = {
             "species": args.species,
             "split_type": args.split_type,
@@ -224,30 +224,30 @@ def main():
         metrics_file = out_dir / f"metrics_{args.species}.json"
         with open(metrics_file, "w") as f:
             json.dump(all_metrics, f, indent=4)
-        print(f"Metriken gespeichert unter: {metrics_file}")
+        print(f"Metrics saved to: {metrics_file}")
 
     elif args.species == "cross_species":
-        # Trainiere auf Human, teste auf Mouse
+        # Train on Human, test on Mouse
         human_file = resolve_embedding_file("human", emb_dir, data_dir)
         mouse_file = resolve_embedding_file("mouse", emb_dir, data_dir)
         
-        print(f"\nLade Human-Daten: {human_file}")
+        print(f"\nLoading human data: {human_file}")
         human_data = load_npz(human_file)
-        print(f"Lade Mouse-Daten: {mouse_file}")
+        print(f"Loading mouse data: {mouse_file}")
         mouse_data = load_npz(mouse_file)
 
         X_train, y_train = human_data["embeddings"], human_data["targets"]
         X_test, y_test = mouse_data["embeddings"], mouse_data["targets"]
         test_genes = mouse_data["genes"]
 
-        print(f"Trainings-Set (Human): {len(y_train)} Proben")
-        print(f"Test-Set (Mouse):      {len(y_test)} Proben")
+        print(f"Training set (Human): {len(y_train)} samples")
+        print(f"Test set (Mouse):      {len(y_test)} samples")
 
-        print(f"\nTrainiere RidgeCV auf Human...")
+        print(f"\nTraining RidgeCV on human...")
         model = RidgeCV(alphas=DEFAULT_ALPHAS, cv=5)
         model.fit(X_train, y_train)
 
-        print(f"Optimales Alpha: {model.alpha_}")
+        print(f"Optimal alpha: {model.alpha_}")
 
         y_train_pred = model.predict(X_train)
         y_test_pred = model.predict(X_test)
@@ -260,7 +260,7 @@ def main():
 
         model_file = out_dir / "ridge_model_cross_species_h2m.joblib"
         joblib.dump(model, model_file)
-        print(f"\nModell gespeichert unter: {model_file}")
+        print(f"\nModel saved to: {model_file}")
 
         pred_df = pd.DataFrame({
             "gene": test_genes,
@@ -269,7 +269,7 @@ def main():
         })
         pred_file = out_dir / "predictions_cross_species_h2m.csv"
         pred_df.to_csv(pred_file, index=False)
-        print(f"Vorhersagen gespeichert unter: {pred_file}")
+        print(f"Predictions saved to: {pred_file}")
 
         all_metrics = {
             "mode": "cross_species_human_to_mouse",
@@ -282,9 +282,9 @@ def main():
         metrics_file = out_dir / "metrics_cross_species_h2m.json"
         with open(metrics_file, "w") as f:
             json.dump(all_metrics, f, indent=4)
-        print(f"Metriken gespeichert unter: {metrics_file}")
+        print(f"Metrics saved to: {metrics_file}")
 
-    # Optionaler Plot
+    # Optional plot
     if args.plot:
         try:
             import matplotlib.pyplot as plt
@@ -292,10 +292,10 @@ def main():
             ax.scatter(y_test, y_test_pred, alpha=0.3, s=15, color="teal")
             p_val = test_metrics.get("test_pearson_r") or test_metrics.get("mouse_test_pearson_r")
             ax.set_title(f"Ridge Regression Test: {args.species} (Pearson R = {p_val:.3f})")
-            ax.set_xlabel("Wahrer Target-Wert (PC1 Half-Life)")
-            ax.set_ylabel("Vorhergesagter Wert")
+            ax.set_xlabel("True Target Value (PC1 Half-Life)")
+            ax.set_ylabel("Predicted Value")
             
-            # Diagonal-Referenzlinie
+            # Diagonal reference line
             lims = [
                 np.min([ax.get_xlim(), ax.get_ylim()]),
                 np.max([ax.get_xlim(), ax.get_ylim()])
@@ -306,11 +306,11 @@ def main():
             plot_file = out_dir / f"scatter_{args.species}.png"
             plt.savefig(plot_file, dpi=300)
             plt.close()
-            print(f"Streudiagramm gespeichert unter: {plot_file}")
+            print(f"Scatter plot saved to: {plot_file}")
         except Exception as e:
-            print(f"Plot konnte nicht erstellt werden: {e}")
+            print(f"Plot could not be created: {e}")
 
-    print("\nEvaluierung erfolgreich abgeschlossen!")
+    print("\nEvaluation successfully completed!")
 
 
 if __name__ == "__main__":
