@@ -280,23 +280,105 @@ def parse_saluki_base_tracks(raw_seq: str) -> tuple:
 # 5. Normalization for Continuous Trans-Factor Tracks (Channels 6 & 7)
 # =============================================================================
 
+def compute_dynamic_quantiles(
+    df: pd.DataFrame,
+    ts_data: dict,
+    eclip_data: dict,
+    gtf_helper: GtfDbHelper,
+    max_length: int = 12288,
+    quantile: float = 0.99,
+    sample_size: int = 2000,
+) -> tuple:
+    """
+    Dynamically determines high percentiles (default: 99th percentile, q99)
+    of non-zero trans-factor signal values across the dataset.
+    """
+    q_pct = quantile * 100.0 if quantile <= 1.0 else quantile
+    print(f"\n[Quantile Estimation] Dynamically calculating {q_pct:.1f}th percentile (q{int(q_pct)}) across dataset...")
+
+    if sample_size is not None and sample_size > 0 and len(df) > sample_size:
+        eval_df = df.sample(n=sample_size, random_state=42)
+        print(f"[Quantile Estimation] Subsampling {sample_size} transcripts for fast percentile estimation...")
+    else:
+        eval_df = df
+        print(f"[Quantile Estimation] Scanning all {len(eval_df)} transcripts...")
+
+    all_mirna_vals = []
+    all_eclip_vals = []
+
+    for _, row in tqdm(eval_df.iterrows(), total=len(eval_df), desc="Estimating quantiles"):
+        tx_id = str(row.get("ensembl_transcript_id", ""))
+        clean_tx = tx_id.split(".")[0]
+        raw_seq = str(row["sequence"])
+        l = min(len(raw_seq), max_length)
+
+        # miRNA channel: TargetScan on 3' UTR
+        if clean_tx in ts_data:
+            upper_indices = [i for i, c in enumerate(raw_seq[:l]) if c.isupper()]
+            utr3_start = (upper_indices[-1] + 3) if upper_indices else 0
+
+            mirna_1d = np.zeros(l, dtype=np.float32)
+            for start, end, score in ts_data[clean_tx]:
+                abs_start = utr3_start + (start - 1)
+                abs_end = utr3_start + end
+                if abs_start < l:
+                    mirna_1d[abs_start:min(abs_end, l)] += score
+            nz_mirna = mirna_1d[mirna_1d > 0]
+            if len(nz_mirna) > 0:
+                all_mirna_vals.append(nz_mirna)
+
+        # eCLIP channel: ENCODE peaks mapped to exons
+        tx_info = gtf_helper.get_transcript_exons(clean_tx)
+        if tx_info is not None:
+            chrom = str(tx_info["chrom"]).replace("chr", "")
+            strand = tx_info["strand"]
+            exons = tx_info["exons"]
+            key = (chrom, strand)
+
+            if key in eclip_data:
+                eclip_1d = map_genomic_intervals_to_transcript(exons, strand, eclip_data[key], l)
+                nz_eclip = eclip_1d[eclip_1d > 0]
+                if len(nz_eclip) > 0:
+                    all_eclip_vals.append(nz_eclip)
+
+    if all_mirna_vals:
+        flat_mirna = np.concatenate(all_mirna_vals)
+        mirna_q = float(np.percentile(flat_mirna, q_pct))
+        print(f"[Quantile Estimation] TargetScan miRNA {q_pct:.1f}% percentile: {mirna_q:.4f} (from {len(flat_mirna):,} active positions)")
+    else:
+        mirna_q = 5.0
+        print(f"[Quantile Estimation] Warning: No positive miRNA values found, fallback to {mirna_q:.4f}")
+
+    if all_eclip_vals:
+        flat_eclip = np.concatenate(all_eclip_vals)
+        eclip_q = float(np.percentile(flat_eclip, q_pct))
+        print(f"[Quantile Estimation] ENCODE eCLIP {q_pct:.1f}% percentile: {eclip_q:.4f} (from {len(flat_eclip):,} active positions)")
+    else:
+        eclip_q = 600.0
+        print(f"[Quantile Estimation] Warning: No positive eCLIP values found, fallback to {eclip_q:.4f}")
+
+    return mirna_q, eclip_q
+
+
 def normalize_trans_factor_tracks(
     mirna_track: np.ndarray,
     eclip_track: np.ndarray,
     norm_method: str,
-    mirna_max: float = 5.0,
-    eclip_max: float = 600.0,
-    minmax_mode: str = "global",
+    mirna_q99: float = 5.0,
+    eclip_q99: float = 600.0,
 ) -> tuple:
     """
-    Normalizes the continuous channels 6 (miRNA) and 7 (eCLIP).
+    Normalizes continuous channels 6 (miRNA) and 7 (eCLIP) using global scaling.
     
     Methods:
       - 'none': Keep unchanged (raw values)
       - 'log': np.log1p(x) -> log(1 + x)
-      - 'minmax':
-          - With minmax_mode='global': x / max_val (clipped to [0, 1])
-          - With minmax_mode='sample': x / (max(x) if max(x) > 0 else 1.0)
+      - 'robust_quantile' (or 'minmax'):
+          Log-transformation with Robust Quantile Scaling (State of the Art):
+          x_scaled = min(1.0, log(1 + x) / log(1 + q_99))
+          Prevents extreme outliers from compressing normal binding sites towards 0,
+          while preserving quantitative differences in the biologically relevant range.
+          Uses global dataset q_99 reference bounds (mirna_q99, eclip_q99).
     """
     # Clamp negative values (de-enrichment / noise) cleanly to 0 before transformation
     mirna_track = np.maximum(0.0, mirna_track)
@@ -311,27 +393,40 @@ def normalize_trans_factor_tracks(
         norm_eclip = np.log1p(eclip_track)
         return norm_mirna, norm_eclip
 
-    if norm_method in ["minmax", "min_max"]:
-        if minmax_mode == "sample":
-            # Per-transcript min-max scaling
-            m_max = float(np.max(mirna_track))
-            e_max = float(np.max(eclip_track))
-            norm_mirna = (mirna_track / m_max) if m_max > 0 else mirna_track
-            norm_eclip = (eclip_track / e_max) if e_max > 0 else eclip_track
-        else:
-            # Global reference scaling to [0, 1]
-            norm_mirna = np.clip(mirna_track / float(mirna_max), 0.0, 1.0)
-            norm_eclip = np.clip(eclip_track / float(eclip_max), 0.0, 1.0)
+    if norm_method in ["robust_quantile", "quantile", "log_quantile", "minmax", "min_max"]:
+        # Global robust quantile scaling: x_scaled = min(1.0, log(1 + x) / log(1 + q_99))
+        denom_mirna = np.log1p(float(mirna_q99))
+        denom_eclip = np.log1p(float(eclip_q99))
+        norm_mirna = (
+            np.clip(np.log1p(mirna_track) / denom_mirna, 0.0, 1.0)
+            if denom_mirna > 0
+            else mirna_track
+        )
+        norm_eclip = (
+            np.clip(np.log1p(eclip_track) / denom_eclip, 0.0, 1.0)
+            if denom_eclip > 0
+            else eclip_track
+        )
         return norm_mirna, norm_eclip
 
-    raise ValueError(f"Unknown normalization method: '{norm_method}' (allowed: 'none', 'log', 'minmax')")
+    raise ValueError(
+        f"Unknown normalization method: '{norm_method}' "
+        "(allowed: 'none', 'log', 'robust_quantile', 'minmax')"
+    )
 
 
 # =============================================================================
 # 6. Incremental Chunking & Merging
 # =============================================================================
 
-def save_chunk(chunk_idx: int, chunk_items: list, chunks_dir: Path, normalization: str = "none"):
+def save_chunk(
+    chunk_idx: int,
+    chunk_items: list,
+    chunks_dir: Path,
+    normalization: str = "none",
+    mirna_q99: float = None,
+    eclip_q99: float = None,
+):
     """Saves a block of transcripts incrementally as NPZ."""
     chunk_file = chunks_dir / f"chunk_{chunk_idx:05d}.npz"
     np.savez_compressed(
@@ -348,10 +443,18 @@ def save_chunk(chunk_idx: int, chunk_items: list, chunks_dir: Path, normalizatio
         has_eclip=np.array([item["has_eclip"] for item in chunk_items], dtype=bool),
         has_gtf=np.array([item["has_gtf"] for item in chunk_items], dtype=bool),
         normalization=str(normalization),
+        mirna_q99=np.float32(mirna_q99) if mirna_q99 is not None else np.nan,
+        eclip_q99=np.float32(eclip_q99) if eclip_q99 is not None else np.nan,
     )
 
 
-def merge_all_chunks(chunks_dir: Path, output_file: Path, normalization: str = "none"):
+def merge_all_chunks(
+    chunks_dir: Path,
+    output_file: Path,
+    normalization: str = "none",
+    mirna_q99: float = None,
+    eclip_q99: float = None,
+):
     """Merges all generated chunks into the final master NPZ."""
     chunk_files = sorted(chunks_dir.glob("chunk_*.npz"))
     if not chunk_files:
@@ -399,6 +502,8 @@ def merge_all_chunks(chunks_dir: Path, output_file: Path, normalization: str = "
         has_eclip=np.array(eclip_flags, dtype=bool),
         has_gtf=np.array(gtf_flags, dtype=bool),
         normalization=str(normalization),
+        mirna_q99=np.float32(mirna_q99) if mirna_q99 is not None else np.nan,
+        eclip_q99=np.float32(eclip_q99) if eclip_q99 is not None else np.nan,
     )
 
     n = len(tx_ids)
@@ -409,7 +514,11 @@ def merge_all_chunks(chunks_dir: Path, output_file: Path, normalization: str = "
     print(f"Successfully mapped in GTF DB:       {sum(gtf_flags)} ({sum(gtf_flags)/n*100:.2f} %)")
     print(f"Transcripts with TargetScan miRNAs:  {sum(mirna_flags)} ({sum(mirna_flags)/n*100:.2f} %)")
     print(f"Transcripts with ENCODE eCLIP peaks: {sum(eclip_flags)} ({sum(eclip_flags)/n*100:.2f} %)")
-    print(f"Trans-factor normalization:          {normalization.upper()}")
+    print(f"Trans-factor normalization:          {normalization.upper()} (Global Scaling)")
+    if mirna_q99 is not None and not np.isnan(mirna_q99):
+        print(f"Global miRNA q99 bound:              {mirna_q99:.4f}")
+    if eclip_q99 is not None and not np.isnan(eclip_q99):
+        print(f"Global eCLIP q99 bound:              {eclip_q99:.4f}")
     print(f"Track dimensions per transcript:     (L, 8)")
     print(f"Channel configuration:               [A, C, G, U, CDS, Splice, TargetScan, eCLIP]")
     print(f"Final file saved:                    {output_file}")
@@ -460,27 +569,36 @@ def main():
         "--normalization",
         type=str,
         default="none",
-        choices=["none", "log", "minmax"],
-        help="Normalization method for trans-factor tracks (channels 6 & 7): 'none', 'log' (np.log1p), or 'minmax' (scaled to [0, 1])",
+        choices=["none", "log", "robust_quantile", "quantile", "minmax"],
+        help="Normalization method for trans-factor tracks (channels 6 & 7): 'none', 'log' (np.log1p), 'robust_quantile' (log-transform with robust quantile scaling to [0, 1]), or 'minmax' (alias for robust_quantile)",
     )
     parser.add_argument(
-        "--minmax_mode",
-        type=str,
-        default="global",
-        choices=["global", "sample"],
-        help="Mode for 'minmax': 'global' (uses reference maxima mirna_max/eclip_max) or 'sample' (separately per transcript)",
-    )
-    parser.add_argument(
+        "--mirna_q99",
         "--mirna_max",
+        dest="mirna_q99",
         type=float,
-        default=5.0,
-        help="Reference maximum for miRNA channel with global minmax (default: 5.0)",
+        default=None,
+        help="99th percentile (q99) reference bound for miRNA channel (default: None, dynamically calculated from dataset)",
     )
     parser.add_argument(
+        "--eclip_q99",
         "--eclip_max",
+        dest="eclip_q99",
         type=float,
-        default=600.0,
-        help="Reference maximum for eCLIP channel with global minmax (default: 600.0)",
+        default=None,
+        help="99th percentile (q99) reference bound for eCLIP channel (default: None, dynamically calculated from dataset)",
+    )
+    parser.add_argument(
+        "--quantile",
+        type=float,
+        default=0.99,
+        help="Percentile to compute dynamically (default: 0.99 for 99th percentile)",
+    )
+    parser.add_argument(
+        "--quantile_sample_size",
+        type=int,
+        default=2000,
+        help="Number of transcripts to sample for dynamic quantile estimation (default: 2000, set to 0 for all transcripts)",
     )
     parser.add_argument(
         "--chunk_size",
@@ -519,7 +637,7 @@ def main():
     print("=" * 75)
     print("   Generation of Trans-Factor Density Tracks (TargetScan, ENCODE eCLIP)   ")
     print("=" * 75)
-    print(f"Normalization:      {norm_method.upper()} " + (f"(Mode: {args.minmax_mode})" if norm_method == "minmax" else ""))
+    print(f"Normalization:      {norm_method.upper()} (Global Robust Quantile Scaling)")
     print(f"Output file:        {out_file}")
     print(f"Chunk directory:    {chunks_dir} (Chunk size: {args.chunk_size})")
 
@@ -558,6 +676,43 @@ def main():
 
     total_samples = len(df)
     print(f"Total entries in hIPSC_CM: {total_samples}")
+
+    # Dynamic quantile determination for global scaling
+    mirna_q99 = args.mirna_q99
+    eclip_q99 = args.eclip_q99
+
+    if norm_method in ["robust_quantile", "quantile", "minmax"]:
+        # Check existing chunks for saved quantiles (to ensure consistency across resume)
+        if not args.recreate and existing_chunks:
+            for cf in existing_chunks:
+                try:
+                    c_data = np.load(cf, allow_pickle=True)
+                    if mirna_q99 is None and "mirna_q99" in c_data and not np.isnan(c_data["mirna_q99"]):
+                        mirna_q99 = float(c_data["mirna_q99"])
+                    if eclip_q99 is None and "eclip_q99" in c_data and not np.isnan(c_data["eclip_q99"]):
+                        eclip_q99 = float(c_data["eclip_q99"])
+                    if mirna_q99 is not None and eclip_q99 is not None:
+                        print(f"[Resume] Reusing dynamic quantiles from {cf.name}: miRNA q99={mirna_q99:.4f}, eCLIP q99={eclip_q99:.4f}")
+                        break
+                except Exception:
+                    continue
+
+        if mirna_q99 is None or eclip_q99 is None:
+            dyn_mirna, dyn_eclip = compute_dynamic_quantiles(
+                df=df,
+                ts_data=ts_data,
+                eclip_data=eclip_data,
+                gtf_helper=gtf_helper,
+                max_length=args.max_length,
+                quantile=args.quantile,
+                sample_size=args.quantile_sample_size,
+            )
+            if mirna_q99 is None:
+                mirna_q99 = dyn_mirna
+            if eclip_q99 is None:
+                eclip_q99 = dyn_eclip
+
+        print(f"[Scaling Bounds] Active global reference bounds: miRNA q99 = {mirna_q99:.4f}, eCLIP q99 = {eclip_q99:.4f}\n")
 
     # Determine next chunk index
     chunk_idx = len(existing_chunks)
@@ -617,9 +772,8 @@ def main():
                 mirna_track,
                 eclip_track,
                 norm_method=norm_method,
-                mirna_max=args.mirna_max,
-                eclip_max=args.eclip_max,
-                minmax_mode=args.minmax_mode,
+                mirna_q99=mirna_q99,
+                eclip_q99=eclip_q99,
             )
 
             # Concatenate to (L, 8)
@@ -643,16 +797,36 @@ def main():
 
             # Save incrementally after every chunk_size transcripts
             if len(current_chunk_items) >= args.chunk_size:
-                save_chunk(chunk_idx, current_chunk_items, chunks_dir, normalization=norm_method)
+                save_chunk(
+                    chunk_idx,
+                    current_chunk_items,
+                    chunks_dir,
+                    normalization=norm_method,
+                    mirna_q99=mirna_q99,
+                    eclip_q99=eclip_q99,
+                )
                 chunk_idx += 1
                 current_chunk_items = []
 
         # Save last incomplete chunk
         if current_chunk_items:
-            save_chunk(chunk_idx, current_chunk_items, chunks_dir, normalization=norm_method)
+            save_chunk(
+                chunk_idx,
+                current_chunk_items,
+                chunks_dir,
+                normalization=norm_method,
+                mirna_q99=mirna_q99,
+                eclip_q99=eclip_q99,
+            )
 
     # 3. Merge all chunks into final file
-    merge_all_chunks(chunks_dir, out_file, normalization=norm_method)
+    merge_all_chunks(
+        chunks_dir,
+        out_file,
+        normalization=norm_method,
+        mirna_q99=mirna_q99,
+        eclip_q99=eclip_q99,
+    )
 
 
 if __name__ == "__main__":
