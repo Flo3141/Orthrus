@@ -369,7 +369,7 @@ def train_model(
         return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and use_scaler))
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and use_scaler))
 
     best_val_r = -1.0
     best_epoch = -1
@@ -386,7 +386,7 @@ def train_model(
     if resume and latest_ckpt_path.exists():
         print(f"\n[Resume] Found existing checkpoint: {latest_ckpt_path}")
         print("Loading model, optimizer, scheduler, and scaler state...")
-        ckpt = torch.load(latest_ckpt_path, map_location=device)
+        ckpt = torch.load(latest_ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
@@ -398,15 +398,21 @@ def train_model(
         start_epoch = ckpt["epoch"] + 1
 
         if "random_states" in ckpt:
-            rs = ckpt["random_states"]
-            if rs.get("torch") is not None:
-                torch.set_rng_state(rs["torch"])
-            if rs.get("cuda") is not None and torch.cuda.is_available():
-                torch.cuda.set_rng_state_all(rs["cuda"])
-            if rs.get("numpy") is not None:
-                np.random.set_state(rs["numpy"])
-            if rs.get("python") is not None:
-                random.setstate(rs["python"])
+            try:
+                rs = ckpt["random_states"]
+                if rs.get("torch") is not None:
+                    # torch.set_rng_state strictly expects a CPU ByteTensor
+                    torch_state = rs["torch"].cpu() if isinstance(rs["torch"], torch.Tensor) else rs["torch"]
+                    torch.set_rng_state(torch_state)
+                if rs.get("cuda") is not None and torch.cuda.is_available():
+                    cuda_states = [s.cpu() if isinstance(s, torch.Tensor) else s for s in rs["cuda"]]
+                    torch.cuda.set_rng_state_all(cuda_states)
+                if rs.get("numpy") is not None:
+                    np.random.set_state(rs["numpy"])
+                if rs.get("python") is not None:
+                    random.setstate(rs["python"])
+            except Exception as e:
+                print(f"[Warning] Could not fully restore random states ({e}), proceeding with current RNG state.")
 
         print(f"[Resume] Successfully resumed from Epoch {ckpt['epoch']}. Next training epoch: {start_epoch}/{epochs}")
         if start_epoch > epochs:
@@ -546,9 +552,9 @@ def train_model(
     # Evaluate best model on test set
     if test_loader is not None and best_ckpt_path.exists():
         print("\nLoading best model checkpoint for Test Set Evaluation...")
-        ckpt = torch.load(best_ckpt_path, map_location=device)
+        ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
-        test_metrics = evaluate(model, test_loader, device, loss_fn)
+        test_metrics = evaluate(model, test_loader, device, loss_fn, amp_dtype=amp_dtype)
 
         print("=" * 60)
         print("                 TEST SET METRICS                 ")
