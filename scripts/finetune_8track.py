@@ -651,16 +651,29 @@ def main():
         help="Linear warmup epochs (default: 3)",
     )
     parser.add_argument(
+        "--splits_lookup_path",
+        type=str,
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hipsc_cm_10folds_lookup.csv",
+        help="Path to standardized 10-fold split lookup table CSV (from create_hipsc_cm_splits.py)",
+    )
+    parser.add_argument(
+        "--split_type",
+        type=str,
+        choices=["lookup", "gene"],
+        default="lookup",
+        help="'lookup' (standardized 10-fold table: Train 0-5, Val 6-7, Test 8-9) or 'gene' (ad-hoc GroupShuffleSplit)",
+    )
+    parser.add_argument(
         "--test_size",
         type=float,
         default=0.10,
-        help="Fraction of genes reserved for test set (default: 0.10)",
+        help="Fraction of genes reserved for test set if fallback to 'gene' (default: 0.10)",
     )
     parser.add_argument(
         "--val_size",
         type=float,
         default=0.10,
-        help="Fraction of genes reserved for validation set (default: 0.10)",
+        help="Fraction of genes reserved for validation set if fallback to 'gene' (default: 0.10)",
     )
     parser.add_argument(
         "--random_seed",
@@ -717,7 +730,7 @@ def main():
 
     # 1. Load multi-track NPZ dataset
     data_file = Path(args.data_path)
-    print(f"Loading 8-track dataset: {data_file}...")
+    print(f"Loading dataset: {data_file}...")
     npz_data = np.load(data_file, allow_pickle=True)
 
     tracks = npz_data["tracks"]
@@ -748,25 +761,62 @@ def main():
         genes = genes[valid_mask]
         tx_ids = tx_ids[valid_mask]
 
+    n_channels = tracks[0].shape[1]
     print(f"Total valid samples loaded: {len(targets)}")
     print(f"Unique genes:              {len(np.unique(genes))}")
+    print(f"Detected track channels:   {n_channels} (Mode: {'8-Track' if n_channels == 8 else '6-Track'})")
     print(f"Target column:             {args.target_col}")
 
-    # 2. Gene-grouped Train / Val / Test splitting
-    print("\nCreating Gene-Grouped splits to prevent isoform leakage...")
-    gss_test = GroupShuffleSplit(n_splits=1, test_size=args.test_size, random_state=args.random_seed)
-    train_val_idx, test_idx = next(gss_test.split(tracks, targets, groups=genes))
+    # 2. Train / Val / Test splitting
+    lookup_path = Path(args.splits_lookup_path)
+    use_lookup = (args.split_type == "lookup" and lookup_path.exists())
 
-    val_rel_size = args.val_size / (1.0 - args.test_size)
-    gss_val = GroupShuffleSplit(n_splits=1, test_size=val_rel_size, random_state=args.random_seed)
-    train_sub_idx, val_sub_idx = next(gss_val.split(tracks[train_val_idx], targets[train_val_idx], groups=genes[train_val_idx]))
+    if args.split_type == "lookup" and not lookup_path.exists():
+        print(f"\n[Warning] Splits lookup table not found at: {lookup_path}")
+        print("Falling back to ad-hoc Gene-Grouped GroupShuffleSplit.")
+        use_lookup = False
 
-    train_idx = train_val_idx[train_sub_idx]
-    val_idx = train_val_idx[val_sub_idx]
+    if use_lookup:
+        print(f"\nUsing Standardized 10-Fold Lookup Table: {lookup_path}")
+        lookup_df = pd.read_csv(lookup_path)
 
-    print(f"  Train samples: {len(train_idx)} ({len(np.unique(genes[train_idx]))} genes)")
-    print(f"  Val samples:   {len(val_idx)} ({len(np.unique(genes[val_idx]))} genes)")
-    print(f"  Test samples:  {len(test_idx)} ({len(np.unique(genes[test_idx]))} genes)")
+        lookup_tx_col = "ensembl_transcript_id" if "ensembl_transcript_id" in lookup_df.columns else "transcript_id"
+        tx_to_split = dict(zip(lookup_df[lookup_tx_col].astype(str).str.strip(), lookup_df["split"].astype(int)))
+
+        sample_splits = np.array([tx_to_split.get(str(t).strip(), -1) for t in tx_ids])
+        unmatched_count = int(np.sum(sample_splits == -1))
+        if unmatched_count > 0:
+            print(f"[Warning] {unmatched_count} transcripts not found in lookup table! Filtering them out.")
+            matched_mask = (sample_splits != -1)
+            tracks = [t for i, t in enumerate(tracks) if matched_mask[i]]
+            targets = targets[matched_mask]
+            genes = genes[matched_mask]
+            tx_ids = tx_ids[matched_mask]
+            sample_splits = sample_splits[matched_mask]
+
+        train_idx = np.where(np.isin(sample_splits, [0, 1, 2, 3, 4, 5]))[0]
+        val_idx = np.where(np.isin(sample_splits, [6, 7]))[0]
+        test_idx = np.where(np.isin(sample_splits, [8, 9]))[0]
+
+        print(f"\n[Split Breakdown from Lookup Table]")
+        print(f"  Train (Splits 0-5): {len(train_idx)} samples ({len(np.unique(genes[train_idx]))} genes, {len(train_idx)/len(targets)*100:.1f}%)")
+        print(f"  Val   (Splits 6-7): {len(val_idx)} samples ({len(np.unique(genes[val_idx]))} genes, {len(val_idx)/len(targets)*100:.1f}%)")
+        print(f"  Test  (Splits 8-9): {len(test_idx)} samples ({len(np.unique(genes[test_idx]))} genes, {len(test_idx)/len(targets)*100:.1f}%)")
+    else:
+        print("\nCreating Ad-hoc Gene-Grouped splits (GroupShuffleSplit)...")
+        gss_test = GroupShuffleSplit(n_splits=1, test_size=args.test_size, random_state=args.random_seed)
+        train_val_idx, test_idx = next(gss_test.split(tracks, targets, groups=genes))
+
+        val_rel_size = args.val_size / (1.0 - args.test_size)
+        gss_val = GroupShuffleSplit(n_splits=1, test_size=val_rel_size, random_state=args.random_seed)
+        train_sub_idx, val_sub_idx = next(gss_val.split(tracks[train_val_idx], targets[train_val_idx], groups=genes[train_val_idx]))
+
+        train_idx = train_val_idx[train_sub_idx]
+        val_idx = train_val_idx[val_sub_idx]
+
+        print(f"  Train samples: {len(train_idx)} ({len(np.unique(genes[train_idx]))} genes)")
+        print(f"  Val samples:   {len(val_idx)} ({len(np.unique(genes[val_idx]))} genes)")
+        print(f"  Test samples:  {len(test_idx)} ({len(np.unique(genes[test_idx]))} genes)")
 
     # 3. Create Datasets & DataLoaders
     train_ds = MultiTrackDataset([tracks[i] for i in train_idx], targets[train_idx], genes[train_idx], tx_ids[train_idx], args.max_length)
