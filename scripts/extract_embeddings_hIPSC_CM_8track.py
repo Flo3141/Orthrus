@@ -68,7 +68,7 @@ def extract_embeddings_for_8track(
 
         with torch.no_grad():
             batch_emb = model.representation(x_tensor, lengths_tensor, channel_last=True)
-            batch_emb_np = batch_emb.cpu().numpy()
+            batch_emb_np = batch_emb.cpu().float().numpy()
 
         for b_idx, s in enumerate(batch):
             orig_i = s["orig_idx"]
