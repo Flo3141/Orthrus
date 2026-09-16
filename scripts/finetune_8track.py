@@ -180,8 +180,8 @@ def evaluate(model: nn.Module, dataloader: DataLoader, device: torch.device, los
 
             if not (torch.isnan(loss) or torch.isinf(loss)):
                 total_loss += loss.item() * len(targets)
-            all_preds.extend(preds.detach().cpu().numpy())
-            all_targets.extend(targets.detach().cpu().numpy())
+            all_preds.extend(preds.detach().cpu().float().numpy())
+            all_targets.extend(targets.detach().cpu().float().numpy())
 
     y_true = np.array(all_targets)
     y_pred = np.array(all_preds)
