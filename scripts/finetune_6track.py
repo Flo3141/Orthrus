@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """
-End-to-End Supervised Fine-Tuning of the 8-Track Orthrus Model on Trans-Factor Augmented Datasets.
+End-to-End Supervised Fine-Tuning of the 6-Track Orthrus Model on hIPSC_CM Dataset.
 
 Features:
-- Loads the 8-track converted Orthrus model (AutoModel with trust_remote_code=True)
-- Attaches an Orthrus-style regression projection head
-- Loads multi-track data (channels: A, C, G, U, CDS, Splice, miRNA, eCLIP) from generate_trans_factor_tracks.py
-- Gene-grouped Train / Validation / Test splitting (avoids data leakage across isoforms)
+- Loads the pretrained 6-track Orthrus model (quietflamingo/orthrus-large-6-track)
+- Attaches the exact same regression projection head as 8-track fine-tuning
+- Slices/loads 6-channel multi-track RNA representations (channels 0-5: A, C, G, U, CDS, Splice)
+- Standardized 10-fold gene-grouped split integration (Train: 0-5, Val: 6-7, Test: 8-9)
 - Dynamic length padding with bucketing to minimize padding overhead
-- Differential learning rates:
-    - Backbone Mamba layers: low LR (e.g. 5e-5)
-    - Input embedding (channels 6 & 7): higher LR (e.g. 2e-4) to rapidly adapt new signals
-    - Regression projection head: higher LR (e.g. 3e-4)
-- Mixed-precision training (torch.cuda.amp) with Cosine Annealing + Linear Warmup
-- Saves the best checkpoint based on validation Pearson r and exports fine-tuned backbone in Hugging Face format
+- Cosine Annealing with Linear Warmup + Mixed Precision (bf16) + Huber loss
+- Saves best checkpoint based on validation Pearson r and exports fine-tuned backbone in Hugging Face format
 """
 
 import argparse
@@ -46,12 +42,18 @@ import matplotlib.pyplot as plt
 
 class MultiTrackDataset(Dataset):
     """
-    Dataset wrapping variable-length multi-track RNA representations and target values.
+    Dataset wrapping variable-length 6-track RNA representations and target values.
     """
     def __init__(self, tracks: list, targets: np.ndarray, genes: np.ndarray, transcript_ids: np.ndarray, max_length: int = 12288):
         self.samples = []
         for i in range(len(tracks)):
             tr = tracks[i]
+            # Ensure strictly 6 channels (slice if input contains 8 channels)
+            if tr.shape[1] > 6:
+                tr = tr[:, :6]
+            elif tr.shape[1] < 6:
+                raise ValueError(f"Sample {i} has only {tr.shape[1]} channels, but 6-track requires 6 channels.")
+
             if tr.shape[0] > max_length:
                 tr = tr[:max_length, :]
             self.samples.append({
@@ -71,20 +73,18 @@ class MultiTrackDataset(Dataset):
 
 class BucketBatchSampler(Sampler):
     """
-    Batches sequences of similar lengths together to dramatically minimize zero-padding overhead.
+    Batches sequences of similar lengths together to minimize zero-padding overhead.
     """
     def __init__(self, dataset: MultiTrackDataset, batch_size: int, shuffle: bool = True):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
-        
-        # Sort indices by sequence length
+
         indices_and_lens = [(i, dataset.samples[i]["length"]) for i in range(len(dataset))]
         indices_and_lens.sort(key=lambda x: x[1])
         self.sorted_indices = [x[0] for x in indices_and_lens]
 
     def __iter__(self):
-        # Create batches of similar length
         batches = [
             self.sorted_indices[i : i + self.batch_size]
             for i in range(0, len(self.sorted_indices), self.batch_size)
@@ -104,7 +104,7 @@ def pad_collate_fn(batch: list) -> dict:
     """
     b_lens = [s["length"] for s in batch]
     max_b_len = max(b_lens)
-    n_channels = batch[0]["track"].shape[1]
+    n_channels = 6
 
     padded_tracks = torch.zeros(len(batch), max_b_len, n_channels, dtype=torch.float32)
     targets = torch.tensor([s["target"] for s in batch], dtype=torch.float32)
@@ -124,19 +124,19 @@ def pad_collate_fn(batch: list) -> dict:
 
 
 # =============================================================================
-# 2. Model Architecture: 8-Track Backbone + Projection Head
+# 2. Model Architecture: 6-Track Backbone + Projection Head
 # =============================================================================
 
 class OrthrusRegressionModel(nn.Module):
     """
-    Wraps the Orthrus backbone with a regression head (matching the Orthrus downstream setup).
+    Wraps the 6-track Orthrus backbone with the identical regression head used for 8-track.
     """
     def __init__(self, backbone: nn.Module, d_model: int = 512, hidden_dim: int = 256, dropout: float = 0.1):
         super().__init__()
         self.backbone = backbone
         self.d_model = d_model
 
-        # Projection head: Linear -> LayerNorm -> ReLU -> Dropout -> Linear(1)
+        # Projection head: Linear -> LayerNorm -> GELU -> Dropout -> Linear(1)
         self.head = nn.Sequential(
             nn.Linear(d_model, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -146,14 +146,13 @@ class OrthrusRegressionModel(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        # Representation: (B, d_model) via mean pooling over unpadded sequence
         rep = self.backbone.representation(x, lengths, channel_last=True)
-        out = self.head(rep).squeeze(-1)  # (B,)
+        out = self.head(rep).squeeze(-1)
         return out
 
 
 # =============================================================================
-# 3. Training & Evaluation Loops
+# 3. Evaluation Loops & Plotting
 # =============================================================================
 
 def evaluate(model: nn.Module, dataloader: DataLoader, device: torch.device, loss_fn: nn.Module, amp_dtype: torch.dtype = torch.bfloat16) -> dict:
@@ -180,7 +179,6 @@ def evaluate(model: nn.Module, dataloader: DataLoader, device: torch.device, los
     y_true = np.array(all_targets)
     y_pred = np.array(all_preds)
 
-    # Protect against any NaNs in predictions
     if np.isnan(y_pred).any() or np.isnan(y_true).any():
         nan_count = int(np.isnan(y_pred).sum())
         print(f"\n[Warning] {nan_count} NaN values detected in predictions during evaluation! Replacing with fallback 0.0.")
@@ -215,7 +213,7 @@ def evaluate(model: nn.Module, dataloader: DataLoader, device: torch.device, los
 
 def plot_and_save_training_curves(history: list, output_file: Path):
     """
-    Plots training & validation loss, Pearson r, Spearman rho, and MSE/RMSE across epochs.
+    Plots training & validation loss, Pearson r, Spearman rho, and RMSE across epochs.
     """
     if not history:
         return
@@ -225,14 +223,13 @@ def plot_and_save_training_curves(history: list, output_file: Path):
     val_loss = [h["val_metrics"]["loss"] for h in history]
     val_pearson = [h["val_metrics"]["pearson_r"] for h in history]
     val_spearman = [h["val_metrics"]["spearman_rho"] for h in history]
-    val_mse = [h["val_metrics"]["mse"] for h in history]
     val_rmse = [h["val_metrics"]["rmse"] for h in history]
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
     # 1. Train vs Val Loss
-    axes[0, 0].plot(epochs, train_loss, label="Train Loss (MSE)", color="#1f77b4", lw=2, marker="o", markersize=4)
-    axes[0, 0].plot(epochs, val_loss, label="Val Loss (MSE)", color="#ff7f0e", lw=2, linestyle="--", marker="s", markersize=4)
+    axes[0, 0].plot(epochs, train_loss, label="Train Loss", color="#1f77b4", lw=2, marker="o", markersize=4)
+    axes[0, 0].plot(epochs, val_loss, label="Val Loss", color="#ff7f0e", lw=2, linestyle="--", marker="s", markersize=4)
     axes[0, 0].set_title("Loss Curves (Train vs. Validation)", fontsize=13, fontweight="bold")
     axes[0, 0].set_xlabel("Epoch", fontsize=11)
     axes[0, 0].set_ylabel("Loss", fontsize=11)
@@ -258,41 +255,24 @@ def plot_and_save_training_curves(history: list, output_file: Path):
     axes[1, 0].grid(True, alpha=0.3)
     axes[1, 0].legend(fontsize=11)
 
-    # 4. Validation Error (MSE & RMSE)
-    axes[1, 1].plot(epochs, val_mse, label="Val MSE", color="#d62728", lw=2, marker="o", markersize=4)
-    axes[1, 1].plot(epochs, val_rmse, label="Val RMSE", color="#8c564b", lw=2, linestyle=":", marker="^", markersize=4)
-    axes[1, 1].set_title("Validation Error (MSE & RMSE)", fontsize=13, fontweight="bold")
+    # 4. Validation RMSE
+    axes[1, 1].plot(epochs, val_rmse, label="Validation RMSE", color="#d62728", lw=2, marker="o", markersize=4)
+    axes[1, 1].set_title("Validation Root Mean Squared Error (RMSE)", fontsize=13, fontweight="bold")
     axes[1, 1].set_xlabel("Epoch", fontsize=11)
-    axes[1, 1].set_ylabel("Error", fontsize=11)
+    axes[1, 1].set_ylabel("RMSE", fontsize=11)
     axes[1, 1].grid(True, alpha=0.3)
     axes[1, 1].legend(fontsize=11)
 
+    plt.suptitle("Orthrus 6-Track Fine-Tuning Performance Across Epochs", fontsize=15, fontweight="bold", y=0.995)
     plt.tight_layout()
-    fig.savefig(output_file, dpi=200)
+    fig.savefig(output_file, dpi=300)
     plt.close(fig)
+    print(f"Training curves saved to: {output_file}")
 
 
-def save_csv_log(history: list, csv_path: Path):
-    """
-    Saves or appends training history to a CSV file.
-    """
-    fieldnames = ["epoch", "train_loss", "val_loss", "val_pearson_r", "val_spearman_rho", "val_mse", "val_rmse", "val_r2"]
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for h in history:
-            vm = h["val_metrics"]
-            writer.writerow({
-                "epoch": h["epoch"],
-                "train_loss": f"{h['train_loss']:.6f}",
-                "val_loss": f"{vm['loss']:.6f}",
-                "val_pearson_r": f"{vm['pearson_r']:.6f}",
-                "val_spearman_rho": f"{vm['spearman_rho']:.6f}",
-                "val_mse": f"{vm['mse']:.6f}",
-                "val_rmse": f"{vm['rmse']:.6f}",
-                "val_r2": f"{vm['r2']:.6f}",
-            })
-
+# =============================================================================
+# 4. Training Loop
+# =============================================================================
 
 def train_model(
     model: nn.Module,
@@ -302,7 +282,6 @@ def train_model(
     device: torch.device,
     epochs: int,
     lr_backbone: float,
-    lr_embedding: float,
     lr_head: float,
     weight_decay: float,
     warmup_epochs: int,
@@ -312,44 +291,37 @@ def train_model(
     loss_fn_name: str = "huber",
     max_grad_norm: float = 1.0,
 ):
-    # Loss Function: Huber loss prevents gradient explosions from outliers
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Select loss function
     if loss_fn_name == "huber":
         loss_fn = nn.HuberLoss(delta=1.0)
     elif loss_fn_name == "smooth_l1":
-        loss_fn = nn.SmoothL1Loss(beta=1.0)
+        loss_fn = nn.SmoothL1Loss()
     else:
         loss_fn = nn.MSELoss()
 
-    # Determine Precision: BFloat16 is strongly recommended for Mamba SSM models!
-    if precision == "bf16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+    # Mixed precision setup
+    if precision == "bf16":
         amp_dtype = torch.bfloat16
         use_scaler = False
-        print("[Precision] Using Native BFloat16 (bf16) mixed precision (optimal for Mamba SSM).")
+        print("[Precision] Using bfloat16 Mixed Precision (bf16). GradScaler disabled.")
     elif precision == "fp16":
         amp_dtype = torch.float16
         use_scaler = True
-        print("[Precision] Using Float16 (fp16) mixed precision with GradScaler.")
+        print("[Precision] Using float16 Mixed Precision (fp16) with GradScaler.")
     else:
         amp_dtype = torch.float32
         use_scaler = False
         print("[Precision] Using Full Precision (fp32).")
 
-    # Differential learning rate parameter groups
-    backbone_params = []
-    embedding_params = []
-
-    for name, param in model.backbone.named_parameters():
-        if not param.requires_grad:
-            continue
-        if "embedding" in name:
-            embedding_params.append(param)
-        else:
-            backbone_params.append(param)
+    # Optimizer with differential learning rate for backbone vs head
+    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
+    head_params = [p for p in model.head.parameters() if p.requires_grad]
 
     optimizer = torch.optim.AdamW([
         {"params": backbone_params, "lr": lr_backbone, "weight_decay": weight_decay},
-        {"params": embedding_params, "lr": lr_embedding, "weight_decay": weight_decay},
-        {"params": model.head.parameters(), "lr": lr_head, "weight_decay": weight_decay},
+        {"params": head_params, "lr": lr_head, "weight_decay": weight_decay},
     ])
 
     total_steps = epochs * len(train_loader)
@@ -379,7 +351,6 @@ def train_model(
     # Check for resume
     if resume and latest_ckpt_path.exists():
         print(f"\n[Resume] Found existing checkpoint: {latest_ckpt_path}")
-        print("Loading model, optimizer, scheduler, and scaler state...")
         ckpt = torch.load(latest_ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -390,35 +361,14 @@ def train_model(
         best_epoch = ckpt.get("best_epoch", -1)
         history = ckpt.get("history", [])
         start_epoch = ckpt["epoch"] + 1
+        print(f"[Resume] Resumed from Epoch {ckpt['epoch']}. Next training epoch: {start_epoch}/{epochs}")
 
-        if "random_states" in ckpt:
-            try:
-                rs = ckpt["random_states"]
-                if rs.get("torch") is not None:
-                    # torch.set_rng_state strictly expects a CPU ByteTensor
-                    torch_state = rs["torch"].cpu() if isinstance(rs["torch"], torch.Tensor) else rs["torch"]
-                    torch.set_rng_state(torch_state)
-                if rs.get("cuda") is not None and torch.cuda.is_available():
-                    cuda_states = [s.cpu() if isinstance(s, torch.Tensor) else s for s in rs["cuda"]]
-                    torch.cuda.set_rng_state_all(cuda_states)
-                if rs.get("numpy") is not None:
-                    np.random.set_state(rs["numpy"])
-                if rs.get("python") is not None:
-                    random.setstate(rs["python"])
-            except Exception as e:
-                print(f"[Warning] Could not fully restore random states ({e}), proceeding with current RNG state.")
-
-        print(f"[Resume] Successfully resumed from Epoch {ckpt['epoch']}. Next training epoch: {start_epoch}/{epochs}")
-        if start_epoch > epochs:
-            print(f"[Notice] Training already completed ({ckpt['epoch']} >= {epochs} epochs). Skipping to evaluation.")
-
-    print("\nStarting Fine-Tuning Training...")
+    print("\nStarting 6-Track Fine-Tuning Training...")
     print(f"Total Epochs:      {epochs}")
     print(f"Batches per Epoch: {len(train_loader)}")
     print(f"Warmup Epochs:     {warmup_epochs} ({warmup_steps} steps)")
     print(f"Loss Function:     {loss_fn_name.upper()}")
     print(f"LR Backbone:       {lr_backbone:.2e}")
-    print(f"LR Embedding:      {lr_embedding:.2e}")
     print(f"LR Head:           {lr_head:.2e}\n")
 
     for epoch in range(start_epoch, epochs + 1):
@@ -437,111 +387,93 @@ def train_model(
                 preds = model(x, lengths)
                 loss = loss_fn(preds, targets)
 
-            # Safeguard 1: Skip batch if loss is NaN/Inf to prevent corrupting weights
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"\n[Warning] NaN/Inf loss encountered at Epoch {epoch}, Batch {batch_idx}! Skipping step.")
                 optimizer.zero_grad()
                 continue
 
             if use_scaler:
-                scale_before = scaler.get_scale()
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-
-                # Safeguard 2: Check gradient norm for NaN
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    print(f"\n[Warning] NaN/Inf gradient norm encountered at Epoch {epoch}, Batch {batch_idx}! Skipping step.")
-                    optimizer.zero_grad()
-                    scaler.update()
-                    continue
-
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
-                scale_after = scaler.get_scale()
-                if scale_after >= scale_before:
-                    scheduler.step()
             else:
                 loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-
-                # Safeguard 2: Check gradient norm for NaN
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    print(f"\n[Warning] NaN/Inf gradient norm encountered at Epoch {epoch}, Batch {batch_idx}! Skipping step.")
-                    optimizer.zero_grad()
-                    continue
-
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
                 optimizer.step()
-                scheduler.step()
 
+            scheduler.step()
             running_loss += loss.item() * len(targets)
             n_samples += len(targets)
-            pbar.set_postfix({"train_loss": f"{running_loss / max(1, n_samples):.4f}"})
 
-        train_loss = running_loss / max(1, n_samples)
+            cur_lr = optimizer.param_groups[0]["lr"]
+            pbar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{cur_lr:.2e}"})
+
+        epoch_train_loss = running_loss / max(1, n_samples)
+
+        # Validation
         val_metrics = evaluate(model, val_loader, device, loss_fn, amp_dtype=amp_dtype)
 
-        val_r = val_metrics["pearson_r"]
-        val_rho = val_metrics["spearman_rho"]
-        val_mse = val_metrics["mse"]
-
-        print(f"Epoch {epoch:02d} | Train Loss: {train_loss:.4f} | Val Pearson r: {val_r:.4f} | Val Spearman rho: {val_rho:.4f} | Val MSE: {val_mse:.4f}")
+        print(
+            f"Epoch {epoch:02d}/{epochs:02d} | "
+            f"Train Loss: {epoch_train_loss:.4f} | "
+            f"Val Loss: {val_metrics['loss']:.4f} | "
+            f"Val Pearson r: {val_metrics['pearson_r']:.4f} | "
+            f"Val Spearman rho: {val_metrics['spearman_rho']:.4f} | "
+            f"Val RMSE: {val_metrics['rmse']:.4f}"
+        )
 
         history.append({
             "epoch": epoch,
-            "train_loss": train_loss,
+            "train_loss": epoch_train_loss,
             "val_metrics": val_metrics,
+            "lr_backbone": optimizer.param_groups[0]["lr"],
+            "lr_head": optimizer.param_groups[1]["lr"],
         })
 
-        # 1. Update Best Model Checkpoint
-        if val_r > best_val_r:
-            best_val_r = val_r
+        is_best = val_metrics["pearson_r"] > best_val_r
+        if is_best:
+            best_val_r = val_metrics["pearson_r"]
             best_epoch = epoch
-            print(f"  --> [*] New best validation Pearson r: {val_r:.4f} (saving best model)")
-
-            # Save best full state
+            print(f"  >>> New Best Validation Pearson r: {best_val_r:.4f} at Epoch {epoch}! Saving checkpoint...")
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                "val_metrics": val_metrics,
+                "best_val_r": best_val_r,
+                "best_epoch": best_epoch,
+                "history": history,
             }, best_ckpt_path)
 
-            # Export best fine-tuned backbone in Hugging Face format
             best_backbone_dir.mkdir(parents=True, exist_ok=True)
             model.backbone.save_pretrained(best_backbone_dir)
-            if (output_dir / "orthrus_hf.py").exists():
-                import shutil
-                shutil.copy2(output_dir / "orthrus_hf.py", best_backbone_dir / "orthrus_hf.py")
 
-        # 2. Save Automatic Resume Checkpoint (latest_checkpoint.pt)
-        torch.save({
+        # Save latest checkpoint
+        latest_dict = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
             "best_val_r": best_val_r,
             "best_epoch": best_epoch,
             "history": history,
-            "random_states": {
-                "torch": torch.get_rng_state(),
-                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-                "numpy": np.random.get_state(),
-                "python": random.getstate(),
-            }
-        }, latest_ckpt_path)
+        }
+        if use_scaler:
+            latest_dict["scaler_state_dict"] = scaler.state_dict()
+        torch.save(latest_dict, latest_ckpt_path)
 
-        # 3. Update Plots and CSV logs incrementally
-        try:
+        # Periodic curves & CSV update
+        if epoch % 2 == 0 or epoch == epochs:
             plot_and_save_training_curves(history, curves_path)
-            save_csv_log(history, csv_log_path)
-        except Exception as e:
-            print(f"[Warning] Could not update loss curves/CSV: {e}")
 
-    print(f"\nTraining completed. Best validation Pearson r: {best_val_r:.4f} at epoch {best_epoch}.")
-    print(f"Loss curves saved to: {curves_path}")
-    print(f"CSV training log saved to: {csv_log_path}")
+    # Save final CSV log
+    with open(csv_log_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "train_loss", "val_loss", "val_pearson_r", "val_spearman_rho", "val_mse", "val_rmse", "val_r2"])
+        for h in history:
+            vm = h["val_metrics"]
+            writer.writerow([h["epoch"], h["train_loss"], vm["loss"], vm["pearson_r"], vm["spearman_rho"], vm["mse"], vm["rmse"], vm["r2"]])
 
     # Evaluate best model on test set
     if test_loader is not None and best_ckpt_path.exists():
@@ -551,7 +483,7 @@ def train_model(
         test_metrics = evaluate(model, test_loader, device, loss_fn, amp_dtype=amp_dtype)
 
         print("=" * 60)
-        print("                 TEST SET METRICS                 ")
+        print("           6-TRACK TEST SET METRICS (Folds 8 & 9)         ")
         print("=" * 60)
         for k, v in test_metrics.items():
             if "pval" in k:
@@ -560,10 +492,10 @@ def train_model(
                 print(f"  {k:20s}: {v:.4f}")
         print("=" * 60)
 
-        # Save training summary
         summary_file = output_dir / "training_summary.json"
         with open(summary_file, "w") as f:
             json.dump({
+                "model_type": "6-track",
                 "best_epoch": best_epoch,
                 "best_val_pearson_r": best_val_r,
                 "test_metrics": test_metrics,
@@ -573,27 +505,40 @@ def train_model(
 
 
 # =============================================================================
-# 4. Main Pipeline
+# 5. Main Pipeline
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Supervised Fine-Tuning of 8-Track Orthrus Model")
+    parser = argparse.ArgumentParser(description="Supervised Fine-Tuning of 6-Track Orthrus Model")
     parser.add_argument(
         "--data_path",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_multitrack_with_trans_factors_minmax.npz",
-        help="Path to augmented 8-track NPZ file (from generate_trans_factor_tracks.py)",
+        help="Path to dataset NPZ file (first 6 tracks will be used)",
+    )
+    parser.add_argument(
+        "--splits_lookup_path",
+        type=str,
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hipsc_cm_10folds_lookup.csv",
+        help="Path to standardized 10-fold split lookup table CSV (from create_hipsc_cm_splits.py)",
+    )
+    parser.add_argument(
+        "--split_type",
+        type=str,
+        choices=["lookup", "gene"],
+        default="lookup",
+        help="'lookup' (standardized 10-fold table: Train 0-5, Val 6-7, Test 8-9) or 'gene' (ad-hoc GroupShuffleSplit)",
     )
     parser.add_argument(
         "--model_checkpoint",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus-large-8-track",
-        help="Path to 8-track converted Orthrus model directory (from convert_6track_to_8track.py)",
+        default="quietflamingo/orthrus-large-6-track",
+        help="Path or HF ID for pretrained 6-track Orthrus model",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus_8track_finetuned_hIPSC_CM",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus_6track_finetuned_hIPSC_CM",
         help="Directory to save fine-tuned checkpoints and logs",
     )
     parser.add_argument(
@@ -621,12 +566,6 @@ def main():
         help="Learning rate for Mamba backbone layers (default: 5e-5)",
     )
     parser.add_argument(
-        "--lr_embedding",
-        type=float,
-        default=2e-4,
-        help="Learning rate for input embedding layer, especially new channels 6 & 7 (default: 2e-4)",
-    )
-    parser.add_argument(
         "--lr_head",
         type=float,
         default=3e-4,
@@ -643,19 +582,6 @@ def main():
         type=int,
         default=3,
         help="Linear warmup epochs (default: 3)",
-    )
-    parser.add_argument(
-        "--splits_lookup_path",
-        type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hipsc_cm_10folds_lookup.csv",
-        help="Path to standardized 10-fold split lookup table CSV (from create_hipsc_cm_splits.py)",
-    )
-    parser.add_argument(
-        "--split_type",
-        type=str,
-        choices=["lookup", "gene"],
-        default="lookup",
-        help="'lookup' (standardized 10-fold table: Train 0-5, Val 6-7, Test 8-9) or 'gene' (ad-hoc GroupShuffleSplit)",
     )
     parser.add_argument(
         "--test_size",
@@ -685,21 +611,21 @@ def main():
         "--resume",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Automatically resume training from latest_checkpoint.pt if it exists in output_dir (default: True, use --no-resume to start fresh)",
+        help="Automatically resume training from latest_checkpoint.pt if it exists in output_dir",
     )
     parser.add_argument(
         "--precision",
         type=str,
         choices=["bf16", "fp16", "fp32"],
         default="bf16",
-        help="Mixed precision mode (default: bf16 - strongly recommended for Mamba SSM models)",
+        help="Mixed precision mode (default: bf16)",
     )
     parser.add_argument(
         "--loss_fn",
         type=str,
         choices=["huber", "mse", "smooth_l1"],
         default="huber",
-        help="Loss function: 'huber' (default, robust against outlier gradients), 'mse', or 'smooth_l1'",
+        help="Loss function: 'huber', 'mse', or 'smooth_l1'",
     )
     parser.add_argument(
         "--max_grad_norm",
@@ -724,7 +650,7 @@ def main():
 
     # 1. Load multi-track NPZ dataset
     data_file = Path(args.data_path)
-    print(f"Loading dataset: {data_file}...")
+    print(f"Loading dataset for 6-track fine-tuning: {data_file}...")
     npz_data = np.load(data_file, allow_pickle=True)
 
     tracks = npz_data["tracks"]
@@ -755,15 +681,17 @@ def main():
         genes = genes[valid_mask]
         tx_ids = tx_ids[valid_mask]
 
-    n_channels = tracks[0].shape[1]
-    if n_channels != 8:
-        raise ValueError(
-            f"[Error] finetune_8track.py is strictly configured for 8 tracks, but input data has {n_channels} channels. "
-            f"Please use finetune_6track.py for 6-track data."
-        )
+    # Strictly enforce/slice 6 tracks
+    raw_channels = tracks[0].shape[1]
+    if raw_channels > 6:
+        print(f"[6-Track Slicing] Input has {raw_channels} channels. Slicing first 6 channels (A, C, G, U, CDS, Splice)...")
+        tracks = [t[:, :6] for t in tracks]
+    elif raw_channels < 6:
+        raise ValueError(f"Expected at least 6 channels, but input only has {raw_channels} channels.")
+
     print(f"Total valid samples loaded: {len(targets)}")
     print(f"Unique genes:              {len(np.unique(genes))}")
-    print(f"Input channels:            8 (A, C, G, U, CDS, Splice, miRNA, eCLIP)")
+    print(f"Input channels:            6 (A, C, G, U, CDS, Splice)")
     print(f"Target column:             {args.target_col}")
 
     # 2. Train / Val / Test splitting
@@ -844,8 +772,8 @@ def main():
         pin_memory=(device.type == "cuda"),
     )
 
-    # 4. Load 8-track model and build regression model
-    print(f"\nLoading 8-track Orthrus checkpoint from: {args.model_checkpoint}...")
+    # 4. Load 6-track model and build regression model
+    print(f"\nLoading 6-track Orthrus checkpoint from: {args.model_checkpoint}...")
     backbone = AutoModel.from_pretrained(args.model_checkpoint, trust_remote_code=True)
     d_model = getattr(backbone.config, "ssm_model_dim", 512)
 
@@ -861,7 +789,6 @@ def main():
         device=device,
         epochs=args.epochs,
         lr_backbone=args.lr_backbone,
-        lr_embedding=args.lr_embedding,
         lr_head=args.lr_head,
         weight_decay=args.weight_decay,
         warmup_epochs=args.warmup_epochs,
