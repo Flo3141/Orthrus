@@ -162,29 +162,50 @@ def evaluate(model: nn.Module, dataloader: DataLoader, device: torch.device, los
     all_preds = []
     all_targets = []
 
+def evaluate(model: nn.Module, dataloader: DataLoader, device: torch.device, loss_fn: nn.Module, amp_dtype: torch.dtype = torch.bfloat16) -> dict:
+    model.eval()
+    total_loss = 0.0
+    all_preds = []
+    all_targets = []
+
     with torch.no_grad():
         for batch in dataloader:
             x = batch["x"].to(device)
             lengths = batch["lengths"].to(device)
             targets = batch["targets"].to(device)
 
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda" and amp_dtype != torch.float32)):
                 preds = model(x, lengths)
                 loss = loss_fn(preds, targets)
 
-            total_loss += loss.item() * len(targets)
+            if not (torch.isnan(loss) or torch.isinf(loss)):
+                total_loss += loss.item() * len(targets)
             all_preds.extend(preds.detach().cpu().numpy())
             all_targets.extend(targets.detach().cpu().numpy())
 
     y_true = np.array(all_targets)
     y_pred = np.array(all_preds)
 
+    # Protect against any NaNs in predictions
+    if np.isnan(y_pred).any() or np.isnan(y_true).any():
+        nan_count = int(np.isnan(y_pred).sum())
+        print(f"\n[Warning] {nan_count} NaN values detected in predictions during evaluation! Replacing with fallback 0.0.")
+        valid_mask = ~np.isnan(y_pred) & ~np.isnan(y_true)
+        if valid_mask.sum() > 2:
+            p_corr, p_val = pearsonr(y_true[valid_mask], y_pred[valid_mask])
+            s_corr, s_val = spearmanr(y_true[valid_mask], y_pred[valid_mask])
+        else:
+            p_corr, p_val = 0.0, 1.0
+            s_corr, s_val = 0.0, 1.0
+        y_pred = np.nan_to_num(y_pred, nan=0.0)
+    else:
+        p_corr, p_val = pearsonr(y_true, y_pred)
+        s_corr, s_val = spearmanr(y_true, y_pred)
+
     mse = float(mean_squared_error(y_true, y_pred))
     rmse = float(np.sqrt(mse))
     r2 = float(r2_score(y_true, y_pred))
-    p_corr, p_val = pearsonr(y_true, y_pred)
-    s_corr, s_val = spearmanr(y_true, y_pred)
-    avg_loss = total_loss / len(y_true)
+    avg_loss = total_loss / max(1, len(y_true))
 
     return {
         "loss": avg_loss,
@@ -293,8 +314,31 @@ def train_model(
     warmup_epochs: int,
     output_dir: Path,
     resume: bool = True,
+    precision: str = "bf16",
+    loss_fn_name: str = "huber",
+    max_grad_norm: float = 1.0,
 ):
-    loss_fn = nn.MSELoss()
+    # Loss Function: Huber loss prevents gradient explosions from outliers
+    if loss_fn_name == "huber":
+        loss_fn = nn.HuberLoss(delta=1.0)
+    elif loss_fn_name == "smooth_l1":
+        loss_fn = nn.SmoothL1Loss(beta=1.0)
+    else:
+        loss_fn = nn.MSELoss()
+
+    # Determine Precision: BFloat16 is strongly recommended for Mamba SSM models!
+    if precision == "bf16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        amp_dtype = torch.bfloat16
+        use_scaler = False
+        print("[Precision] Using Native BFloat16 (bf16) mixed precision (optimal for Mamba SSM).")
+    elif precision == "fp16":
+        amp_dtype = torch.float16
+        use_scaler = True
+        print("[Precision] Using Float16 (fp16) mixed precision with GradScaler.")
+    else:
+        amp_dtype = torch.float32
+        use_scaler = False
+        print("[Precision] Using Full Precision (fp32).")
 
     # Differential learning rate parameter groups
     backbone_params = []
@@ -325,7 +369,7 @@ def train_model(
         return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and use_scaler))
 
     best_val_r = -1.0
     best_epoch = -1
@@ -346,7 +390,8 @@ def train_model(
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        scaler.load_state_dict(ckpt["scaler_state_dict"])
+        if use_scaler and "scaler_state_dict" in ckpt:
+            scaler.load_state_dict(ckpt["scaler_state_dict"])
         best_val_r = ckpt.get("best_val_r", -1.0)
         best_epoch = ckpt.get("best_epoch", -1)
         history = ckpt.get("history", [])
@@ -371,6 +416,7 @@ def train_model(
     print(f"Total Epochs:      {epochs}")
     print(f"Batches per Epoch: {len(train_loader)}")
     print(f"Warmup Epochs:     {warmup_epochs} ({warmup_steps} steps)")
+    print(f"Loss Function:     {loss_fn_name.upper()}")
     print(f"LR Backbone:       {lr_backbone:.2e}")
     print(f"LR Embedding:      {lr_embedding:.2e}")
     print(f"LR Head:           {lr_head:.2e}\n")
@@ -381,29 +427,59 @@ def train_model(
         n_samples = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:02d}/{epochs:02d} [Train]")
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             x = batch["x"].to(device)
             lengths = batch["lengths"].to(device)
             targets = batch["targets"].to(device)
 
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda" and precision != "fp32")):
                 preds = model(x, lengths)
                 loss = loss_fn(preds, targets)
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+            # Safeguard 1: Skip batch if loss is NaN/Inf to prevent corrupting weights
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n[Warning] NaN/Inf loss encountered at Epoch {epoch}, Batch {batch_idx}! Skipping step.")
+                optimizer.zero_grad()
+                continue
+
+            if use_scaler:
+                scale_before = scaler.get_scale()
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+
+                # Safeguard 2: Check gradient norm for NaN
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    print(f"\n[Warning] NaN/Inf gradient norm encountered at Epoch {epoch}, Batch {batch_idx}! Skipping step.")
+                    optimizer.zero_grad()
+                    scaler.update()
+                    continue
+
+                scaler.step(optimizer)
+                scaler.update()
+                scale_after = scaler.get_scale()
+                if scale_after >= scale_before:
+                    scheduler.step()
+            else:
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+
+                # Safeguard 2: Check gradient norm for NaN
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    print(f"\n[Warning] NaN/Inf gradient norm encountered at Epoch {epoch}, Batch {batch_idx}! Skipping step.")
+                    optimizer.zero_grad()
+                    continue
+
+                optimizer.step()
+                scheduler.step()
 
             running_loss += loss.item() * len(targets)
             n_samples += len(targets)
-            pbar.set_postfix({"train_loss": f"{running_loss / n_samples:.4f}"})
+            pbar.set_postfix({"train_loss": f"{running_loss / max(1, n_samples):.4f}"})
 
-        train_loss = running_loss / n_samples
-        val_metrics = evaluate(model, val_loader, device, loss_fn)
+        train_loss = running_loss / max(1, n_samples)
+        val_metrics = evaluate(model, val_loader, device, loss_fn, amp_dtype=amp_dtype)
 
         val_r = val_metrics["pearson_r"]
         val_rho = val_metrics["spearman_rho"]
@@ -598,6 +674,26 @@ def main():
         default=True,
         help="Automatically resume training from latest_checkpoint.pt if it exists in output_dir (default: True, use --no-resume to start fresh)",
     )
+    parser.add_argument(
+        "--precision",
+        type=str,
+        choices=["bf16", "fp16", "fp32"],
+        default="bf16",
+        help="Mixed precision mode (default: bf16 - strongly recommended for Mamba SSM models)",
+    )
+    parser.add_argument(
+        "--loss_fn",
+        type=str,
+        choices=["huber", "mse", "smooth_l1"],
+        default="huber",
+        help="Loss function: 'huber' (default, robust against outlier gradients), 'mse', or 'smooth_l1'",
+    )
+    parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help="Maximum gradient norm for gradient clipping (default: 1.0)",
+    )
     args = parser.parse_args()
 
     # Set seeds
@@ -631,9 +727,24 @@ def main():
 
     tx_ids = npz_data["ensembl_transcript_id"].astype(str) if "ensembl_transcript_id" in npz_data else np.array([f"tx_{i}" for i in range(len(targets))])
 
-    print(f"Total samples loaded: {len(targets)}")
-    print(f"Unique genes:        {len(np.unique(genes))}")
-    print(f"Target column:       {args.target_col}")
+    # Clean invalid samples (NaN targets, Inf targets, empty sequences)
+    valid_mask = ~np.isnan(targets) & ~np.isinf(targets)
+    if "seq_lens" in npz_data:
+        valid_mask &= (npz_data["seq_lens"] > 0)
+    else:
+        valid_mask &= np.array([len(t) > 0 for t in tracks])
+
+    n_invalid = int(np.sum(~valid_mask))
+    if n_invalid > 0:
+        print(f"[Data Cleaning] Filtered out {n_invalid} samples with NaN/Inf targets or empty sequence length.")
+        tracks = [t for i, t in enumerate(tracks) if valid_mask[i]]
+        targets = targets[valid_mask]
+        genes = genes[valid_mask]
+        tx_ids = tx_ids[valid_mask]
+
+    print(f"Total valid samples loaded: {len(targets)}")
+    print(f"Unique genes:              {len(np.unique(genes))}")
+    print(f"Target column:             {args.target_col}")
 
     # 2. Gene-grouped Train / Val / Test splitting
     print("\nCreating Gene-Grouped splits to prevent isoform leakage...")
@@ -701,6 +812,9 @@ def main():
         warmup_epochs=args.warmup_epochs,
         output_dir=output_dir,
         resume=args.resume,
+        precision=args.precision,
+        loss_fn_name=args.loss_fn,
+        max_grad_norm=args.max_grad_norm,
     )
 
 
