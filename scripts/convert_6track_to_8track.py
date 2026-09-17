@@ -44,7 +44,27 @@ def convert_6track_to_8track(
 
     # 1. Load base 6-track model
     print(f"\n[1/5] Loading base model '{base_model_name}'...")
-    model_6t = AutoModel.from_pretrained(base_model_name, trust_remote_code=True)
+    base_path = Path(base_model_name)
+    if base_path.is_dir() and (base_path / "best_finetuned_backbone").is_dir():
+        print(f"      Found 'best_finetuned_backbone' inside {base_path} - using it as model source.")
+        base_path = base_path / "best_finetuned_backbone"
+        base_model_name = str(base_path)
+
+    if base_path.is_file() and base_path.suffix in [".pt", ".pth", ".bin"]:
+        print(f"      Restoring weights from PyTorch checkpoint file: {base_path}...")
+        model_6t = AutoModel.from_pretrained("quietflamingo/orthrus-large-6-track", trust_remote_code=True)
+        ckpt = torch.load(base_path, map_location="cpu", weights_only=False)
+        state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+        backbone_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("backbone."):
+                backbone_dict[k[len("backbone."):]] = v
+            elif not k.startswith("head."):
+                backbone_dict[k] = v
+        model_6t.load_state_dict(backbone_dict, strict=False)
+    else:
+        model_6t = AutoModel.from_pretrained(base_model_name, trust_remote_code=True)
+
     model_6t.eval()
     config_6t = model_6t.config
 
