@@ -40,6 +40,46 @@ import matplotlib.pyplot as plt
 # 1. Dataset & Length-Grouped Dynamic Batching
 # =============================================================================
 
+def seq_to_one_hot(seq: str) -> np.ndarray:
+    """
+    Converts an RNA/DNA sequence into a 4-channel one-hot encoding.
+    Conforms to the Orthrus paper:
+      Channel 0: A (Adenine)
+      Channel 1: C (Cytosine)
+      Channel 2: G (Guanine)
+      Channel 3: T / U (Thymine / Uracil)
+      All other characters (e.g. 'N') -> [0, 0, 0, 0]
+    """
+    seq_bytes = np.frombuffer(seq.upper().encode("ascii"), dtype=np.uint8)
+    oh = np.zeros((len(seq_bytes), 4), dtype=np.float32)
+    oh[seq_bytes == 65, 0] = 1.0  # 'A'
+    oh[seq_bytes == 67, 1] = 1.0  # 'C'
+    oh[seq_bytes == 71, 2] = 1.0  # 'G'
+    oh[(seq_bytes == 84) | (seq_bytes == 85), 3] = 1.0  # 'T' (84) or 'U' (85)
+    return oh
+
+
+def parse_saluki_sequence_to_six_track(raw_seq: str) -> np.ndarray:
+    """
+    Parses comma-separated Saluki tokens into (L, 6) feature matrix:
+      Channels 0-3: A, C, G, U one-hot
+      Channel 4:    CDS marker (1.0 on uppercase letters, 0.0 on lowercase)
+      Channel 5:    Splice marker (1.0 on 'ej' tokens, 0.0 otherwise)
+    """
+    tokens = [tok.strip() for tok in raw_seq.split(",") if tok.strip()]
+    if not tokens:
+        return np.zeros((0, 6), dtype=np.float32)
+
+    clean_seq = "".join(tok[0] for tok in tokens)
+    seq_oh = seq_to_one_hot(clean_seq)
+
+    cds_track = np.array([1.0 if tok[0].isupper() else 0.0 for tok in tokens], dtype=np.float32).reshape(-1, 1)
+    splice_track = np.array([1.0 if "ej" in tok.lower() else 0.0 for tok in tokens], dtype=np.float32).reshape(-1, 1)
+
+    six_track = np.concatenate([seq_oh, cds_track, splice_track], axis=1)
+    return six_track
+
+
 class MultiTrackDataset(Dataset):
     """
     Dataset wrapping variable-length 6-track RNA representations and target values.
@@ -513,8 +553,8 @@ def main():
     parser.add_argument(
         "--data_path",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_8track_minmax.npz",
-        help="Path to dataset NPZ file (first 6 tracks will be used)",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_ej_cds_transformed.txt",
+        help="Path to hIPSC_CM tab-separated data file (hIPSC_CM_ej_cds_transformed.txt)",
     )
     parser.add_argument(
         "--splits_lookup_path",
@@ -648,31 +688,42 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # 1. Load multi-track NPZ dataset
+    # 1. Load hIPSC_CM TSV dataset
     data_file = Path(args.data_path)
-    print(f"Loading dataset for 6-track fine-tuning: {data_file}...")
-    npz_data = np.load(data_file, allow_pickle=True)
+    if not data_file.exists():
+        raise FileNotFoundError(f"Dataset file not found: {data_file}")
 
-    tracks = npz_data["tracks"]
-    targets = npz_data[args.target_col].astype(np.float32)
+    print(f"Loading hIPSC_CM dataset for 6-track fine-tuning: {data_file}...")
+    df = pd.read_csv(data_file, sep="\t")
+    print(f"Total entries loaded: {len(df)}")
 
-    # Use gene symbol if present, else gene id
-    if "hgnc_symbol" in npz_data:
-        genes = npz_data["hgnc_symbol"].astype(str)
-    elif "ensembl_gene_id" in npz_data:
-        genes = npz_data["ensembl_gene_id"].astype(str)
+    # Ensure target column exists
+    if args.target_col not in df.columns:
+        raise KeyError(f"Target column '{args.target_col}' not found in {list(df.columns)}")
+
+    targets = df[args.target_col].astype(np.float32).values
+
+    # Determine gene column
+    if "hgnc_symbol" in df.columns:
+        genes = df["hgnc_symbol"].astype(str).values
     else:
-        genes = np.array([f"gene_{i}" for i in range(len(targets))])
+        raise KeyError(f"Target column 'hgnc_symbol' not found in {list(df.columns)}")
 
-    tx_ids = npz_data["ensembl_transcript_id"].astype(str) if "ensembl_transcript_id" in npz_data else np.array([f"tx_{i}" for i in range(len(targets))])
+    # Determine transcript ID column
+    if "ensembl_transcript_id" in df.columns:
+        tx_ids = df["ensembl_transcript_id"].astype(str).values
+    else:
+        raise KeyError(f"Target column 'ensembl_transcript_id' not found in {list(df.columns)}")
+
+    # Parse Saluki sequence tokens into 6 tracks
+    print("Parsing sequences into 6-channel tracks [A, C, G, U, CDS, Splice]...")
+    raw_seqs = df["sequence"].astype(str).values
+    tracks = []
+    for s in tqdm(raw_seqs, desc="Parsing 6-tracks"):
+        tracks.append(parse_saluki_sequence_to_six_track(s))
 
     # Clean invalid samples (NaN targets, Inf targets, empty sequences)
-    valid_mask = ~np.isnan(targets) & ~np.isinf(targets)
-    if "seq_lens" in npz_data:
-        valid_mask &= (npz_data["seq_lens"] > 0)
-    else:
-        valid_mask &= np.array([len(t) > 0 for t in tracks])
-
+    valid_mask = ~np.isnan(targets) & ~np.isinf(targets) & np.array([len(t) > 0 for t in tracks])
     n_invalid = int(np.sum(~valid_mask))
     if n_invalid > 0:
         print(f"[Data Cleaning] Filtered out {n_invalid} samples with NaN/Inf targets or empty sequence length.")
@@ -680,14 +731,6 @@ def main():
         targets = targets[valid_mask]
         genes = genes[valid_mask]
         tx_ids = tx_ids[valid_mask]
-
-    # Strictly enforce/slice 6 tracks
-    raw_channels = tracks[0].shape[1]
-    if raw_channels > 6:
-        print(f"[6-Track Slicing] Input has {raw_channels} channels. Slicing first 6 channels (A, C, G, U, CDS, Splice)...")
-        tracks = [t[:, :6] for t in tracks]
-    elif raw_channels < 6:
-        raise ValueError(f"Expected at least 6 channels, but input only has {raw_channels} channels.")
 
     print(f"Total valid samples loaded: {len(targets)}")
     print(f"Unique genes:              {len(np.unique(genes))}")
