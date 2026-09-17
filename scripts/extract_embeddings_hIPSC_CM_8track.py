@@ -77,13 +77,12 @@ def extract_embeddings_for_8track(
     all_embeddings = np.stack(embeddings_list, axis=0)
     return all_embeddings
 
-
 def main():
     parser = argparse.ArgumentParser(description="Extract Orthrus 8-track embeddings for hIPSC_CM")
     parser.add_argument(
         "--data_path",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_multitrack_with_trans_factors_minmax.npz",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_8track_minmax.npz",
         help="Path to 8-track augmented NPZ file (from generate_trans_factor_tracks.py)",
     )
     parser.add_argument(
@@ -102,7 +101,7 @@ def main():
         "--output_filename",
         type=str,
         default="orthrus_8track_embeddings_hIPSC_CM.npz",
-        help="Filename for the saved embeddings NPZ archive",
+        help="Filename for the saved embeddings NPZ archive (automatically appended with normalization suffix)",
     )
     parser.add_argument(
         "--batch_size",
@@ -123,6 +122,15 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     save_file = output_dir / args.output_filename
 
+    # 1. Load multi-track data
+    print(f"\nLoading NPZ archive: {data_file}...")
+    npz_data = np.load(data_file, allow_pickle=True)
+
+    # Dynamically append normalization suffix if using default output_filename
+    norm_val = str(npz_data.get("normalization", "none")).strip().lower()
+    if norm_val and norm_val not in ["none", "nan"] and not save_file.stem.endswith(f"_{norm_val}"):
+        save_file = save_file.parent / f"{save_file.stem}_{norm_val}{save_file.suffix}"
+
     print("=" * 70)
     print("         Orthrus 8-Track Embedding Extraction Pipeline          ")
     print("=" * 70)
@@ -131,10 +139,6 @@ def main():
     print(f"Output file:       {save_file}")
     print(f"Batch size:        {args.batch_size}")
     print(f"Max sequence len:  {args.max_length}")
-
-    # 1. Load multi-track data
-    print(f"\nLoading NPZ archive: {data_file}...")
-    npz_data = np.load(data_file, allow_pickle=True)
 
     tracks = list(npz_data["tracks"])
     n_samples = len(tracks)

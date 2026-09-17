@@ -922,7 +922,7 @@ def main():
     parser.add_argument(
         "--input",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_multitrack_with_trans_factors_chunks",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_8track_chunks",
         help="Path to master NPZ, a chunk (.npz), or the chunks folder",
     )
     parser.add_argument(

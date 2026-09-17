@@ -562,7 +562,7 @@ def main():
     parser.add_argument(
         "--output_file",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_multitrack_with_trans_factors.npz",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_8track.npz",
         help="Output file for the augmented NPZ archive (automatically appended with normalization suffix)",
     )
     parser.add_argument(

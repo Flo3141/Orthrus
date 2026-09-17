@@ -103,13 +103,100 @@ def load_hIPSC_CM_npz(file_path: Path, target_col: str) -> dict:
     else:
         transcript_ids = np.array([f"tx_{i}" for i in range(len(targets))])
 
+    normalization = None
+    if "normalization" in data:
+        try:
+            norm_val = str(data["normalization"]).strip().lower()
+            if norm_val and norm_val != "none_not_set":
+                normalization = norm_val
+        except Exception:
+            pass
+
     return {
         "embeddings": data["embeddings"],
         "targets": targets.astype(np.float32),
         "genes": genes,
         "transcript_ids": transcript_ids,
         "seq_lens": data.get("seq_lens", None),
+        "normalization": normalization,
+        "archive_keys": available_keys,
     }
+
+
+def resolve_track_and_normalization(
+    data: dict,
+    file_path: Path,
+    user_track_type: str = "auto",
+    user_normalization: str = "auto",
+) -> tuple:
+    """
+    Infers the track type ('6track' vs '8track') and normalization scheme.
+    Returns: (track_type, normalization)
+    """
+    path_str = str(file_path).lower()
+    archive_keys = data.get("archive_keys", [])
+
+    # 1. Resolve track type
+    if user_track_type != "auto":
+        track_type = user_track_type.lower()
+    else:
+        if "8track" in path_str or "8_track" in path_str or "8-track" in path_str:
+            track_type = "8track"
+        elif "6track" in path_str or "6_track" in path_str or "6-track" in path_str:
+            track_type = "6track"
+        elif "has_mirna" in archive_keys or "has_eclip" in archive_keys:
+            track_type = "8track"
+        elif data.get("normalization") is not None:
+            track_type = "8track"
+        else:
+            track_type = "6track"
+
+    # 2. Resolve normalization (for 8track)
+    if user_normalization != "auto":
+        normalization = user_normalization.lower()
+    else:
+        norm_from_data = data.get("normalization")
+        if norm_from_data and norm_from_data not in ["none", "nan", "none_not_set"]:
+            normalization = norm_from_data
+        elif "minmax" in path_str or "min_max" in path_str:
+            normalization = "minmax"
+        elif "log" in path_str:
+            normalization = "log"
+        elif norm_from_data == "none" or "none" in path_str:
+            normalization = "none"
+        else:
+            normalization = "none"
+
+    return track_type, normalization
+
+
+def resolve_output_dir(base_output_dir: Path, track_type: str, normalization: str) -> Path:
+    """
+    Constructs the structured output folder:
+    - 6-track:  <base_output_dir>/6track
+    - 8-track:  <base_output_dir>/8track/<normalization>
+    Avoids redundant nesting if the user already passed the full subfolder path.
+    """
+    norm_clean = normalization.lower().strip() if normalization else "none"
+
+    if track_type == "6track":
+        if base_output_dir.name.lower() == "6track":
+            target_dir = base_output_dir
+        else:
+            target_dir = base_output_dir / "6track"
+    else:  # 8track
+        if (
+            base_output_dir.name.lower() == norm_clean
+            and base_output_dir.parent.name.lower() == "8track"
+        ):
+            target_dir = base_output_dir
+        elif base_output_dir.name.lower() == "8track":
+            target_dir = base_output_dir / norm_clean
+        else:
+            target_dir = base_output_dir / "8track" / norm_clean
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    return target_dir
 
 
 def parse_args():
@@ -123,6 +210,19 @@ def parse_args():
         help="Path to NPZ file containing hIPSC_CM embeddings",
     )
     parser.add_argument(
+        "--track_type",
+        type=str,
+        choices=["auto", "6track", "8track"],
+        default="auto",
+        help="Track representation type ('6track', '8track', or 'auto' to infer from embeddings file)",
+    )
+    parser.add_argument(
+        "--normalization",
+        type=str,
+        default="auto",
+        help="Normalization method for 8-track ('none', 'minmax', 'log', or 'auto' to infer from file)",
+    )
+    parser.add_argument(
         "--splits_lookup_path",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hipsc_cm_10folds_lookup.csv",
@@ -132,7 +232,7 @@ def parse_args():
         "--output_dir",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/results/Orthrus/hIPSC_CM",
-        help="Output directory for models, metrics, plots, and predictions",
+        help="Base output directory (subfolders '6track' or '8track/<normalization>' will be created automatically)",
     )
     parser.add_argument(
         "--target_col",
@@ -172,20 +272,31 @@ def main():
     args = parse_args()
     emb_path = Path(args.embeddings_path)
     lookup_path = Path(args.splits_lookup_path)
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    base_out_dir = Path(args.output_dir)
+
+    print("\nLoading embeddings and target variables...")
+    data = load_hIPSC_CM_npz(emb_path, target_col=args.target_col)
+
+    track_type, normalization = resolve_track_and_normalization(
+        data=data,
+        file_path=emb_path,
+        user_track_type=args.track_type,
+        user_normalization=args.normalization,
+    )
+
+    out_dir = resolve_output_dir(base_out_dir, track_type=track_type, normalization=normalization)
 
     print("=" * 75)
     print("        Orthrus Ridge Regression: hIPSC_CM Evaluation Pipeline        ")
     print("=" * 75)
     print(f"Embeddings file:    {emb_path}")
+    print(f"Track type:         {track_type.upper()}")
+    if track_type == "8track":
+        print(f"Normalization:      {normalization.upper()}")
     print(f"Target variable:    {args.target_col}")
     print(f"Split mechanism:    {args.split_type}")
     print(f"Random state:       {args.random_state}")
     print(f"Output directory:   {out_dir}")
-
-    print("\nLoading embeddings and target variables...")
-    data = load_hIPSC_CM_npz(emb_path, target_col=args.target_col)
 
     X = data["embeddings"]
     y = data["targets"]
@@ -388,7 +499,10 @@ def main():
     # 3. Save comprehensive metrics as JSON
     all_metrics = {
         "dataset": "hIPSC_CM",
+        "track_type": track_type,
+        "normalization": normalization if track_type == "8track" else None,
         "target_col": args.target_col,
+        "embeddings_path": str(emb_path),
         "split_mechanism": "lookup_10folds" if use_lookup else args.split_type,
         "splits_lookup_path": str(lookup_path) if use_lookup else None,
         "best_alpha": best_alpha,
@@ -418,9 +532,9 @@ def main():
             s_rho = test_metrics["test_spearman_rho"]
             r2 = test_metrics["test_r2"]
 
-            emb_type = "8-Track" if X.shape[1] == 512 else "6-Track"
+            emb_label = f"8-Track ({normalization.upper()})" if track_type == "8track" else "6-Track"
             ax.set_title(
-                f"Orthrus {emb_type} -> hIPSC_CM ({args.target_col})\n"
+                f"Orthrus {emb_label} -> hIPSC_CM ({args.target_col})\n"
                 f"Test Pearson r = {p_r:.3f} | Spearman rho = {s_rho:.3f} | R² = {r2:.3f}",
                 fontsize=11,
                 fontweight="bold",
