@@ -175,13 +175,15 @@ def main():
         "--output_filename",
         type=str,
         default="orthrus_6track_embeddings_hIPSC_CM.npz",
-        help="Filename for the saved NPZ archive",
+        help="Filename for the saved NPZ archive (automatically appended with _finetuned when a fine-tuned checkpoint is used)",
     )
     parser.add_argument(
+        "--model_checkpoint",
         "--model_name",
+        dest="model_checkpoint",
         type=str,
         default="quietflamingo/orthrus-large-6-track",
-        help="Hugging Face model identifier",
+        help="Path to 6-track model directory (or .pt checkpoint), or Hugging Face identifier (default: quietflamingo/orthrus-large-6-track)",
     )
     parser.add_argument(
         "--batch_size",
@@ -200,9 +202,32 @@ def main():
     data_path = Path(args.data_path)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    save_file = output_dir / args.output_filename
 
-    print(f"Loading hIPSC_CM dataset from: {data_path}")
+    model_path_str = str(args.model_checkpoint).strip()
+    is_finetuned = (
+        model_path_str != "quietflamingo/orthrus-large-6-track"
+        or "finetun" in model_path_str.lower()
+        or "checkpoint" in model_path_str.lower()
+    )
+
+    save_file = output_dir / args.output_filename
+    # If fine-tuned and default filename was kept, automatically append _finetuned
+    if is_finetuned and "finetuned" not in save_file.stem.lower():
+        stem = save_file.stem
+        save_file = save_file.parent / f"{stem}_finetuned{save_file.suffix}"
+
+    print("=" * 70)
+    print("         Orthrus 6-Track Embedding Extraction Pipeline          ")
+    print("=" * 70)
+    print(f"Data file:         {data_path}")
+    print(f"Model checkpoint:  {model_path_str}")
+    print(f"Model variant:     {'Fine-Tuned' if is_finetuned else 'Pretrained Base'}")
+    print(f"Output file:       {save_file}")
+    print(f"Batch size:        {args.batch_size}")
+    print(f"Max sequence len:  {args.max_length}")
+
+    # 1. Load dataset
+    print(f"\nLoading hIPSC_CM dataset from: {data_path}")
     df = pd.read_csv(data_path, sep="\t")
     print(f"Loaded rows: {len(df)}")
     print(f"Columns: {list(df.columns)}")
@@ -217,11 +242,30 @@ def main():
         df["half_life_transformed"] = (y_log - mu_log) / sigma_log
         print(f"Transformation computed: mu={mu_log:.4f}, sigma={sigma_log:.4f}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # 2. Load model (directory, HF hub, or .pt checkpoint)
+    model_path = Path(model_path_str)
+    if model_path.is_dir() and (model_path / "best_finetuned_backbone").is_dir():
+        model_path = model_path / "best_finetuned_backbone"
 
-    print(f"Loading Orthrus 6-track model '{args.model_name}'...")
-    model = AutoModel.from_pretrained(args.model_name, trust_remote_code=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\nUsing device: {device}")
+
+    if model_path.is_file() and model_path.suffix in [".pt", ".pth", ".bin"]:
+        print(f"Loading base Orthrus model and restoring weights from checkpoint file: {model_path}...")
+        model = AutoModel.from_pretrained("quietflamingo/orthrus-large-6-track", trust_remote_code=True)
+        ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+        state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+        backbone_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("backbone."):
+                backbone_dict[k[len("backbone."):]] = v
+            elif not k.startswith("head."):
+                backbone_dict[k] = v
+        model.load_state_dict(backbone_dict, strict=False)
+    else:
+        print(f"Loading Orthrus 6-track model from '{model_path}'...")
+        model = AutoModel.from_pretrained(str(model_path), trust_remote_code=True)
+
     model = model.to(device)
     model.eval()
     print("Model loaded successfully.")
@@ -246,6 +290,8 @@ def main():
         hgnc_symbol=result["hgnc_symbol"],
         transcript_biotype=result["transcript_biotype"],
         seq_lens=result["seq_lens"],
+        model_checkpoint=str(model_path),
+        is_finetuned=is_finetuned,
     )
 
     print("Successfully saved!")

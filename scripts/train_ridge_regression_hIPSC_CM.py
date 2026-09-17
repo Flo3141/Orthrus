@@ -112,6 +112,13 @@ def load_hIPSC_CM_npz(file_path: Path, target_col: str) -> dict:
         except Exception:
             pass
 
+    is_finetuned = None
+    if "is_finetuned" in data:
+        try:
+            is_finetuned = bool(data["is_finetuned"])
+        except Exception:
+            pass
+
     return {
         "embeddings": data["embeddings"],
         "targets": targets.astype(np.float32),
@@ -119,6 +126,7 @@ def load_hIPSC_CM_npz(file_path: Path, target_col: str) -> dict:
         "transcript_ids": transcript_ids,
         "seq_lens": data.get("seq_lens", None),
         "normalization": normalization,
+        "is_finetuned": is_finetuned,
         "archive_keys": available_keys,
     }
 
@@ -170,20 +178,31 @@ def resolve_track_and_normalization(
     return track_type, normalization
 
 
-def resolve_output_dir(base_output_dir: Path, track_type: str, normalization: str) -> Path:
+def resolve_output_dir(
+    base_output_dir: Path,
+    track_type: str,
+    normalization: str,
+    is_finetuned: bool = False,
+) -> Path:
     """
     Constructs the structured output folder:
-    - 6-track:  <base_output_dir>/6track
+    - 6-track:  <base_output_dir>/6track/pretrained or <base_output_dir>/6track/finetuned
     - 8-track:  <base_output_dir>/8track/<normalization>
     Avoids redundant nesting if the user already passed the full subfolder path.
     """
     norm_clean = normalization.lower().strip() if normalization else "none"
 
     if track_type == "6track":
-        if base_output_dir.name.lower() == "6track":
+        variant = "finetuned" if is_finetuned else "pretrained"
+        if (
+            base_output_dir.name.lower() == variant
+            and base_output_dir.parent.name.lower() == "6track"
+        ):
             target_dir = base_output_dir
+        elif base_output_dir.name.lower() == "6track":
+            target_dir = base_output_dir / variant
         else:
-            target_dir = base_output_dir / "6track"
+            target_dir = base_output_dir / "6track" / variant
     else:  # 8track
         if (
             base_output_dir.name.lower() == norm_clean
@@ -284,7 +303,18 @@ def main():
         user_normalization=args.normalization,
     )
 
-    out_dir = resolve_output_dir(base_out_dir, track_type=track_type, normalization=normalization)
+    is_finetuned = (
+        bool(data.get("is_finetuned"))
+        if data.get("is_finetuned") is not None
+        else ("finetun" in str(emb_path).lower())
+    )
+
+    out_dir = resolve_output_dir(
+        base_out_dir,
+        track_type=track_type,
+        normalization=normalization,
+        is_finetuned=is_finetuned,
+    )
 
     print("=" * 75)
     print("        Orthrus Ridge Regression: hIPSC_CM Evaluation Pipeline        ")
@@ -293,6 +323,8 @@ def main():
     print(f"Track type:         {track_type.upper()}")
     if track_type == "8track":
         print(f"Normalization:      {normalization.upper()}")
+    elif track_type == "6track":
+        print(f"Model variant:      {'Fine-Tuned' if is_finetuned else 'Pretrained Base'}")
     print(f"Target variable:    {args.target_col}")
     print(f"Split mechanism:    {args.split_type}")
     print(f"Random state:       {args.random_state}")
@@ -500,6 +532,7 @@ def main():
     all_metrics = {
         "dataset": "hIPSC_CM",
         "track_type": track_type,
+        "is_finetuned": is_finetuned,
         "normalization": normalization if track_type == "8track" else None,
         "target_col": args.target_col,
         "embeddings_path": str(emb_path),
@@ -532,7 +565,13 @@ def main():
             s_rho = test_metrics["test_spearman_rho"]
             r2 = test_metrics["test_r2"]
 
-            emb_label = f"8-Track ({normalization.upper()})" if track_type == "8track" else "6-Track"
+            if track_type == "8track":
+                emb_label = f"8-Track ({normalization.upper()})"
+            elif is_finetuned:
+                emb_label = "6-Track (Fine-Tuned)"
+            else:
+                emb_label = "6-Track (Pretrained)"
+
             ax.set_title(
                 f"Orthrus {emb_label} -> hIPSC_CM ({args.target_col})\n"
                 f"Test Pearson r = {p_r:.3f} | Spearman rho = {s_rho:.3f} | R² = {r2:.3f}",
