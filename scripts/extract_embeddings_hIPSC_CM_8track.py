@@ -115,12 +115,31 @@ def main():
         default=12288,
         help="Maximum sequence length according to the Orthrus paper (default: 12288)",
     )
+    parser.add_argument(
+        "--is_finetuned",
+        type=str,
+        choices=["auto", "true", "false"],
+        default="auto",
+        help="Whether the checkpoint is fine-tuned ('auto', 'true', or 'false')",
+    )
     args = parser.parse_args()
 
     data_file = Path(args.data_path)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     save_file = output_dir / args.output_filename
+
+    # Resolve whether model is fine-tuned
+    model_path_str = str(args.model_checkpoint).strip()
+    if args.is_finetuned == "true":
+        is_finetuned = True
+    elif args.is_finetuned == "false":
+        is_finetuned = False
+    else:
+        is_finetuned = (
+            "finetun" in model_path_str.lower()
+            or "checkpoint" in model_path_str.lower()
+        )
 
     # 1. Load multi-track data
     print(f"\nLoading NPZ archive: {data_file}...")
@@ -136,6 +155,7 @@ def main():
     print("=" * 70)
     print(f"Data file:         {data_file}")
     print(f"Model checkpoint:  {args.model_checkpoint}")
+    print(f"Model variant:     {'Fine-Tuned' if is_finetuned else 'Base 8-Track'}")
     print(f"Output file:       {save_file}")
     print(f"Batch size:        {args.batch_size}")
     print(f"Max sequence len:  {args.max_length}")
@@ -193,6 +213,8 @@ def main():
         has_gtf=np.array([m["has_gtf"] for m in metadata_list], dtype=bool),
         seq_lens=np.array([tr.shape[0] for tr in tracks], dtype=np.int32),
         normalization=str(npz_data.get("normalization", "none")),
+        model_checkpoint=model_path_str,
+        is_finetuned=is_finetuned,
     )
 
     print(f"Successfully saved! Embedding array shape: {embeddings.shape}")
