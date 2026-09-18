@@ -280,6 +280,13 @@ def parse_args():
         help="Random seed for reproducibility",
     )
     parser.add_argument(
+        "--is_finetuned",
+        type=str,
+        choices=["auto", "true", "false"],
+        default="auto",
+        help="Whether embeddings stem from a fine-tuned model ('auto', 'true', or 'false')",
+    )
+    parser.add_argument(
         "--plot",
         action="store_true",
         help="Optional: create scatter plot (y_true vs. y_pred) as PNG",
@@ -303,11 +310,16 @@ def main():
         user_normalization=args.normalization,
     )
 
-    is_finetuned = (
-        bool(data.get("is_finetuned"))
-        if data.get("is_finetuned") is not None
-        else ("finetun" in str(emb_path).lower())
-    )
+    if args.is_finetuned == "true":
+        is_finetuned = True
+    elif args.is_finetuned == "false":
+        is_finetuned = False
+    else:
+        is_finetuned = (
+            bool(data.get("is_finetuned"))
+            if data.get("is_finetuned") is not None
+            else ("finetun" in str(emb_path).lower())
+        )
 
     out_dir = resolve_output_dir(
         base_out_dir,
@@ -386,88 +398,162 @@ def main():
 
         # Folds 8 & 9 are reserved for Test Set (20%)
         test_mask = np.isin(sample_splits, [8, 9])
-        cv_mask = np.isin(sample_splits, [0, 1, 2, 3, 4, 5, 6, 7])
-
-        X_train_cv, y_train_cv = X[cv_mask], y[cv_mask]
-        cv_splits = sample_splits[cv_mask]
-        train_genes = genes[cv_mask]
-
         X_test, y_test = X[test_mask], y[test_mask]
         test_genes = genes[test_mask]
         test_tx = transcript_ids[test_mask]
 
-        print(f"\n[Split Breakdown]")
-        print(f"  CV Pool (Folds 0-7): {len(y_train_cv)} samples ({len(np.unique(train_genes))} unique genes)")
-        print(f"  Test Set (Folds 8-9): {len(y_test)} samples ({len(np.unique(test_genes))} unique genes)")
+        if is_finetuned:
+            # -----------------------------------------------------------------
+            # Fine-Tuned Model Pipeline: Train [0..5], Val [6..7], Test [8..9]
+            # No CV across 0..7 to prevent target leakage from fine-tuning
+            # -----------------------------------------------------------------
+            train_mask = np.isin(sample_splits, [0, 1, 2, 3, 4, 5])
+            val_mask = np.isin(sample_splits, [6, 7])
 
-        cv_fold_definitions = [
-            {"name": "Fold 1", "train_splits": [0, 1, 2, 3, 4, 5], "val_splits": [6, 7]},
-            {"name": "Fold 2", "train_splits": [2, 3, 4, 5, 6, 7], "val_splits": [0, 1]},
-            {"name": "Fold 3", "train_splits": [0, 1, 4, 5, 6, 7], "val_splits": [2, 3]},
-            {"name": "Fold 4", "train_splits": [0, 1, 2, 3, 6, 7], "val_splits": [4, 5]},
-        ]
+            X_train, y_train = X[train_mask], y[train_mask]
+            train_genes = genes[train_mask]
 
-        custom_cv = []
-        for fold_def in cv_fold_definitions:
-            tr_idx = np.where(np.isin(cv_splits, fold_def["train_splits"]))[0]
-            val_idx = np.where(np.isin(cv_splits, fold_def["val_splits"]))[0]
-            custom_cv.append((tr_idx, val_idx))
+            X_val, y_val = X[val_mask], y[val_mask]
+            val_genes = genes[val_mask]
 
-        print(f"\nTraining RidgeCV across custom 4-Fold Cross-Validation (Alphas: {DEFAULT_ALPHAS})...")
-        model = RidgeCV(alphas=DEFAULT_ALPHAS, cv=custom_cv)
-        model.fit(X_train_cv, y_train_cv)
+            print(f"\n[Split Breakdown - Fine-Tuned Model (No-Leakage Protocol)]")
+            print(f"  Training Set   (Splits 0-5): {len(y_train)} samples ({len(np.unique(train_genes))} unique genes)")
+            print(f"  Validation Set (Splits 6-7): {len(y_val)} samples ({len(np.unique(val_genes))} unique genes)")
+            print(f"  Test Set       (Splits 8-9): {len(y_test)} samples ({len(np.unique(test_genes))} unique genes)")
 
-        best_alpha = float(model.alpha_)
-        print(f"\n>>> Selected Optimal Alpha: {best_alpha:.4e} <<<")
+            print(f"\nTuning Ridge alpha on Validation Set [6, 7] (Candidates: {DEFAULT_ALPHAS})...")
+            print("-" * 70)
+            print(f"{'Alpha':<12} | {'Val Pearson r':<16} | {'Val Spearman rho':<18} | {'Val RMSE':<10}")
+            print("-" * 70)
 
-        # Evaluate individual CV folds with optimal alpha
-        print("\n" + "-" * 65)
-        print("          4-FOLD CROSS-VALIDATION DIAGNOSTICS (VAL FOLDS)         ")
-        print("-" * 65)
-        print(f"{'Fold':<10} | {'Train Folds':<18} | {'Val Folds':<12} | {'Val Pearson r':<14} | {'Val RMSE':<10}")
-        print("-" * 65)
+            alpha_evaluations = []
+            best_alpha = None
+            best_val_r = -float("inf")
+            best_model = None
 
-        fold_evaluations = []
-        val_pearsons = []
-        val_rmses = []
-        val_spearmans = []
+            for alpha_cand in DEFAULT_ALPHAS:
+                cand_ridge = Ridge(alpha=alpha_cand)
+                cand_ridge.fit(X_train, y_train)
+                val_pred_cand = cand_ridge.predict(X_val)
 
-        for f_idx, fold_def in enumerate(cv_fold_definitions):
-            tr_idx, val_idx = custom_cv[f_idx]
-            fold_ridge = Ridge(alpha=best_alpha)
-            fold_ridge.fit(X_train_cv[tr_idx], y_train_cv[tr_idx])
-            val_pred = fold_ridge.predict(X_train_cv[val_idx])
+                cand_metrics = calculate_metrics(y_val, val_pred_cand, prefix=f"alpha_{alpha_cand}")
+                cand_r = cand_metrics[f"alpha_{alpha_cand}_pearson_r"]
+                cand_rho = cand_metrics[f"alpha_{alpha_cand}_spearman_rho"]
+                cand_rmse = cand_metrics[f"alpha_{alpha_cand}_rmse"]
 
-            f_metrics = calculate_metrics(y_train_cv[val_idx], val_pred, prefix=f"fold_{f_idx+1}")
-            fold_evaluations.append({
-                "fold_name": fold_def["name"],
-                "train_splits": fold_def["train_splits"],
-                "val_splits": fold_def["val_splits"],
-                "val_samples": int(len(val_idx)),
-                **f_metrics,
-            })
-            r_val = f_metrics[f"fold_{f_idx+1}_pearson_r"]
-            rmse_val = f_metrics[f"fold_{f_idx+1}_rmse"]
-            s_val = f_metrics[f"fold_{f_idx+1}_spearman_rho"]
-            val_pearsons.append(r_val)
-            val_rmses.append(rmse_val)
-            val_spearmans.append(s_val)
+                alpha_evaluations.append({
+                    "alpha": float(alpha_cand),
+                    "val_pearson_r": cand_r,
+                    "val_spearman_rho": cand_rho,
+                    "val_rmse": cand_rmse,
+                })
+                print(f"{alpha_cand:<12.4e} | {cand_r:>14.4f}   | {cand_rho:>16.4f}   | {cand_rmse:>8.4f}")
 
-            tr_str = ",".join(map(str, fold_def["train_splits"]))
-            val_str = ",".join(map(str, fold_def["val_splits"]))
-            print(f"{fold_def['name']:<10} | {tr_str:<18} | {val_str:<12} | {r_val:>12.4f}  | {rmse_val:>8.4f}")
+                if cand_r > best_val_r:
+                    best_val_r = cand_r
+                    best_alpha = float(alpha_cand)
+                    best_model = cand_ridge
 
-        print("-" * 65)
-        mean_cv_r = float(np.mean(val_pearsons))
-        std_cv_r = float(np.std(val_pearsons))
-        mean_cv_rmse = float(np.mean(val_rmses))
-        std_cv_rmse = float(np.std(val_rmses))
-        print(f"{'Mean ± Std':<10} | {'-':<18} | {'-':<12} | {mean_cv_r:>7.4f} ± {std_cv_r:.4f} | {mean_cv_rmse:>6.4f} ± {std_cv_rmse:.4f}")
-        print("-" * 65)
+            print("-" * 70)
+            print(f"\n>>> Selected Optimal Alpha: {best_alpha:.4e} (Validation Pearson r = {best_val_r:.4f}) <<<")
 
-        # Train predictions on entire CV pool (0-7)
-        y_train_pred = model.predict(X_train_cv)
-        train_metrics = calculate_metrics(y_train_cv, y_train_pred, prefix="train_cv_pool")
+            model = best_model
+
+            # Train and Val predictions
+            y_train_pred = model.predict(X_train)
+            train_metrics = calculate_metrics(y_train, y_train_pred, prefix="train")
+
+            y_val_pred = model.predict(X_val)
+            val_metrics = calculate_metrics(y_val, y_val_pred, prefix="val")
+
+            X_train_cv = X_train
+            y_train_cv = y_train
+            fold_evaluations = alpha_evaluations
+            mean_cv_r, std_cv_r = float(best_val_r), 0.0
+            mean_cv_rmse, std_cv_rmse = float(val_metrics["val_rmse"]), 0.0
+
+        else:
+            # -----------------------------------------------------------------
+            # Pretrained Model Pipeline: 4-Fold CV across [0..7], Test [8..9]
+            # -----------------------------------------------------------------
+            cv_mask = np.isin(sample_splits, [0, 1, 2, 3, 4, 5, 6, 7])
+            X_train_cv, y_train_cv = X[cv_mask], y[cv_mask]
+            cv_splits = sample_splits[cv_mask]
+            train_genes = genes[cv_mask]
+
+            print(f"\n[Split Breakdown - Pretrained Base Model (4-Fold CV)]")
+            print(f"  CV Pool (Folds 0-7): {len(y_train_cv)} samples ({len(np.unique(train_genes))} unique genes)")
+            print(f"  Test Set (Folds 8-9): {len(y_test)} samples ({len(np.unique(test_genes))} unique genes)")
+
+            cv_fold_definitions = [
+                {"name": "Fold 1", "train_splits": [0, 1, 2, 3, 4, 5], "val_splits": [6, 7]},
+                {"name": "Fold 2", "train_splits": [2, 3, 4, 5, 6, 7], "val_splits": [0, 1]},
+                {"name": "Fold 3", "train_splits": [0, 1, 4, 5, 6, 7], "val_splits": [2, 3]},
+                {"name": "Fold 4", "train_splits": [0, 1, 2, 3, 6, 7], "val_splits": [4, 5]},
+            ]
+
+            custom_cv = []
+            for fold_def in cv_fold_definitions:
+                tr_idx = np.where(np.isin(cv_splits, fold_def["train_splits"]))[0]
+                val_idx = np.where(np.isin(cv_splits, fold_def["val_splits"]))[0]
+                custom_cv.append((tr_idx, val_idx))
+
+            print(f"\nTraining RidgeCV across custom 4-Fold Cross-Validation (Alphas: {DEFAULT_ALPHAS})...")
+            model = RidgeCV(alphas=DEFAULT_ALPHAS, cv=custom_cv)
+            model.fit(X_train_cv, y_train_cv)
+
+            best_alpha = float(model.alpha_)
+            print(f"\n>>> Selected Optimal Alpha: {best_alpha:.4e} <<<")
+
+            # Evaluate individual CV folds with optimal alpha
+            print("\n" + "-" * 65)
+            print("          4-FOLD CROSS-VALIDATION DIAGNOSTICS (VAL FOLDS)         ")
+            print("-" * 65)
+            print(f"{'Fold':<10} | {'Train Folds':<18} | {'Val Folds':<12} | {'Val Pearson r':<14} | {'Val RMSE':<10}")
+            print("-" * 65)
+
+            fold_evaluations = []
+            val_pearsons = []
+            val_rmses = []
+            val_spearmans = []
+
+            for f_idx, fold_def in enumerate(cv_fold_definitions):
+                tr_idx, val_idx = custom_cv[f_idx]
+                fold_ridge = Ridge(alpha=best_alpha)
+                fold_ridge.fit(X_train_cv[tr_idx], y_train_cv[tr_idx])
+                val_pred = fold_ridge.predict(X_train_cv[val_idx])
+
+                f_metrics = calculate_metrics(y_train_cv[val_idx], val_pred, prefix=f"fold_{f_idx+1}")
+                fold_evaluations.append({
+                    "fold_name": fold_def["name"],
+                    "train_splits": fold_def["train_splits"],
+                    "val_splits": fold_def["val_splits"],
+                    "val_samples": int(len(val_idx)),
+                    **f_metrics,
+                })
+                r_val = f_metrics[f"fold_{f_idx+1}_pearson_r"]
+                rmse_val = f_metrics[f"fold_{f_idx+1}_rmse"]
+                s_val = f_metrics[f"fold_{f_idx+1}_spearman_rho"]
+                val_pearsons.append(r_val)
+                val_rmses.append(rmse_val)
+                val_spearmans.append(s_val)
+
+                tr_str = ",".join(map(str, fold_def["train_splits"]))
+                val_str = ",".join(map(str, fold_def["val_splits"]))
+                print(f"{fold_def['name']:<10} | {tr_str:<18} | {val_str:<12} | {r_val:>12.4f}  | {rmse_val:>8.4f}")
+
+            print("-" * 65)
+            mean_cv_r = float(np.mean(val_pearsons))
+            std_cv_r = float(np.std(val_pearsons))
+            mean_cv_rmse = float(np.mean(val_rmses))
+            std_cv_rmse = float(np.std(val_rmses))
+            print(f"{'Mean ± Std':<10} | {'-':<18} | {'-':<12} | {mean_cv_r:>7.4f} ± {std_cv_r:.4f} | {mean_cv_rmse:>6.4f} ± {std_cv_rmse:.4f}")
+            print("-" * 65)
+
+            # Train predictions on entire CV pool (0-7)
+            y_train_pred = model.predict(X_train_cv)
+            train_metrics = calculate_metrics(y_train_cv, y_train_pred, prefix="train_cv_pool")
+            val_metrics = {}
 
     else:
         # Fallback to standard split
@@ -498,6 +584,7 @@ def main():
         fold_evaluations = []
         mean_cv_r, std_cv_r = 0.0, 0.0
         mean_cv_rmse, std_cv_rmse = 0.0, 0.0
+        val_metrics = {}
 
         y_train_pred = model.predict(X_train_cv)
         train_metrics = calculate_metrics(y_train_cv, y_train_pred, prefix="train")
@@ -508,7 +595,13 @@ def main():
     y_test_pred = model.predict(X_test)
     test_metrics = calculate_metrics(y_test, y_test_pred, prefix="test")
 
-    print_metrics(train_metrics, f"Training/CV Pool Metrics ({args.target_col})")
+    if is_finetuned and use_lookup:
+        print_metrics(train_metrics, f"Training Set Metrics (Splits 0-5) ({args.target_col})")
+        print_metrics(val_metrics, f"Validation Set Metrics (Splits 6-7) ({args.target_col})")
+    elif use_lookup:
+        print_metrics(train_metrics, f"Training/CV Pool Metrics (Splits 0-7) ({args.target_col})")
+    else:
+        print_metrics(train_metrics, f"Training Set Metrics ({args.target_col})")
     print_metrics(test_metrics, f"Test Set Metrics (Folds 8 & 9) ({args.target_col})")
 
     # 1. Save trained model
@@ -537,18 +630,24 @@ def main():
         "target_col": args.target_col,
         "embeddings_path": str(emb_path),
         "split_mechanism": "lookup_10folds" if use_lookup else args.split_type,
+        "evaluation_scheme": (
+            "train_0_5_val_6_7_test_8_9" if (is_finetuned and use_lookup)
+            else ("4fold_cv_pool_0_7" if use_lookup else args.split_type)
+        ),
         "splits_lookup_path": str(lookup_path) if use_lookup else None,
         "best_alpha": best_alpha,
         "cv_pool_size": int(len(y_train_cv)),
         "test_size": int(len(y_test)),
         "cv_pool_unique_genes": int(len(np.unique(train_genes))),
         "test_unique_genes": int(len(np.unique(test_genes))),
+        **({"val_size": int(len(y_val)), "val_unique_genes": int(len(np.unique(val_genes)))} if (is_finetuned and use_lookup) else {}),
         "cv_folds_metrics": fold_evaluations,
         "cv_mean_pearson_r": mean_cv_r,
         "cv_std_pearson_r": std_cv_r,
         "cv_mean_rmse": mean_cv_rmse,
         "cv_std_rmse": std_cv_rmse,
         **train_metrics,
+        **val_metrics,
         **test_metrics,
     }
     metrics_file = out_dir / f"metrics_hIPSC_CM_{args.target_col}.json"
