@@ -578,7 +578,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus_6track_finetuned_hIPSC_CM",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus/orthrus_6track_finetuned_hIPSC_CM",
         help="Directory to save fine-tuned checkpoints and logs",
     )
     parser.add_argument(

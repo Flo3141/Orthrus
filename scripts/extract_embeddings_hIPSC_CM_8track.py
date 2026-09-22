@@ -88,7 +88,7 @@ def main():
     parser.add_argument(
         "--model_checkpoint",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus_8track_finetuned_hIPSC_CM/best_finetuned_backbone",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus/orthrus_8track_finetuned_hIPSC_CM/best_finetuned_backbone",
         help="Path to 8-track model directory (warm-started from convert_6track_to_8track.py or fine-tuned backbone)",
     )
     parser.add_argument(

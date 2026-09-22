@@ -16,8 +16,8 @@ SCRIPTS_DIR="${PROJECT_DIR}/Orthrus/scripts"
 
 DATA_NPZ="${PROJECT_DIR}/data/hIPSC_CM/hIPSC_CM_8track_minmax.npz"
 SPLITS_LOOKUP="${PROJECT_DIR}/data/hIPSC_CM/hipsc_cm_10folds_lookup.csv"
-CHECKPOINT_8T_DIR="${PROJECT_DIR}/checkpoints/orthrus-large-8-track"
-FINETUNED_DIR="${PROJECT_DIR}/checkpoints/orthrus_8track_finetuned_hIPSC_CM"
+CHECKPOINT_8T_DIR="${PROJECT_DIR}/checkpoints/orthrus/orthrus-large-8-track"
+FINETUNED_DIR="${PROJECT_DIR}/checkpoints/orthrus/orthrus_8track_finetuned_hIPSC_CM"
 EMBEDDING_OUT="${PROJECT_DIR}/data/hIPSC_CM/orthrus_8track_embeddings_hIPSC_CM_minmax.npz"
 
 # -----------------------------------------------------------------------------

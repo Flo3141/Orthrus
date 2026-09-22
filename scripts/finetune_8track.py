@@ -587,13 +587,13 @@ def main():
     parser.add_argument(
         "--model_checkpoint",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus-large-8-track",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus/orthrus-large-8-track",
         help="Path to 8-track converted Orthrus model directory (from convert_6track_to_8track.py)",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus_8track_finetuned_hIPSC_CM",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus/orthrus_8track_finetuned_hIPSC_CM",
         help="Directory to save fine-tuned checkpoints and logs",
     )
     parser.add_argument(
