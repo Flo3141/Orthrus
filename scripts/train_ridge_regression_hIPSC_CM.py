@@ -64,6 +64,46 @@ def print_metrics(metrics: dict, title: str):
             print(f"  {k:26s}: {v:.4f}")
 
 
+def load_transformation_params(params_path: Path) -> tuple:
+    """
+    Loads mu_log, sigma_log, and pseudocount from transformation_params.json.
+    Raises FileNotFoundError if the file does not exist, and KeyError if mu_log or sigma_log are missing.
+    """
+    if not params_path.exists():
+        raise FileNotFoundError(f"Transformation parameter file not found: {params_path}")
+
+    with open(params_path, "r", encoding="utf-8") as f:
+        params = json.load(f)
+
+    if "mu_log" not in params:
+        raise KeyError(f"Key 'mu_log' is missing in transformation parameter file: {params_path}")
+    if "sigma_log" not in params:
+        raise KeyError(f"Key 'sigma_log' is missing in transformation parameter file: {params_path}")
+
+    mu_log = float(params["mu_log"])
+    sigma_log = float(params["sigma_log"])
+    pseudocount = float(params.get("pseudocount", 0.1))
+
+    return mu_log, sigma_log, pseudocount, params_path
+
+
+def inverse_transform_half_life(
+    y_transformed: np.ndarray,
+    mu: float,
+    sigma: float,
+    pseudocount: float = 0.1,
+) -> np.ndarray:
+    """
+    Inverts the log + z-score transformation:
+      y_log = (y_transformed * sigma) + mu
+      y_raw = exp(y_log) - pseudocount
+    Clips output to >= 0 to avoid negative physical half-lives.
+    """
+    y_log = (y_transformed * sigma) + mu
+    y_raw = np.exp(y_log) - pseudocount
+    return np.clip(y_raw, a_min=0.0, a_max=None)
+
+
 def load_hIPSC_CM_npz(file_path: Path, target_col: str) -> dict:
     """Loads an NPZ file containing hIPSC_CM embeddings and metadata."""
     if not file_path.exists():
@@ -119,6 +159,10 @@ def load_hIPSC_CM_npz(file_path: Path, target_col: str) -> dict:
         except Exception:
             pass
 
+    raw_half_life = None
+    if "half_life" in data:
+        raw_half_life = data["half_life"].astype(np.float32)
+
     return {
         "embeddings": data["embeddings"],
         "targets": targets.astype(np.float32),
@@ -128,6 +172,7 @@ def load_hIPSC_CM_npz(file_path: Path, target_col: str) -> dict:
         "normalization": normalization,
         "is_finetuned": is_finetuned,
         "archive_keys": available_keys,
+        "raw_half_life": raw_half_life,
     }
 
 
@@ -287,6 +332,12 @@ def parse_args():
         help="Whether embeddings stem from a fine-tuned model ('auto', 'true', or 'false')",
     )
     parser.add_argument(
+        "--transformation_params_path",
+        type=str,
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/transformation_params.json",
+        help="Path to transformation_params.json containing mu_log and sigma_log (from transform_hIPSC_CM_dataset.py)",
+    )
+    parser.add_argument(
         "--plot",
         action="store_true",
         help="Optional: create scatter plot (y_true vs. y_pred) as PNG",
@@ -346,6 +397,7 @@ def main():
     y = data["targets"]
     genes = data["genes"]
     transcript_ids = data["transcript_ids"]
+    raw_half_life = data.get("raw_half_life")
 
     # Filter invalid target values (NaN / Inf)
     valid_mask = ~np.isnan(y) & ~np.isinf(y)
@@ -356,6 +408,8 @@ def main():
         y = y[valid_mask]
         genes = genes[valid_mask]
         transcript_ids = transcript_ids[valid_mask]
+        if raw_half_life is not None:
+            raw_half_life = raw_half_life[valid_mask]
 
     print(f"Valid samples:       {len(y)}")
     print(f"Feature dimension:   {X.shape[1]}")
@@ -395,12 +449,15 @@ def main():
             genes = genes[matched_mask]
             transcript_ids = transcript_ids[matched_mask]
             sample_splits = sample_splits[matched_mask]
+            if raw_half_life is not None:
+                raw_half_life = raw_half_life[matched_mask]
 
         # Folds 8 & 9 are reserved for Test Set (20%)
         test_mask = np.isin(sample_splits, [8, 9])
         X_test, y_test = X[test_mask], y[test_mask]
         test_genes = genes[test_mask]
         test_tx = transcript_ids[test_mask]
+        y_test_raw_true = raw_half_life[test_mask] if raw_half_life is not None else None
 
         if is_finetuned:
             # -----------------------------------------------------------------
@@ -571,6 +628,7 @@ def main():
         X_test, y_test = X[test_idx], y[test_idx]
         train_genes, test_genes = genes[train_idx], genes[test_idx]
         test_tx = transcript_ids[test_idx]
+        y_test_raw_true = raw_half_life[test_idx] if raw_half_life is not None else None
 
         print(f"Training set: {len(y_train_cv)} samples ({len(np.unique(train_genes))} unique genes)")
         print(f"Test set:     {len(y_test)} samples ({len(np.unique(test_genes))} unique genes)")
@@ -595,6 +653,35 @@ def main():
     y_test_pred = model.predict(X_test)
     test_metrics = calculate_metrics(y_test, y_test_pred, prefix="test")
 
+    # Inverse transformation for half_life_transformed
+    test_raw_metrics = {}
+    y_test_pred_raw = None
+    trans_info = None
+
+    if args.target_col == "half_life_transformed":
+        params_path = Path(args.transformation_params_path)
+        mu_log, sigma_log, pseudocount, resolved_params_path = load_transformation_params(params_path)
+        print(f"\n[Transformation Params Loaded from: {resolved_params_path}]")
+        print(f"  mu_log:      {mu_log:.6f}")
+        print(f"  sigma_log:   {sigma_log:.6f}")
+        print(f"  pseudocount: {pseudocount}")
+
+        y_test_pred_raw = inverse_transform_half_life(
+            y_test_pred, mu=mu_log, sigma=sigma_log, pseudocount=pseudocount
+        )
+        if y_test_raw_true is None:
+            y_test_raw_true = inverse_transform_half_life(
+                y_test, mu=mu_log, sigma=sigma_log, pseudocount=pseudocount
+            )
+
+        test_raw_metrics = calculate_metrics(y_test_raw_true, y_test_pred_raw, prefix="test_raw_hwz")
+        trans_info = {
+            "params_path": str(resolved_params_path),
+            "mu_log": mu_log,
+            "sigma_log": sigma_log,
+            "pseudocount": pseudocount,
+        }
+
     if is_finetuned and use_lookup:
         print_metrics(train_metrics, f"Training Set Metrics (Splits 0-5) ({args.target_col})")
         print_metrics(val_metrics, f"Validation Set Metrics (Splits 6-7) ({args.target_col})")
@@ -602,7 +689,10 @@ def main():
         print_metrics(train_metrics, f"Training/CV Pool Metrics (Splits 0-7) ({args.target_col})")
     else:
         print_metrics(train_metrics, f"Training Set Metrics ({args.target_col})")
-    print_metrics(test_metrics, f"Test Set Metrics (Folds 8 & 9) ({args.target_col})")
+
+    print_metrics(test_metrics, f"Test Set Metrics (Folds 8 & 9) - Transformed ({args.target_col})")
+    if test_raw_metrics:
+        print_metrics(test_raw_metrics, "Test Set Metrics (Folds 8 & 9) - Back-transformed (Actual Half-Life in Hours)")
 
     # 1. Save trained model
     model_file = out_dir / f"ridge_model_hIPSC_CM_{args.target_col}.joblib"
@@ -610,13 +700,19 @@ def main():
     print(f"\nModel saved to: {model_file}")
 
     # 2. Save predictions as CSV
-    pred_df = pd.DataFrame({
+    pred_dict = {
         "transcript_id": test_tx,
         "gene": test_genes,
         "true_target": y_test,
         "predicted_target": y_test_pred,
         "residual": y_test - y_test_pred,
-    })
+    }
+    if y_test_pred_raw is not None and y_test_raw_true is not None:
+        pred_dict["true_half_life_hours"] = y_test_raw_true
+        pred_dict["predicted_half_life_hours"] = y_test_pred_raw
+        pred_dict["residual_hours"] = y_test_raw_true - y_test_pred_raw
+
+    pred_df = pd.DataFrame(pred_dict)
     pred_file = out_dir / f"predictions_hIPSC_CM_{args.target_col}.csv"
     pred_df.to_csv(pred_file, index=False)
     print(f"Predictions saved to: {pred_file}")
@@ -641,6 +737,7 @@ def main():
         "cv_pool_unique_genes": int(len(np.unique(train_genes))),
         "test_unique_genes": int(len(np.unique(test_genes))),
         **({"val_size": int(len(y_val)), "val_unique_genes": int(len(np.unique(val_genes)))} if (is_finetuned and use_lookup) else {}),
+        "transformation_params": trans_info,
         "cv_folds_metrics": fold_evaluations,
         "cv_mean_pearson_r": mean_cv_r,
         "cv_std_pearson_r": std_cv_r,
@@ -649,6 +746,7 @@ def main():
         **train_metrics,
         **val_metrics,
         **test_metrics,
+        **test_raw_metrics,
     }
     metrics_file = out_dir / f"metrics_hIPSC_CM_{args.target_col}.json"
     with open(metrics_file, "w", encoding="utf-8") as f:
@@ -658,12 +756,6 @@ def main():
     # 4. Save scatter plot (y_true vs. y_pred)
     if args.plot:
         try:
-            fig, ax = plt.subplots(figsize=(7, 6))
-            ax.scatter(y_test, y_test_pred, alpha=0.35, s=18, color="#1f77b4", edgecolors="none")
-            p_r = test_metrics["test_pearson_r"]
-            s_rho = test_metrics["test_spearman_rho"]
-            r2 = test_metrics["test_r2"]
-
             if track_type == "8track":
                 emb_label = f"8-Track ({normalization.upper()})"
             elif is_finetuned:
@@ -671,30 +763,86 @@ def main():
             else:
                 emb_label = "6-Track (Pretrained)"
 
-            ax.set_title(
-                f"Orthrus {emb_label} -> hIPSC_CM ({args.target_col})\n"
-                f"Test Pearson r = {p_r:.3f} | Spearman rho = {s_rho:.3f} | R² = {r2:.3f}",
-                fontsize=11,
-                fontweight="bold",
-            )
-            ax.set_xlabel(f"True Value ({args.target_col})", fontsize=10)
-            ax.set_ylabel(f"Predicted Value ({args.target_col})", fontsize=10)
+            if y_test_pred_raw is not None and y_test_raw_true is not None:
+                # Dual subplot: Left = Transformed Z-Score, Right = Back-transformed (Hours)
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
-            # Diagonal reference line (Ideal)
-            min_val = min(float(np.min(y_test)), float(np.min(y_test_pred)))
-            max_val = max(float(np.max(y_test)), float(np.max(y_test_pred)))
-            margin = (max_val - min_val) * 0.05
-            ax.plot(
-                [min_val - margin, max_val + margin],
-                [min_val - margin, max_val + margin],
-                "r--",
-                linewidth=1.5,
-                label="Ideal (y=x)",
-            )
-            ax.legend()
-            ax.grid(True, linestyle="--", alpha=0.5)
+                # Subplot 1: Transformed Z-score
+                ax1.scatter(y_test, y_test_pred, alpha=0.35, s=18, color="#1f77b4", edgecolors="none")
+                p_r = test_metrics["test_pearson_r"]
+                s_rho = test_metrics["test_spearman_rho"]
+                r2 = test_metrics["test_r2"]
+                rmse = test_metrics["test_rmse"]
+                ax1.set_title(
+                    f"Transformed Target (Z-Score)\n"
+                    f"Pearson r = {p_r:.3f} | Spearman rho = {s_rho:.3f} | RMSE = {rmse:.3f} | R² = {r2:.3f}",
+                    fontsize=10,
+                    fontweight="bold",
+                )
+                ax1.set_xlabel(f"True Value ({args.target_col})", fontsize=10)
+                ax1.set_ylabel(f"Predicted Value ({args.target_col})", fontsize=10)
+                min_v1 = min(float(np.min(y_test)), float(np.min(y_test_pred)))
+                max_v1 = max(float(np.max(y_test)), float(np.max(y_test_pred)))
+                margin1 = (max_v1 - min_v1) * 0.05
+                ax1.plot([min_v1 - margin1, max_v1 + margin1], [min_v1 - margin1, max_v1 + margin1], "r--", linewidth=1.5, label="Ideal (y=x)")
+                ax1.legend()
+                ax1.grid(True, linestyle="--", alpha=0.5)
 
-            plt.tight_layout()
+                # Subplot 2: Back-transformed (Actual Half-Life in Hours)
+                ax2.scatter(y_test_raw_true, y_test_pred_raw, alpha=0.35, s=18, color="#2ca02c", edgecolors="none")
+                p_r_raw = test_raw_metrics.get("test_raw_hwz_pearson_r", np.nan)
+                s_rho_raw = test_raw_metrics.get("test_raw_hwz_spearman_rho", np.nan)
+                rmse_raw = test_raw_metrics.get("test_raw_hwz_rmse", np.nan)
+                mae_raw = test_raw_metrics.get("test_raw_hwz_mae", np.nan)
+                r2_raw = test_raw_metrics.get("test_raw_hwz_r2", np.nan)
+                ax2.set_title(
+                    f"Back-transformed: Actual Half-Life (Hours)\n"
+                    f"Pearson r = {p_r_raw:.3f} | Spearman rho = {s_rho_raw:.3f} | RMSE = {rmse_raw:.2f}h | MAE = {mae_raw:.2f}h",
+                    fontsize=10,
+                    fontweight="bold",
+                )
+                ax2.set_xlabel("True Half-Life (Hours)", fontsize=10)
+                ax2.set_ylabel("Predicted Half-Life (Hours)", fontsize=10)
+                min_v2 = min(float(np.min(y_test_raw_true)), float(np.min(y_test_pred_raw)))
+                max_v2 = max(float(np.max(y_test_raw_true)), float(np.max(y_test_pred_raw)))
+                margin2 = (max_v2 - min_v2) * 0.05
+                ax2.plot([min_v2 - margin2, max_v2 + margin2], [min_v2 - margin2, max_v2 + margin2], "r--", linewidth=1.5, label="Ideal (y=x)")
+                ax2.legend()
+                ax2.grid(True, linestyle="--", alpha=0.5)
+
+                fig.suptitle(f"Orthrus {emb_label} -> hIPSC_CM Test Set Evaluation", fontsize=12, fontweight="bold")
+                plt.tight_layout()
+            else:
+                # Single plot (standard behavior)
+                fig, ax = plt.subplots(figsize=(7, 6))
+                ax.scatter(y_test, y_test_pred, alpha=0.35, s=18, color="#1f77b4", edgecolors="none")
+                p_r = test_metrics["test_pearson_r"]
+                s_rho = test_metrics["test_spearman_rho"]
+                r2 = test_metrics["test_r2"]
+
+                ax.set_title(
+                    f"Orthrus {emb_label} -> hIPSC_CM ({args.target_col})\n"
+                    f"Test Pearson r = {p_r:.3f} | Spearman rho = {s_rho:.3f} | R² = {r2:.3f}",
+                    fontsize=11,
+                    fontweight="bold",
+                )
+                ax.set_xlabel(f"True Value ({args.target_col})", fontsize=10)
+                ax.set_ylabel(f"Predicted Value ({args.target_col})", fontsize=10)
+
+                min_val = min(float(np.min(y_test)), float(np.min(y_test_pred)))
+                max_val = max(float(np.max(y_test)), float(np.max(y_test_pred)))
+                margin = (max_val - min_val) * 0.05
+                ax.plot(
+                    [min_val - margin, max_val + margin],
+                    [min_val - margin, max_val + margin],
+                    "r--",
+                    linewidth=1.5,
+                    label="Ideal (y=x)",
+                )
+                ax.legend()
+                ax.grid(True, linestyle="--", alpha=0.5)
+                plt.tight_layout()
+
             plot_file = out_dir / f"scatter_hIPSC_CM_{args.target_col}.png"
             fig.savefig(plot_file, dpi=300)
             plt.close(fig)
