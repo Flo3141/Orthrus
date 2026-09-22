@@ -178,7 +178,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus/orthrus-large-8-track",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus/orthrus_8track_from_finetuned_6track",
         help="Destination path to save the 8-track checkpoint",
     )
     parser.add_argument(
