@@ -338,6 +338,13 @@ def parse_args():
         help="Path to transformation_params.json containing mu_log and sigma_log (from transform_hIPSC_CM_dataset.py)",
     )
     parser.add_argument(
+        "--evaluation_scheme",
+        type=str,
+        choices=["auto", "4fold_cv", "single_split"],
+        default="auto",
+        help="Evaluation scheme for standardized lookup table: '4fold_cv' (4-fold CV on splits 0-7, test 8,9), 'single_split' (legacy single split train 0-5, val 6-7, test 8,9), or 'auto' (4fold_cv for 4-fold CV embeddings and base model). Default: auto",
+    )
+    parser.add_argument(
         "--plot",
         action="store_true",
         help="Optional: create scatter plot (y_true vs. y_pred) as PNG",
@@ -459,10 +466,18 @@ def main():
         test_tx = transcript_ids[test_mask]
         y_test_raw_true = raw_half_life[test_mask] if raw_half_life is not None else None
 
-        if is_finetuned:
+        is_4fold_cv = bool(emb_data.get("is_4fold_cv", False)) or ("fold_assignment" in emb_data)
+        if args.evaluation_scheme == "4fold_cv":
+            run_4fold_cv = True
+        elif args.evaluation_scheme == "single_split":
+            run_4fold_cv = False
+        else:
+            # 'auto': 4-fold CV for 4-fold out-of-fold embeddings and base models
+            run_4fold_cv = is_4fold_cv or (not is_finetuned)
+
+        if not run_4fold_cv:
             # -----------------------------------------------------------------
-            # Fine-Tuned Model Pipeline: Train [0..5], Val [6..7], Test [8..9]
-            # No CV across 0..7 to prevent target leakage from fine-tuning
+            # Legacy Single Fine-Tuned Model Pipeline: Train [0..5], Val [6..7], Test [8..9]
             # -----------------------------------------------------------------
             train_mask = np.isin(sample_splits, [0, 1, 2, 3, 4, 5])
             val_mask = np.isin(sample_splits, [6, 7])
@@ -473,7 +488,7 @@ def main():
             X_val, y_val = X[val_mask], y[val_mask]
             val_genes = genes[val_mask]
 
-            print(f"\n[Split Breakdown - Fine-Tuned Model (No-Leakage Protocol)]")
+            print(f"\n[Split Breakdown - Legacy Single-Model Protocol]")
             print(f"  Training Set   (Splits 0-5): {len(y_train)} samples ({len(np.unique(train_genes))} unique genes)")
             print(f"  Validation Set (Splits 6-7): {len(y_val)} samples ({len(np.unique(val_genes))} unique genes)")
             print(f"  Test Set       (Splits 8-9): {len(y_test)} samples ({len(np.unique(test_genes))} unique genes)")
@@ -531,22 +546,22 @@ def main():
 
         else:
             # -----------------------------------------------------------------
-            # Pretrained Model Pipeline: 4-Fold CV across [0..7], Test [8..9]
+            # 4-Fold Cross-Validation Pipeline across [0..7], Holdout Test [8..9]
             # -----------------------------------------------------------------
             cv_mask = np.isin(sample_splits, [0, 1, 2, 3, 4, 5, 6, 7])
             X_train_cv, y_train_cv = X[cv_mask], y[cv_mask]
             cv_splits = sample_splits[cv_mask]
             train_genes = genes[cv_mask]
 
-            print(f"\n[Split Breakdown - Pretrained Base Model (4-Fold CV)]")
+            print(f"\n[Split Breakdown - 4-Fold Cross-Validation Protocol]")
             print(f"  CV Pool (Folds 0-7): {len(y_train_cv)} samples ({len(np.unique(train_genes))} unique genes)")
             print(f"  Test Set (Folds 8-9): {len(y_test)} samples ({len(np.unique(test_genes))} unique genes)")
 
             cv_fold_definitions = [
-                {"name": "Fold 1", "train_splits": [0, 1, 2, 3, 4, 5], "val_splits": [6, 7]},
-                {"name": "Fold 2", "train_splits": [2, 3, 4, 5, 6, 7], "val_splits": [0, 1]},
-                {"name": "Fold 3", "train_splits": [0, 1, 4, 5, 6, 7], "val_splits": [2, 3]},
-                {"name": "Fold 4", "train_splits": [0, 1, 2, 3, 6, 7], "val_splits": [4, 5]},
+                {"name": "Fold 0", "train_splits": [0, 1, 2, 3, 4, 5], "val_splits": [6, 7]},
+                {"name": "Fold 1", "train_splits": [2, 3, 4, 5, 6, 7], "val_splits": [0, 1]},
+                {"name": "Fold 2", "train_splits": [0, 1, 4, 5, 6, 7], "val_splits": [2, 3]},
+                {"name": "Fold 3", "train_splits": [0, 1, 2, 3, 6, 7], "val_splits": [4, 5]},
             ]
 
             custom_cv = []
@@ -580,7 +595,7 @@ def main():
                 fold_ridge.fit(X_train_cv[tr_idx], y_train_cv[tr_idx])
                 val_pred = fold_ridge.predict(X_train_cv[val_idx])
 
-                f_metrics = calculate_metrics(y_train_cv[val_idx], val_pred, prefix=f"fold_{f_idx+1}")
+                f_metrics = calculate_metrics(y_train_cv[val_idx], val_pred, prefix=f"fold_{f_idx}")
                 fold_evaluations.append({
                     "fold_name": fold_def["name"],
                     "train_splits": fold_def["train_splits"],
@@ -588,9 +603,9 @@ def main():
                     "val_samples": int(len(val_idx)),
                     **f_metrics,
                 })
-                r_val = f_metrics[f"fold_{f_idx+1}_pearson_r"]
-                rmse_val = f_metrics[f"fold_{f_idx+1}_rmse"]
-                s_val = f_metrics[f"fold_{f_idx+1}_spearman_rho"]
+                r_val = f_metrics[f"fold_{f_idx}_pearson_r"]
+                rmse_val = f_metrics[f"fold_{f_idx}_rmse"]
+                s_val = f_metrics[f"fold_{f_idx}_spearman_rho"]
                 val_pearsons.append(r_val)
                 val_rmses.append(rmse_val)
                 val_spearmans.append(s_val)
@@ -682,7 +697,9 @@ def main():
             "pseudocount": pseudocount,
         }
 
-    if is_finetuned and use_lookup:
+    if use_lookup and run_4fold_cv:
+        print_metrics(train_metrics, f"Training/CV Pool Metrics (Splits 0-7) ({args.target_col})")
+    elif is_finetuned and use_lookup:
         print_metrics(train_metrics, f"Training Set Metrics (Splits 0-5) ({args.target_col})")
         print_metrics(val_metrics, f"Validation Set Metrics (Splits 6-7) ({args.target_col})")
     elif use_lookup:
@@ -722,13 +739,15 @@ def main():
         "dataset": "hIPSC_CM",
         "track_type": track_type,
         "is_finetuned": is_finetuned,
+        "is_4fold_cv": is_4fold_cv,
         "normalization": normalization if track_type == "8track" else None,
         "target_col": args.target_col,
         "embeddings_path": str(emb_path),
         "split_mechanism": "lookup_10folds" if use_lookup else args.split_type,
         "evaluation_scheme": (
-            "train_0_5_val_6_7_test_8_9" if (is_finetuned and use_lookup)
-            else ("4fold_cv_pool_0_7" if use_lookup else args.split_type)
+            "4fold_cv_pool_0_7" if (use_lookup and run_4fold_cv)
+            else ("train_0_5_val_6_7_test_8_9" if (is_finetuned and use_lookup)
+            else ("4fold_cv_pool_0_7" if use_lookup else args.split_type))
         ),
         "splits_lookup_path": str(lookup_path) if use_lookup else None,
         "best_alpha": best_alpha,
@@ -736,7 +755,7 @@ def main():
         "test_size": int(len(y_test)),
         "cv_pool_unique_genes": int(len(np.unique(train_genes))),
         "test_unique_genes": int(len(np.unique(test_genes))),
-        **({"val_size": int(len(y_val)), "val_unique_genes": int(len(np.unique(val_genes)))} if (is_finetuned and use_lookup) else {}),
+        **({"val_size": int(len(y_val)), "val_unique_genes": int(len(np.unique(val_genes)))} if (not run_4fold_cv and is_finetuned and use_lookup) else {}),
         "transformation_params": trans_info,
         "cv_folds_metrics": fold_evaluations,
         "cv_mean_pearson_r": mean_cv_r,

@@ -77,6 +77,10 @@ def extract_embeddings_for_8track(
     all_embeddings = np.stack(embeddings_list, axis=0)
     return all_embeddings
 
+
+SPLITS_LOOKUP_PATH = Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hipsc_cm_10folds_lookup.csv")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Extract Orthrus 8-track embeddings for hIPSC_CM")
     parser.add_argument(
@@ -88,8 +92,8 @@ def main():
     parser.add_argument(
         "--model_checkpoint",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus/orthrus_8track_finetuned_hIPSC_CM/best_finetuned_backbone",
-        help="Path to 8-track model directory (warm-started from convert_6track_to_8track.py or fine-tuned backbone)",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus/orthrus_8track_finetuned_hIPSC_CM",
+        help="Path to 8-track model directory (parent folder with fold_0..fold_3, or single model checkpoint)",
     )
     parser.add_argument(
         "--output_dir",
@@ -129,15 +133,20 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     save_file = output_dir / args.output_filename
 
-    # Resolve whether model is fine-tuned
-    model_path_str = str(args.model_checkpoint).strip()
+    # Resolve whether model is fine-tuned or 4-fold
+    model_path = Path(str(args.model_checkpoint).strip())
+    fold_subdirs = [model_path / f"fold_{k}" for k in range(4)]
+    is_4fold = all(p.is_dir() for p in fold_subdirs)
+
+    model_path_str = str(model_path)
     if args.is_finetuned == "true":
         is_finetuned = True
     elif args.is_finetuned == "false":
         is_finetuned = False
     else:
         is_finetuned = (
-            "finetun" in model_path_str.lower()
+            is_4fold
+            or "finetun" in model_path_str.lower()
             or "checkpoint" in model_path_str.lower()
         )
 
@@ -155,6 +164,7 @@ def main():
     print("=" * 70)
     print(f"Data file:         {data_file}")
     print(f"Model checkpoint:  {args.model_checkpoint}")
+    print(f"Extraction Mode:   {'4-Fold Cross-Validation (Out-of-Fold + Test Ensemble)' if is_4fold else 'Single Model'}")
     print(f"Model variant:     {'Fine-Tuned' if is_finetuned else 'Base 8-Track'}")
     print(f"Output file:       {save_file}")
     print(f"Batch size:        {args.batch_size}")
@@ -165,59 +175,151 @@ def main():
     print(f"Loaded {n_samples} transcripts.")
 
     # 2. Extract metadata
-    metadata_list = []
-    for i in range(n_samples):
-        metadata_list.append({
-            "tx_id": str(npz_data["ensembl_transcript_id"][i]) if "ensembl_transcript_id" in npz_data else f"tx_{i}",
-            "gene_id": str(npz_data["ensembl_gene_id"][i]) if "ensembl_gene_id" in npz_data else "",
-            "gene_symbol": str(npz_data["hgnc_symbol"][i]) if "hgnc_symbol" in npz_data else "",
-            "half_life_transformed": float(npz_data["half_life_transformed"][i]) if "half_life_transformed" in npz_data else np.nan,
-            "half_life": float(npz_data["half_life"][i]) if "half_life" in npz_data else np.nan,
-            "rate": float(npz_data["rate"][i]) if "rate" in npz_data else np.nan,
-            "has_mirna": bool(npz_data["has_mirna"][i]) if "has_mirna" in npz_data else False,
-            "has_eclip": bool(npz_data["has_eclip"][i]) if "has_eclip" in npz_data else False,
-            "has_gtf": bool(npz_data["has_gtf"][i]) if "has_gtf" in npz_data else False,
-        })
+    tx_ids = np.array([str(npz_data["ensembl_transcript_id"][i]) if "ensembl_transcript_id" in npz_data else f"tx_{i}" for i in range(n_samples)])
+    gene_ids = np.array([str(npz_data["ensembl_gene_id"][i]) if "ensembl_gene_id" in npz_data else "" for i in range(n_samples)])
+    gene_symbols = np.array([str(npz_data["hgnc_symbol"][i]) if "hgnc_symbol" in npz_data else "" for i in range(n_samples)])
+    half_lives = np.array([float(npz_data["half_life"][i]) if "half_life" in npz_data else np.nan for i in range(n_samples)], dtype=np.float32)
+    half_lives_transformed = np.array([float(npz_data["half_life_transformed"][i]) if "half_life_transformed" in npz_data else np.nan for i in range(n_samples)], dtype=np.float32)
+    rates = np.array([float(npz_data["rate"][i]) if "rate" in npz_data else np.nan for i in range(n_samples)], dtype=np.float32)
+    has_mirna = np.array([bool(npz_data["has_mirna"][i]) if "has_mirna" in npz_data else False for i in range(n_samples)], dtype=bool)
+    has_eclip = np.array([bool(npz_data["has_eclip"][i]) if "has_eclip" in npz_data else False for i in range(n_samples)], dtype=bool)
+    has_gtf = np.array([bool(npz_data["has_gtf"][i]) if "has_gtf" in npz_data else False for i in range(n_samples)], dtype=bool)
+    seq_lens = np.array([tr.shape[0] for tr in tracks], dtype=np.int32)
 
-    # 3. Load model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\nLoading 8-track model from '{args.model_checkpoint}' on {device}...")
-    model = AutoModel.from_pretrained(args.model_checkpoint, trust_remote_code=True)
-    model = model.to(device)
-    model.eval()
-    print("Model loaded successfully.")
+    print(f"\nUsing device: {device}")
 
-    # 4. Extract embeddings
-    embeddings = extract_embeddings_for_8track(
-        tracks=tracks,
-        metadata_list=metadata_list,
-        model=model,
-        device=device,
-        batch_size=args.batch_size,
-        max_length=args.max_length,
-    )
+    # 3. Extract embeddings
+    if is_4fold:
+        lookup_path = SPLITS_LOOKUP_PATH
+        if not lookup_path.exists():
+            raise FileNotFoundError(f"4-fold extraction requires split lookup table at: {lookup_path}")
 
-    # 5. Save in standardized NPZ format
+        print(f"\nLoading split lookup table: {lookup_path}")
+        lookup_df = pd.read_csv(lookup_path)
+        if "ensembl_transcript_id" not in lookup_df.columns:
+            raise KeyError(f"[Error] 'ensembl_transcript_id' column not found in lookup table {lookup_path}. Columns: {list(lookup_df.columns)}")
+        if "split" not in lookup_df.columns:
+            raise KeyError(f"[Error] 'split' column not found in lookup table {lookup_path}. Columns: {list(lookup_df.columns)}")
+
+        tx_to_split = dict(zip(lookup_df["ensembl_transcript_id"].astype(str).str.strip(), lookup_df["split"].astype(int)))
+        sample_splits = np.array([tx_to_split.get(str(t).strip(), -1) for t in tx_ids])
+
+        # Canonical 4-fold validation assignments:
+        # Fold 0 (Train [0..5]) -> Val [6, 7]
+        # Fold 1 (Train [2..7]) -> Val [0, 1]
+        # Fold 2 (Train [0,1,4,5,6,7]) -> Val [2, 3]
+        # Fold 3 (Train [0,1,2,3,6,7]) -> Val [4, 5]
+        fold_val_splits = {
+            0: [6, 7],
+            1: [0, 1],
+            2: [2, 3],
+            3: [4, 5],
+        }
+        test_splits = [8, 9]
+
+        all_embeddings = np.zeros((n_samples, 512), dtype=np.float32)
+        fold_assignment = np.empty(n_samples, dtype=object)
+
+        test_idx = np.where(np.isin(sample_splits, test_splits))[0]
+        test_tracks = [tracks[i] for i in test_idx]
+        test_accum = np.zeros((len(test_idx), 512), dtype=np.float32)
+
+        print(f"\n4-Fold CV Extraction: Total Samples = {n_samples}, Test Samples [8, 9] = {len(test_idx)}")
+
+        for k in range(4):
+            val_splits = fold_val_splits[k]
+            val_idx = np.where(np.isin(sample_splits, val_splits))[0]
+            val_tracks = [tracks[i] for i in val_idx]
+
+            fold_dir = fold_subdirs[k]
+            ckpt_dir = fold_dir / "best_finetuned_backbone" if (fold_dir / "best_finetuned_backbone").is_dir() else fold_dir
+            print(f"\n--- [Fold {k}] Loading 8-track model from: {ckpt_dir} ---")
+            fold_model = AutoModel.from_pretrained(str(ckpt_dir), trust_remote_code=True)
+            fold_model = fold_model.to(device)
+            fold_model.eval()
+
+            print(f"[Fold {k}] Extracting Out-of-Fold Val Embeddings (Splits {val_splits}, {len(val_idx)} samples)...")
+            val_emb = extract_embeddings_for_8track(
+                tracks=val_tracks,
+                metadata_list=[],
+                model=fold_model,
+                device=device,
+                batch_size=args.batch_size,
+                max_length=args.max_length,
+            )
+            all_embeddings[val_idx] = val_emb
+            for i in val_idx:
+                fold_assignment[i] = f"fold_{k}"
+
+            print(f"[Fold {k}] Extracting Test Set Embeddings (Splits {test_splits}, {len(test_idx)} samples)...")
+            fold_test_emb = extract_embeddings_for_8track(
+                tracks=test_tracks,
+                metadata_list=[],
+                model=fold_model,
+                device=device,
+                batch_size=args.batch_size,
+                max_length=args.max_length,
+            )
+            test_accum += fold_test_emb
+
+            del fold_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        print("\nComputing Ensemble Mean Embedding for Test Set [8, 9] across all 4 folds...")
+        all_embeddings[test_idx] = test_accum / 4.0
+        for i in test_idx:
+            fold_assignment[i] = "ensemble_mean"
+
+        unmatched_idx = np.where(sample_splits == -1)[0]
+        if len(unmatched_idx) > 0:
+            print(f"[Notice] {len(unmatched_idx)} samples had no split assignment in lookup table.")
+            for i in unmatched_idx:
+                fold_assignment[i] = "unassigned"
+
+    else:
+        # Single model mode
+        print(f"\nLoading 8-track model from '{args.model_checkpoint}' on {device}...")
+        model = AutoModel.from_pretrained(args.model_checkpoint, trust_remote_code=True)
+        model = model.to(device)
+        model.eval()
+        print("Model loaded successfully.")
+
+        all_embeddings = extract_embeddings_for_8track(
+            tracks=tracks,
+            metadata_list=[],
+            model=model,
+            device=device,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+        )
+        fold_assignment = np.array(["single_model"] * n_samples, dtype=object)
+
+    # 4. Save in standardized NPZ format
     print(f"\nSaving embeddings to: {save_file}")
     np.savez_compressed(
         save_file,
-        embeddings=embeddings,
-        half_life_transformed=np.array([m["half_life_transformed"] for m in metadata_list], dtype=np.float32),
-        half_life=np.array([m["half_life"] for m in metadata_list], dtype=np.float32),
-        rate=np.array([m["rate"] for m in metadata_list], dtype=np.float32),
-        ensembl_transcript_id=np.array([m["tx_id"] for m in metadata_list]),
-        ensembl_gene_id=np.array([m["gene_id"] for m in metadata_list]),
-        hgnc_symbol=np.array([m["gene_symbol"] for m in metadata_list]),
-        has_mirna=np.array([m["has_mirna"] for m in metadata_list], dtype=bool),
-        has_eclip=np.array([m["has_eclip"] for m in metadata_list], dtype=bool),
-        has_gtf=np.array([m["has_gtf"] for m in metadata_list], dtype=bool),
-        seq_lens=np.array([tr.shape[0] for tr in tracks], dtype=np.int32),
+        embeddings=all_embeddings,
+        fold_assignment=fold_assignment,
+        half_life_transformed=half_lives_transformed,
+        half_life=half_lives,
+        rate=rates,
+        ensembl_transcript_id=tx_ids,
+        ensembl_gene_id=gene_ids,
+        hgnc_symbol=gene_symbols,
+        has_mirna=has_mirna,
+        has_eclip=has_eclip,
+        has_gtf=has_gtf,
+        seq_lens=seq_lens,
         normalization=str(npz_data.get("normalization", "none")),
         model_checkpoint=model_path_str,
         is_finetuned=is_finetuned,
+        is_4fold_cv=is_4fold,
     )
 
-    print(f"Successfully saved! Embedding array shape: {embeddings.shape}")
+    print(f"Successfully saved! Embedding array shape: {all_embeddings.shape}")
+    print(f"Saved to:        {save_file}")
     print("=" * 70 + "\n")
 
 

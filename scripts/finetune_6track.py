@@ -327,7 +327,6 @@ def train_model(
     warmup_epochs: int,
     output_dir: Path,
     resume: bool = True,
-    precision: str = "bf16",
     loss_fn_name: str = "huber",
     max_grad_norm: float = 1.0,
 ):
@@ -341,19 +340,15 @@ def train_model(
     else:
         loss_fn = nn.MSELoss()
 
-    # Mixed precision setup
-    if precision == "bf16":
+    # Mixed precision setup: BFloat16 is strictly required for Mamba SSM models
+    if device.type == "cuda" and torch.cuda.is_bf16_supported():
         amp_dtype = torch.bfloat16
         use_scaler = False
-        print("[Precision] Using bfloat16 Mixed Precision (bf16). GradScaler disabled.")
-    elif precision == "fp16":
-        amp_dtype = torch.float16
-        use_scaler = True
-        print("[Precision] Using float16 Mixed Precision (fp16) with GradScaler.")
+        print("[Precision] Using Native BFloat16 (bf16) mixed precision (strictly required for Mamba SSM).")
     else:
         amp_dtype = torch.float32
         use_scaler = False
-        print("[Precision] Using Full Precision (fp32).")
+        print("[Precision] Using Full Precision (fp32) (CUDA bf16 not available).")
 
     # Optimizer with differential learning rate for backbone vs head
     backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
@@ -423,7 +418,7 @@ def train_model(
             targets = batch["targets"].to(device)
 
             optimizer.zero_grad()
-            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda" and precision != "fp32")):
+            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda" and amp_dtype != torch.float32)):
                 preds = model(x, lengths)
                 loss = loss_fn(preds, targets)
 
@@ -533,20 +528,30 @@ def train_model(
         print("=" * 60)
 
         summary_file = output_dir / "training_summary.json"
+        summary_data = {
+            "model_type": "6-track",
+            "best_epoch": best_epoch,
+            "best_val_pearson_r": best_val_r,
+            "test_metrics": test_metrics,
+            "history": history,
+        }
         with open(summary_file, "w") as f:
-            json.dump({
-                "model_type": "6-track",
-                "best_epoch": best_epoch,
-                "best_val_pearson_r": best_val_r,
-                "test_metrics": test_metrics,
-                "history": history,
-            }, f, indent=2)
+            json.dump(summary_data, f, indent=2)
         print(f"Summary report saved to: {summary_file}")
+
+    return {
+        "best_epoch": best_epoch,
+        "best_val_pearson_r": best_val_r,
+        "test_metrics": test_metrics if (test_loader is not None and best_ckpt_path.exists()) else None,
+    }
 
 
 # =============================================================================
 # 5. Main Pipeline
 # =============================================================================
+
+SPLITS_LOOKUP_PATH = Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hipsc_cm_10folds_lookup.csv")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Supervised Fine-Tuning of 6-Track Orthrus Model")
@@ -557,29 +562,23 @@ def main():
         help="Path to hIPSC_CM tab-separated data file (hIPSC_CM_ej_cds_transformed.txt)",
     )
     parser.add_argument(
-        "--splits_lookup_path",
-        type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hipsc_cm_10folds_lookup.csv",
-        help="Path to standardized 10-fold split lookup table CSV (from create_hipsc_cm_splits.py)",
-    )
-    parser.add_argument(
-        "--split_type",
-        type=str,
-        choices=["lookup", "gene"],
-        default="lookup",
-        help="'lookup' (standardized 10-fold table: Train 0-5, Val 6-7, Test 8-9) or 'gene' (ad-hoc GroupShuffleSplit)",
-    )
-    parser.add_argument(
         "--model_checkpoint",
         type=str,
         default="quietflamingo/orthrus-large-6-track",
         help="Path or HF ID for pretrained 6-track Orthrus model",
     )
     parser.add_argument(
+        "--fold",
+        type=str,
+        default="all",
+        choices=["all", "0", "1", "2", "3"],
+        help="Which fold to train: '0', '1', '2', '3', or 'all' to train all 4 folds. (Default: all)",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus/orthrus_6track_finetuned_hIPSC_CM",
-        help="Directory to save fine-tuned checkpoints and logs",
+        help="Directory to save fine-tuned checkpoints and logs (subfolder fold_X will be created inside)",
     )
     parser.add_argument(
         "--target_col",
@@ -624,18 +623,6 @@ def main():
         help="Linear warmup epochs (default: 3)",
     )
     parser.add_argument(
-        "--test_size",
-        type=float,
-        default=0.10,
-        help="Fraction of genes reserved for test set if fallback to 'gene' (default: 0.10)",
-    )
-    parser.add_argument(
-        "--val_size",
-        type=float,
-        default=0.10,
-        help="Fraction of genes reserved for validation set if fallback to 'gene' (default: 0.10)",
-    )
-    parser.add_argument(
         "--random_seed",
         type=int,
         default=42,
@@ -652,13 +639,6 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Automatically resume training from latest_checkpoint.pt if it exists in output_dir",
-    )
-    parser.add_argument(
-        "--precision",
-        type=str,
-        choices=["bf16", "fp16", "fp32"],
-        default="bf16",
-        help="Mixed precision mode (default: bf16)",
     )
     parser.add_argument(
         "--loss_fn",
@@ -737,110 +717,153 @@ def main():
     print(f"Input channels:            6 (A, C, G, U, CDS, Splice)")
     print(f"Target column:             {args.target_col}")
 
-    # 2. Train / Val / Test splitting
-    lookup_path = Path(args.splits_lookup_path)
-    use_lookup = (args.split_type == "lookup" and lookup_path.exists())
+    # 2. Standardized 10-Fold Lookup Table Verification & Splitting
+    lookup_path = SPLITS_LOOKUP_PATH
+    if not lookup_path.exists():
+        raise FileNotFoundError(
+            f"[Error] Standardized splits lookup table not found at: {lookup_path}! "
+            f"A valid lookup table is strictly required."
+        )
 
-    if args.split_type == "lookup" and not lookup_path.exists():
-        print(f"\n[Warning] Splits lookup table not found at: {lookup_path}")
-        print("Falling back to ad-hoc Gene-Grouped GroupShuffleSplit.")
-        use_lookup = False
+    print(f"\nUsing Standardized 10-Fold Lookup Table: {lookup_path}")
+    lookup_df = pd.read_csv(lookup_path)
 
-    if use_lookup:
-        print(f"\nUsing Standardized 10-Fold Lookup Table: {lookup_path}")
-        lookup_df = pd.read_csv(lookup_path)
+    if "ensembl_transcript_id" not in lookup_df.columns:
+        raise KeyError(f"[Error] 'ensembl_transcript_id' column not found in lookup table {lookup_path}. Columns: {list(lookup_df.columns)}")
+    if "split" not in lookup_df.columns:
+        raise KeyError(f"[Error] 'split' column not found in lookup table {lookup_path}. Columns: {list(lookup_df.columns)}")
 
-        lookup_tx_col = "ensembl_transcript_id" if "ensembl_transcript_id" in lookup_df.columns else "transcript_id"
-        tx_to_split = dict(zip(lookup_df[lookup_tx_col].astype(str).str.strip(), lookup_df["split"].astype(int)))
+    available_splits = set(lookup_df["split"].dropna().astype(int).unique())
+    expected_splits = set(range(10))
+    missing_splits = expected_splits - available_splits
+    if missing_splits:
+        raise ValueError(
+            f"[Error] Missing folds in lookup table {lookup_path}! Expected all 10 splits (0-9), but missing: {sorted(missing_splits)}."
+        )
 
-        sample_splits = np.array([tx_to_split.get(str(t).strip(), -1) for t in tx_ids])
-        unmatched_count = int(np.sum(sample_splits == -1))
-        if unmatched_count > 0:
-            print(f"[Warning] {unmatched_count} transcripts not found in lookup table! Filtering them out.")
-            matched_mask = (sample_splits != -1)
-            tracks = [t for i, t in enumerate(tracks) if matched_mask[i]]
-            targets = targets[matched_mask]
-            genes = genes[matched_mask]
-            tx_ids = tx_ids[matched_mask]
-            sample_splits = sample_splits[matched_mask]
+    tx_to_split = dict(zip(lookup_df["ensembl_transcript_id"].astype(str).str.strip(), lookup_df["split"].astype(int)))
+    sample_splits = np.array([tx_to_split.get(str(t).strip(), -1) for t in tx_ids])
+    unmatched_count = int(np.sum(sample_splits == -1))
+    if unmatched_count > 0:
+        print(f"[Warning] {unmatched_count} transcripts not found in lookup table! Filtering them out.")
+        matched_mask = (sample_splits != -1)
+        tracks = [t for i, t in enumerate(tracks) if matched_mask[i]]
+        targets = targets[matched_mask]
+        genes = genes[matched_mask]
+        tx_ids = tx_ids[matched_mask]
+        sample_splits = sample_splits[matched_mask]
 
-        train_idx = np.where(np.isin(sample_splits, [0, 1, 2, 3, 4, 5]))[0]
-        val_idx = np.where(np.isin(sample_splits, [6, 7]))[0]
-        test_idx = np.where(np.isin(sample_splits, [8, 9]))[0]
+    cv_fold_definitions = {
+        0: {"name": "Fold 0", "train": [0, 1, 2, 3, 4, 5], "val": [6, 7], "test": [8, 9]},
+        1: {"name": "Fold 1", "train": [2, 3, 4, 5, 6, 7], "val": [0, 1], "test": [8, 9]},
+        2: {"name": "Fold 2", "train": [0, 1, 4, 5, 6, 7], "val": [2, 3], "test": [8, 9]},
+        3: {"name": "Fold 3", "train": [0, 1, 2, 3, 6, 7], "val": [4, 5], "test": [8, 9]},
+    }
 
-        print(f"\n[Split Breakdown from Lookup Table]")
-        print(f"  Train (Splits 0-5): {len(train_idx)} samples ({len(np.unique(genes[train_idx]))} genes, {len(train_idx)/len(targets)*100:.1f}%)")
-        print(f"  Val   (Splits 6-7): {len(val_idx)} samples ({len(np.unique(genes[val_idx]))} genes, {len(val_idx)/len(targets)*100:.1f}%)")
-        print(f"  Test  (Splits 8-9): {len(test_idx)} samples ({len(np.unique(genes[test_idx]))} genes, {len(test_idx)/len(targets)*100:.1f}%)")
-    else:
-        print("\nCreating Ad-hoc Gene-Grouped splits (GroupShuffleSplit)...")
-        gss_test = GroupShuffleSplit(n_splits=1, test_size=args.test_size, random_state=args.random_seed)
-        train_val_idx, test_idx = next(gss_test.split(tracks, targets, groups=genes))
+    folds_to_run = [0, 1, 2, 3] if args.fold == "all" else [int(args.fold)]
+    all_fold_summaries = {}
 
-        val_rel_size = args.val_size / (1.0 - args.test_size)
-        gss_val = GroupShuffleSplit(n_splits=1, test_size=val_rel_size, random_state=args.random_seed)
-        train_sub_idx, val_sub_idx = next(gss_val.split(tracks[train_val_idx], targets[train_val_idx], groups=genes[train_val_idx]))
+    for fold_id in folds_to_run:
+        fold_def = cv_fold_definitions[fold_id]
+        fold_output_dir = output_dir / f"fold_{fold_id}"
+        fold_output_dir.mkdir(parents=True, exist_ok=True)
 
-        train_idx = train_val_idx[train_sub_idx]
-        val_idx = train_val_idx[val_sub_idx]
+        train_idx = np.where(np.isin(sample_splits, fold_def["train"]))[0]
+        val_idx = np.where(np.isin(sample_splits, fold_def["val"]))[0]
+        test_idx = np.where(np.isin(sample_splits, fold_def["test"]))[0]
 
-        print(f"  Train samples: {len(train_idx)} ({len(np.unique(genes[train_idx]))} genes)")
-        print(f"  Val samples:   {len(val_idx)} ({len(np.unique(genes[val_idx]))} genes)")
-        print(f"  Test samples:  {len(test_idx)} ({len(np.unique(genes[test_idx]))} genes)")
+        if len(train_idx) == 0:
+            raise ValueError(f"[Error] Fold {fold_id} has 0 training samples! Train splits: {fold_def['train']}")
+        if len(val_idx) == 0:
+            raise ValueError(f"[Error] Fold {fold_id} has 0 validation samples! Val splits: {fold_def['val']}")
+        if len(test_idx) == 0:
+            raise ValueError(f"[Error] Fold {fold_id} has 0 test samples! Test splits: {fold_def['test']}")
 
-    # 3. Create Datasets & DataLoaders
-    train_ds = MultiTrackDataset([tracks[i] for i in train_idx], targets[train_idx], genes[train_idx], tx_ids[train_idx], args.max_length)
-    val_ds = MultiTrackDataset([tracks[i] for i in val_idx], targets[val_idx], genes[val_idx], tx_ids[val_idx], args.max_length)
-    test_ds = MultiTrackDataset([tracks[i] for i in test_idx], targets[test_idx], genes[test_idx], tx_ids[test_idx], args.max_length)
+        print("\n" + "=" * 70)
+        print(f"       STARTING 6-TRACK FINE-TUNING: {fold_def['name'].upper()}")
+        print("=" * 70)
+        print(f"  Train (Splits {fold_def['train']}): {len(train_idx)} samples ({len(np.unique(genes[train_idx]))} genes, {len(train_idx)/len(targets)*100:.1f}%)")
+        print(f"  Val   (Splits {fold_def['val']}):   {len(val_idx)} samples ({len(np.unique(genes[val_idx]))} genes, {len(val_idx)/len(targets)*100:.1f}%)")
+        print(f"  Test  (Splits {fold_def['test']}):  {len(test_idx)} samples ({len(np.unique(genes[test_idx]))} genes, {len(test_idx)/len(targets)*100:.1f}%)")
+        print(f"  Output Directory: {fold_output_dir}")
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_sampler=BucketBatchSampler(train_ds, batch_size=args.batch_size, shuffle=True),
-        collate_fn=pad_collate_fn,
-        num_workers=2,
-        pin_memory=(device.type == "cuda"),
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_sampler=BucketBatchSampler(val_ds, batch_size=args.batch_size, shuffle=False),
-        collate_fn=pad_collate_fn,
-        num_workers=2,
-        pin_memory=(device.type == "cuda"),
-    )
-    test_loader = DataLoader(
-        test_ds,
-        batch_sampler=BucketBatchSampler(test_ds, batch_size=args.batch_size, shuffle=False),
-        collate_fn=pad_collate_fn,
-        num_workers=2,
-        pin_memory=(device.type == "cuda"),
-    )
+        train_ds = MultiTrackDataset([tracks[i] for i in train_idx], targets[train_idx], genes[train_idx], tx_ids[train_idx], args.max_length)
+        val_ds = MultiTrackDataset([tracks[i] for i in val_idx], targets[val_idx], genes[val_idx], tx_ids[val_idx], args.max_length)
+        test_ds = MultiTrackDataset([tracks[i] for i in test_idx], targets[test_idx], genes[test_idx], tx_ids[test_idx], args.max_length)
 
-    # 4. Load 6-track model and build regression model
-    print(f"\nLoading 6-track Orthrus checkpoint from: {args.model_checkpoint}...")
-    backbone = AutoModel.from_pretrained(args.model_checkpoint, trust_remote_code=True)
-    d_model = getattr(backbone.config, "ssm_model_dim", 512)
+        train_loader = DataLoader(
+            train_ds,
+            batch_sampler=BucketBatchSampler(train_ds, batch_size=args.batch_size, shuffle=True),
+            collate_fn=pad_collate_fn,
+            num_workers=2,
+            pin_memory=(device.type == "cuda"),
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_sampler=BucketBatchSampler(val_ds, batch_size=args.batch_size, shuffle=False),
+            collate_fn=pad_collate_fn,
+            num_workers=2,
+            pin_memory=(device.type == "cuda"),
+        )
+        test_loader = DataLoader(
+            test_ds,
+            batch_sampler=BucketBatchSampler(test_ds, batch_size=args.batch_size, shuffle=False),
+            collate_fn=pad_collate_fn,
+            num_workers=2,
+            pin_memory=(device.type == "cuda"),
+        )
 
-    model = OrthrusRegressionModel(backbone=backbone, d_model=d_model, hidden_dim=256, dropout=0.1)
-    model.to(device)
+        print(f"\nLoading 6-track Orthrus checkpoint from: {args.model_checkpoint}...")
+        backbone = AutoModel.from_pretrained(args.model_checkpoint, trust_remote_code=True)
+        d_model = getattr(backbone.config, "ssm_model_dim", 512)
 
-    # 5. Train
-    train_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        test_loader=test_loader,
-        device=device,
-        epochs=args.epochs,
-        lr_backbone=args.lr_backbone,
-        lr_head=args.lr_head,
-        weight_decay=args.weight_decay,
-        warmup_epochs=args.warmup_epochs,
-        output_dir=output_dir,
-        resume=args.resume,
-        precision=args.precision,
-        loss_fn_name=args.loss_fn,
-        max_grad_norm=args.max_grad_norm,
-    )
+        model = OrthrusRegressionModel(backbone=backbone, d_model=d_model, hidden_dim=256, dropout=0.1)
+        model.to(device)
+
+        fold_summary = train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            device=device,
+            epochs=args.epochs,
+            lr_backbone=args.lr_backbone,
+            lr_head=args.lr_head,
+            weight_decay=args.weight_decay,
+            warmup_epochs=args.warmup_epochs,
+            output_dir=fold_output_dir,
+            resume=args.resume,
+            loss_fn_name=args.loss_fn,
+            max_grad_norm=args.max_grad_norm,
+        )
+        all_fold_summaries[fold_id] = fold_summary
+
+        del model, backbone
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if len(folds_to_run) > 1:
+        print("\n" + "=" * 70)
+        print("         6-TRACK 4-FOLD CROSS-VALIDATION SUMMARY REPORT         ")
+        print("=" * 70)
+        val_rs = [all_fold_summaries[f]["best_val_pearson_r"] for f in folds_to_run if all_fold_summaries[f]]
+        for f in folds_to_run:
+            r_f = all_fold_summaries[f]["best_val_pearson_r"]
+            ep_f = all_fold_summaries[f]["best_epoch"]
+            print(f"  Fold {f}: Best Val Pearson r = {r_f:.4f} (Epoch {ep_f})")
+        if val_rs:
+            print(f"  Mean Val Pearson r: {np.mean(val_rs):.4f} ± {np.std(val_rs):.4f}")
+        print("=" * 70)
+
+        overall_summary_file = output_dir / "all_folds_summary.json"
+        with open(overall_summary_file, "w") as f:
+            json.dump({
+                "model_type": "6-track",
+                "folds": all_fold_summaries,
+                "mean_val_pearson_r": float(np.mean(val_rs)) if val_rs else None,
+                "std_val_pearson_r": float(np.std(val_rs)) if val_rs else None,
+            }, f, indent=2)
+        print(f"All folds summary saved to: {overall_summary_file}")
 
 
 if __name__ == "__main__":

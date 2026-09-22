@@ -50,7 +50,6 @@ python "${SCRIPTS_DIR}/convert_6track_to_8track.py" \
 echo -e "\n[STEP 2/4] Fine-tuning 8-track Orthrus on hIPSC_CM half-life..."
 python "${SCRIPTS_DIR}/finetune_8track.py" \
     --data_path "${DATA_NPZ}" \
-    --splits_lookup_path "${SPLITS_LOOKUP}" \
     --model_checkpoint "${CHECKPOINT_8T_DIR}" \
     --output_dir "${FINETUNED_DIR}" \
     --target_col "half_life_transformed" \
@@ -61,16 +60,15 @@ python "${SCRIPTS_DIR}/finetune_8track.py" \
     --lr_head 3e-4 \
     --weight_decay 0.01 \
     --warmup_epochs 3 \
-    --precision "bf16" \
     --loss_fn "huber"
 
 # -----------------------------------------------------------------------------
 # Step 3: Extract 512-D Representations from Fine-Tuned 8-Track Model
 # -----------------------------------------------------------------------------
-echo -e "\n[STEP 3/4] Extracting fine-tuned 8-track representations..."
+echo -e "\n[STEP 3/4] Extracting fine-tuned 8-track representations (4-Fold CV)..."
 python "${SCRIPTS_DIR}/extract_embeddings_hIPSC_CM_8track.py" \
     --data_path "${DATA_NPZ}" \
-    --model_checkpoint "${FINETUNED_DIR}/best_finetuned_backbone" \
+    --model_checkpoint "${FINETUNED_DIR}" \
     --output_dir "${PROJECT_DIR}/data/hIPSC_CM" \
     --output_filename "orthrus_8track_embeddings_hIPSC_CM_minmax.npz" \
     --batch_size 16

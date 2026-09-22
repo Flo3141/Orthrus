@@ -104,17 +104,39 @@ def extract_embeddings_for_hIPSC_CM(
     if skipped_count > 0:
         print(f"Notice: {skipped_count} sequences were truncated to max_length={max_length} nucleotides.")
 
+def extract_embeddings_for_tracks(
+    tracks: list,
+    model: torch.nn.Module,
+    device: torch.device,
+    batch_size: int = 16,
+    max_length: int = 12288,
+    desc: str = "Extracting embeddings",
+) -> np.ndarray:
+    """
+    Extracts Orthrus embeddings for a list of tracks using dynamic length batching.
+    """
+    if len(tracks) == 0:
+        return np.zeros((0, 512), dtype=np.float32)
+
+    sample_data = []
+    for idx, tr in enumerate(tracks):
+        if tr.shape[0] > max_length:
+            tr = tr[:max_length, :]
+        sample_data.append({
+            "orig_idx": idx,
+            "track": tr,
+            "length": tr.shape[0],
+        })
+
     # Sort by length to minimize padding within batches
     sorted_samples = sorted(sample_data, key=lambda x: x["length"])
     embeddings_list = [None] * len(sample_data)
 
-    print(f"Starting embedding extraction with batch size {batch_size}...")
-    for i in tqdm(range(0, len(sorted_samples), batch_size), desc="Extracting embeddings"):
+    for i in tqdm(range(0, len(sorted_samples), batch_size), desc=desc):
         batch = sorted_samples[i : i + batch_size]
         b_lens = [s["length"] for s in batch]
         max_b_len = max(b_lens)
 
-        # Padded batch tensor (batch, max_b_len, 6)
         batch_arr = np.zeros((len(batch), max_b_len, 6), dtype=np.float32)
         for b_idx, s in enumerate(batch):
             l = s["length"]
@@ -124,7 +146,6 @@ def extract_embeddings_for_hIPSC_CM(
         lengths_tensor = torch.tensor(b_lens, dtype=torch.long, device=device)
 
         with torch.no_grad():
-            # channel_last=True expects (B, L, C) with C=6
             batch_emb = model.representation(x_tensor, lengths_tensor, channel_last=True)
             batch_emb_np = batch_emb.cpu().numpy()
 
@@ -132,29 +153,38 @@ def extract_embeddings_for_hIPSC_CM(
             orig_i = s["orig_idx"]
             embeddings_list[orig_i] = batch_emb_np[b_idx]
 
-    all_embeddings = np.stack(embeddings_list, axis=0)
+    return np.stack(embeddings_list, axis=0)
 
-    # Metadata in original DataFrame order
-    transcript_ids = np.array([s["transcript_id"] for s in sample_data])
-    gene_ids = np.array([s["gene_id"] for s in sample_data])
-    gene_symbols = np.array([s["gene_symbol"] for s in sample_data])
-    biotypes = np.array([s["biotype"] for s in sample_data])
-    half_lives = np.array([s["half_life"] for s in sample_data], dtype=np.float32)
-    half_lives_transformed = np.array([s["half_life_transformed"] for s in sample_data], dtype=np.float32)
-    rates = np.array([s["rate"] for s in sample_data], dtype=np.float32)
-    seq_lens = np.array([s["length"] for s in sample_data], dtype=np.int32)
 
-    return {
-        "embeddings": all_embeddings,
-        "half_life": half_lives,
-        "half_life_transformed": half_lives_transformed,
-        "rate": rates,
-        "ensembl_transcript_id": transcript_ids,
-        "ensembl_gene_id": gene_ids,
-        "hgnc_symbol": gene_symbols,
-        "transcript_biotype": biotypes,
-        "seq_lens": seq_lens,
-    }
+def load_model_from_checkpoint(model_path: Path, device: torch.device) -> torch.nn.Module:
+    """
+    Loads a 6-track Orthrus model from a directory or .pt file.
+    """
+    if model_path.is_dir() and (model_path / "best_finetuned_backbone").is_dir():
+        model_path = model_path / "best_finetuned_backbone"
+
+    if model_path.is_file() and model_path.suffix in [".pt", ".pth", ".bin"]:
+        print(f"Loading base Orthrus model and restoring weights from checkpoint file: {model_path}...")
+        model = AutoModel.from_pretrained("quietflamingo/orthrus-large-6-track", trust_remote_code=True)
+        ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+        state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+        backbone_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("backbone."):
+                backbone_dict[k[len("backbone."):]] = v
+            elif not k.startswith("head."):
+                backbone_dict[k] = v
+        model.load_state_dict(backbone_dict, strict=False)
+    else:
+        print(f"Loading Orthrus 6-track model from '{model_path}'...")
+        model = AutoModel.from_pretrained(str(model_path), trust_remote_code=True)
+
+    model = model.to(device)
+    model.eval()
+    return model
+
+
+SPLITS_LOOKUP_PATH = Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hipsc_cm_10folds_lookup.csv")
 
 
 def main():
@@ -175,15 +205,15 @@ def main():
         "--output_filename",
         type=str,
         default="orthrus_6track_embeddings_hIPSC_CM.npz",
-        help="Filename for the saved NPZ archive (automatically appended with _finetuned when a fine-tuned checkpoint is used)",
+        help="Filename for the saved NPZ archive (automatically appended with _finetuned when fine-tuned)",
     )
     parser.add_argument(
         "--model_checkpoint",
         "--model_name",
         dest="model_checkpoint",
         type=str,
-        default="quietflamingo/orthrus-large-6-track",
-        help="Path to 6-track model directory (or .pt checkpoint), or Hugging Face identifier (default: quietflamingo/orthrus-large-6-track)",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus/orthrus_6track_finetuned_hIPSC_CM",
+        help="Path to 6-track model directory (or parent folder with fold_0..fold_3), or Hugging Face identifier",
     )
     parser.add_argument(
         "--batch_size",
@@ -203,15 +233,19 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    model_path_str = str(args.model_checkpoint).strip()
+    model_path = Path(str(args.model_checkpoint).strip())
+    fold_subdirs = [model_path / f"fold_{k}" for k in range(4)]
+    is_4fold = all(p.is_dir() for p in fold_subdirs)
+
+    model_path_str = str(model_path)
     is_finetuned = (
-        model_path_str != "quietflamingo/orthrus-large-6-track"
+        is_4fold
+        or model_path_str != "quietflamingo/orthrus-large-6-track"
         or "finetun" in model_path_str.lower()
         or "checkpoint" in model_path_str.lower()
     )
 
     save_file = output_dir / args.output_filename
-    # If fine-tuned and default filename was kept, automatically append _finetuned
     if is_finetuned and "finetuned" not in save_file.stem.lower():
         stem = save_file.stem
         save_file = save_file.parent / f"{stem}_finetuned{save_file.suffix}"
@@ -221,6 +255,7 @@ def main():
     print("=" * 70)
     print(f"Data file:         {data_path}")
     print(f"Model checkpoint:  {model_path_str}")
+    print(f"Extraction Mode:   {'4-Fold Cross-Validation (Out-of-Fold + Test Ensemble)' if is_4fold else 'Single Model'}")
     print(f"Model variant:     {'Fine-Tuned' if is_finetuned else 'Pretrained Base'}")
     print(f"Output file:       {save_file}")
     print(f"Batch size:        {args.batch_size}")
@@ -232,70 +267,146 @@ def main():
     print(f"Loaded rows: {len(df)}")
     print(f"Columns: {list(df.columns)}")
 
-    # Ensure half_life_transformed exists (if called with raw hIPSC_CM_ej_cds.txt)
-    if "half_life_transformed" not in df.columns and "half_life" in df.columns:
-        print("Column 'half_life_transformed' not found - computing from 'half_life' (Log + Z-Score)...")
-        y_raw = df["half_life"].astype(float)
-        y_log = np.log(y_raw + 0.1)
-        mu_log = float(y_log.mean())
-        sigma_log = float(y_log.std(ddof=1))
-        df["half_life_transformed"] = (y_log - mu_log) / sigma_log
-        print(f"Transformation computed: mu={mu_log:.4f}, sigma={sigma_log:.4f}")
+    # Ensure half_life_transformed exists 
+    if "half_life_transformed" not in df.columns:
+        raise ValueError(f"Column 'half_life_transformed' not found! Columns are: {list(df.columns)}")
 
-    # 2. Load model (directory, HF hub, or .pt checkpoint)
-    model_path = Path(model_path_str)
-    if model_path.is_dir() and (model_path / "best_finetuned_backbone").is_dir():
-        model_path = model_path / "best_finetuned_backbone"
+    # Parse Saluki sequence tokens into 6 tracks
+    print("\nParsing sequences into 6-channel tracks [A, C, G, U, CDS, Splice]...")
+    raw_seqs = df["sequence"].astype(str).values
+    tracks = []
+    truncated_count = 0
+    for s in tqdm(raw_seqs, desc="Parsing 6-tracks"):
+        tr = parse_saluki_sequence_to_six_track(s)
+        if tr.shape[0] > args.max_length:
+            truncated_count += 1
+            tr = tr[:args.max_length, :]
+        tracks.append(tr)
+
+    if truncated_count > 0:
+        print(f"Notice: {truncated_count} sequences were truncated to max_length={args.max_length} nucleotides.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nUsing device: {device}")
 
-    if model_path.is_file() and model_path.suffix in [".pt", ".pth", ".bin"]:
-        print(f"Loading base Orthrus model and restoring weights from checkpoint file: {model_path}...")
-        model = AutoModel.from_pretrained("quietflamingo/orthrus-large-6-track", trust_remote_code=True)
-        ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
-        state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
-        backbone_dict = {}
-        for k, v in state_dict.items():
-            if k.startswith("backbone."):
-                backbone_dict[k[len("backbone."):]] = v
-            elif not k.startswith("head."):
-                backbone_dict[k] = v
-        model.load_state_dict(backbone_dict, strict=False)
+    # Extract metadata arrays
+    transcript_ids = df["ensembl_transcript_id"].astype(str).values if "ensembl_transcript_id" in df.columns else np.array([""] * len(df))
+    gene_ids = df["ensembl_gene_id"].astype(str).values if "ensembl_gene_id" in df.columns else np.array([""] * len(df))
+    gene_symbols = df["hgnc_symbol"].astype(str).values if "hgnc_symbol" in df.columns else np.array([""] * len(df))
+    biotypes = df["transcript_biotype"].astype(str).values if "transcript_biotype" in df.columns else np.array([""] * len(df))
+    half_lives = df["half_life"].astype(np.float32).values if "half_life" in df.columns else np.full(len(df), np.nan, dtype=np.float32)
+    half_lives_transformed = df["half_life_transformed"].astype(np.float32).values if "half_life_transformed" in df.columns else np.full(len(df), np.nan, dtype=np.float32)
+    rates = df["rate"].astype(np.float32).values if "rate" in df.columns else np.full(len(df), np.nan, dtype=np.float32)
+    seq_lens = np.array([len(t) for t in tracks], dtype=np.int32)
+
+    # 2. Extract Embeddings
+    if is_4fold:
+        lookup_path = SPLITS_LOOKUP_PATH
+        if not lookup_path.exists():
+            raise FileNotFoundError(f"4-fold extraction requires split lookup table at: {lookup_path}")
+
+        print(f"\nLoading split lookup table: {lookup_path}")
+        lookup_df = pd.read_csv(lookup_path)
+        if "ensembl_transcript_id" not in lookup_df.columns:
+            raise KeyError(f"[Error] 'ensembl_transcript_id' column not found in lookup table {lookup_path}. Columns: {list(lookup_df.columns)}")
+        if "split" not in lookup_df.columns:
+            raise KeyError(f"[Error] 'split' column not found in lookup table {lookup_path}. Columns: {list(lookup_df.columns)}")
+
+        tx_to_split = dict(zip(lookup_df["ensembl_transcript_id"].astype(str).str.strip(), lookup_df["split"].astype(int)))
+        sample_splits = np.array([tx_to_split.get(str(t).strip(), -1) for t in transcript_ids])
+
+        # Canonical 4-fold validation assignments:
+        # Fold 0 (Train [0..5]) -> Val [6, 7]
+        # Fold 1 (Train [2..7]) -> Val [0, 1]
+        # Fold 2 (Train [0,1,4,5,6,7]) -> Val [2, 3]
+        # Fold 3 (Train [0,1,2,3,6,7]) -> Val [4, 5]
+        fold_val_splits = {
+            0: [6, 7],
+            1: [0, 1],
+            2: [2, 3],
+            3: [4, 5],
+        }
+        test_splits = [8, 9]
+
+        all_embeddings = np.zeros((len(df), 512), dtype=np.float32)
+        fold_assignment = np.empty(len(df), dtype=object)
+
+        test_idx = np.where(np.isin(sample_splits, test_splits))[0]
+        test_tracks = [tracks[i] for i in test_idx]
+        test_accum = np.zeros((len(test_idx), 512), dtype=np.float32)
+
+        print(f"\n4-Fold CV Extraction: Total Samples = {len(df)}, Test Samples [8, 9] = {len(test_idx)}")
+
+        for k in range(4):
+            val_splits = fold_val_splits[k]
+            val_idx = np.where(np.isin(sample_splits, val_splits))[0]
+            val_tracks = [tracks[i] for i in val_idx]
+
+            fold_model_dir = fold_subdirs[k]
+            print(f"\n--- [Fold {k}] Loading model from: {fold_model_dir} ---")
+            fold_model = load_model_from_checkpoint(fold_model_dir, device)
+
+            print(f"[Fold {k}] Extracting Out-of-Fold Val Embeddings (Splits {val_splits}, {len(val_idx)} samples)...")
+            val_emb = extract_embeddings_for_tracks(
+                val_tracks, fold_model, device, batch_size=args.batch_size, max_length=args.max_length, desc=f"Fold {k} Val"
+            )
+            all_embeddings[val_idx] = val_emb
+            for i in val_idx:
+                fold_assignment[i] = f"fold_{k}"
+
+            print(f"[Fold {k}] Extracting Test Set Embeddings (Splits {test_splits}, {len(test_idx)} samples)...")
+            fold_test_emb = extract_embeddings_for_tracks(
+                test_tracks, fold_model, device, batch_size=args.batch_size, max_length=args.max_length, desc=f"Fold {k} Test"
+            )
+            test_accum += fold_test_emb
+
+            del fold_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Average test set embeddings across all 4 fold models
+        print("\nComputing Ensemble Mean Embedding for Test Set [8, 9] across all 4 folds...")
+        all_embeddings[test_idx] = test_accum / 4.0
+        for i in test_idx:
+            fold_assignment[i] = "ensemble_mean"
+
+        # Handle any unmatched samples (fallback)
+        unmatched_idx = np.where(sample_splits == -1)[0]
+        if len(unmatched_idx) > 0:
+            print(f"[Notice] {len(unmatched_idx)} samples had no split assignment in lookup table.")
+            for i in unmatched_idx:
+                fold_assignment[i] = "unassigned"
+
     else:
-        print(f"Loading Orthrus 6-track model from '{model_path}'...")
-        model = AutoModel.from_pretrained(str(model_path), trust_remote_code=True)
-
-    model = model.to(device)
-    model.eval()
-    print("Model loaded successfully.")
-
-    result = extract_embeddings_for_hIPSC_CM(
-        df=df,
-        model=model,
-        device=device,
-        batch_size=args.batch_size,
-        max_length=args.max_length,
-    )
+        # Single model mode
+        model = load_model_from_checkpoint(model_path, device)
+        print(f"\nExtracting representations for all {len(tracks)} samples using single model...")
+        all_embeddings = extract_embeddings_for_tracks(
+            tracks, model, device, batch_size=args.batch_size, max_length=args.max_length, desc="Extracting embeddings"
+        )
+        fold_assignment = np.array(["single_model"] * len(df), dtype=object)
 
     print(f"\nSaving embeddings to: {save_file}")
     np.savez_compressed(
         save_file,
-        embeddings=result["embeddings"],
-        half_life=result["half_life"],
-        half_life_transformed=result["half_life_transformed"],
-        rate=result["rate"],
-        ensembl_transcript_id=result["ensembl_transcript_id"],
-        ensembl_gene_id=result["ensembl_gene_id"],
-        hgnc_symbol=result["hgnc_symbol"],
-        transcript_biotype=result["transcript_biotype"],
-        seq_lens=result["seq_lens"],
+        embeddings=all_embeddings,
+        fold_assignment=fold_assignment,
+        half_life=half_lives,
+        half_life_transformed=half_lives_transformed,
+        rate=rates,
+        ensembl_transcript_id=transcript_ids,
+        ensembl_gene_id=gene_ids,
+        hgnc_symbol=gene_symbols,
+        transcript_biotype=biotypes,
+        seq_lens=seq_lens,
         model_checkpoint=str(model_path),
         is_finetuned=is_finetuned,
+        is_4fold_cv=is_4fold,
     )
 
     print("Successfully saved!")
-    print(f"Embedding shape: {result['embeddings'].shape}")
+    print(f"Embedding shape: {all_embeddings.shape}")
+    print(f"Saved to:        {save_file}")
 
 
 if __name__ == "__main__":
