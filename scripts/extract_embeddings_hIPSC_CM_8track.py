@@ -86,7 +86,7 @@ def main():
     parser.add_argument(
         "--data_path",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_8track_minmax.npz",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/hIPSC_CM_8track_minmax.npz",
         help="Path to 8-track augmented NPZ file (from generate_trans_factor_tracks.py)",
     )
     parser.add_argument(
@@ -98,7 +98,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus",
         help="Directory to save the extracted embeddings",
     )
     parser.add_argument(

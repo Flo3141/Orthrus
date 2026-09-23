@@ -270,7 +270,7 @@ def parse_args():
     parser.add_argument(
         "--embeddings_path",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus_6track_embeddings_hIPSC_CM.npz",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/orthrus_6track_embeddings_hIPSC_CM.npz",
         help="Path to NPZ file containing hIPSC_CM embeddings",
     )
     parser.add_argument(

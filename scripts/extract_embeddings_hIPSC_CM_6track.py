@@ -198,7 +198,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus",
         help="Directory to save embeddings",
     )
     parser.add_argument(

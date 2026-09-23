@@ -592,13 +592,13 @@ def main():
     parser.add_argument(
         "--data_path",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_8track_minmax.npz",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/hIPSC_CM_8track_minmax.npz",
         help="Path to augmented 8-track NPZ file (from generate_trans_factor_tracks.py)",
     )
     parser.add_argument(
         "--model_checkpoint",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus/orthrus-large-8-track",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus/orthrus_8track_from_finetuned_6track",
         help="Path to 8-track converted Orthrus model directory (from convert_6track_to_8track.py)",
     )
     parser.add_argument(

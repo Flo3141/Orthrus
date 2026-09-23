@@ -14,11 +14,11 @@ date
 PROJECT_DIR="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code"
 SCRIPTS_DIR="${PROJECT_DIR}/Orthrus/scripts"
 
-DATA_NPZ="${PROJECT_DIR}/data/hIPSC_CM/hIPSC_CM_8track_minmax.npz"
+DATA_NPZ="${PROJECT_DIR}/data/hIPSC_CM/orthrus/hIPSC_CM_8track_minmax.npz"
 SPLITS_LOOKUP="${PROJECT_DIR}/data/hIPSC_CM/hipsc_cm_10folds_lookup.csv"
 CHECKPOINT_8T_DIR="${PROJECT_DIR}/checkpoints/orthrus/orthrus-large-8-track"
 FINETUNED_DIR="${PROJECT_DIR}/checkpoints/orthrus/orthrus_8track_finetuned_hIPSC_CM"
-EMBEDDING_OUT="${PROJECT_DIR}/data/hIPSC_CM/orthrus_8track_embeddings_hIPSC_CM_minmax.npz"
+EMBEDDING_OUT="${PROJECT_DIR}/data/hIPSC_CM/orthrus/orthrus_8track_embeddings_hIPSC_CM_minmax.npz"
 
 # -----------------------------------------------------------------------------
 # Step 0: Standardized 10-Fold Gene-Grouped Split Table Creation
@@ -69,7 +69,7 @@ echo -e "\n[STEP 3/4] Extracting fine-tuned 8-track representations (4-Fold CV).
 python "${SCRIPTS_DIR}/extract_embeddings_hIPSC_CM_8track.py" \
     --data_path "${DATA_NPZ}" \
     --model_checkpoint "${FINETUNED_DIR}" \
-    --output_dir "${PROJECT_DIR}/data/hIPSC_CM" \
+    --output_dir "${PROJECT_DIR}/data/hIPSC_CM/orthrus" \
     --output_filename "orthrus_8track_embeddings_hIPSC_CM_minmax.npz" \
     --batch_size 16
 
