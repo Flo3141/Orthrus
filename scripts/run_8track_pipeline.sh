@@ -81,7 +81,6 @@ python "${SCRIPTS_DIR}/train_ridge_regression_hIPSC_CM.py" \
     --embeddings_path "${EMBEDDING_OUT}" \
     --splits_lookup_path "${SPLITS_LOOKUP}" \
     --target_col "half_life_transformed" \
-    --split_type "lookup" \
     --plot
 
 echo -e "\n============================================================================="
