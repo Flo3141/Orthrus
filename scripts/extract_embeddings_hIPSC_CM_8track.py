@@ -18,21 +18,23 @@ import pandas as pd
 
 def extract_embeddings_for_8track(
     tracks: list,
-    metadata_list: list,
     model: torch.nn.Module,
     device: torch.device,
     batch_size: int = 16,
     max_length: int = 12288,
+    desc: str = "Computing representations",
+    metadata_list: list = None,
 ) -> np.ndarray:
     """
     Extracts embeddings using dynamic-length batching (sorting by sequence length to minimize padding).
     """
-    print(f"Preparing {len(tracks)} sequences for embedding extraction...")
+    if len(tracks) == 0:
+        return np.zeros((0, 512), dtype=np.float32)
 
     sample_data = []
     truncated_count = 0
 
-    for idx, (tr, meta) in enumerate(zip(tracks, metadata_list)):
+    for idx, tr in enumerate(tracks):
         if tr.shape[0] > max_length:
             truncated_count += 1
             tr = tr[:max_length, :]
@@ -41,7 +43,6 @@ def extract_embeddings_for_8track(
             "orig_idx": idx,
             "track": tr,
             "length": tr.shape[0],
-            "meta": meta,
         })
 
     if truncated_count > 0:
@@ -51,8 +52,7 @@ def extract_embeddings_for_8track(
     sorted_samples = sorted(sample_data, key=lambda s: s["length"])
     embeddings_list = [None] * len(sample_data)
 
-    print(f"Extracting embeddings with batch size {batch_size} on {device}...")
-    for i in tqdm(range(0, len(sorted_samples), batch_size), desc="Computing representations"):
+    for i in tqdm(range(0, len(sorted_samples), batch_size), desc=desc):
         batch = sorted_samples[i : i + batch_size]
         b_lens = [s["length"] for s in batch]
         max_b_len = max(b_lens)
@@ -242,11 +242,11 @@ def main():
             print(f"[Fold {k}] Extracting Out-of-Fold Val Embeddings (Splits {val_splits}, {len(val_idx)} samples)...")
             val_emb = extract_embeddings_for_8track(
                 tracks=val_tracks,
-                metadata_list=[],
                 model=fold_model,
                 device=device,
                 batch_size=args.batch_size,
                 max_length=args.max_length,
+                desc=f"Fold {k} Val",
             )
             all_embeddings[val_idx] = val_emb
             for i in val_idx:
@@ -255,11 +255,11 @@ def main():
             print(f"[Fold {k}] Extracting Test Set Embeddings (Splits {test_splits}, {len(test_idx)} samples)...")
             fold_test_emb = extract_embeddings_for_8track(
                 tracks=test_tracks,
-                metadata_list=[],
                 model=fold_model,
                 device=device,
                 batch_size=args.batch_size,
                 max_length=args.max_length,
+                desc=f"Fold {k} Test",
             )
             test_accum += fold_test_emb
 
@@ -288,11 +288,11 @@ def main():
 
         all_embeddings = extract_embeddings_for_8track(
             tracks=tracks,
-            metadata_list=[],
             model=model,
             device=device,
             batch_size=args.batch_size,
             max_length=args.max_length,
+            desc="Extracting embeddings",
         )
         fold_assignment = np.array(["single_model"] * n_samples, dtype=object)
 
