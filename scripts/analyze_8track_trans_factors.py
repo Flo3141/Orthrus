@@ -1009,41 +1009,6 @@ def main():
     multi_report = run_multivariate_modeling(df)
     report_buf.write(multi_report + "\n")
 
-    # --- Section H: Future Research Directions & Creative Hypotheses ---
-    report_buf.write("=" * 80 + "\n")
-    report_buf.write("=== 8. SCIENTIFIC RECOMMENDATIONS: OTHER VALUES & CORRELATIONS TO EXPLORE ===\n")
-    report_buf.write("=" * 80 + "\n")
-    recommendations = """
-1. Cross-Channel Antagonism & Synergy (miRNA vs. RBP in 3' UTR):
-   - Investigate whether RBP binding sites directly overlap or flank miRNA seed sites.
-   - Known biology: Certain RBPs (e.g. HuR / ELAVL1) compete with miRNAs by binding to adjacent
-     U-rich motifs, blocking RISC loading and derepressing translation. Other RBPs (e.g. Pumilio / PUM1/2)
-     change secondary structure to expose miRNA seeds, acting synergistically.
-   - Analysis: Measure the spatial distance from each miRNA peak to the nearest eCLIP peak.
-
-2. Positional Gradients and End-Proximity Metrics:
-   - Distance to Stop Codon: Binding sites located <15 nt from the stop codon are often displaced
-     by translating ribosomes terminating translation.
-   - Distance to Poly(A) Tail: Sites near the poly(A) tail (>50 nt from stop codon, near polyA)
-     consistently show stronger destabilizing efficiency.
-   - Exon Junction Complex (EJC) Proximity: RBPs bound near splice junctions (Channel 5) often
-     regulate alternative splicing or participate in nonsense-mediated decay (NMD).
-
-3. AU-Rich Elements (ARE) and Motifs:
-   - The classical AUUUA motif in 3' UTRs recruits destabilizing zinc-finger RBPs (TTP / ZFP36, AUF1).
-   - Analyzing the correlation between ARE count, 3' UTR RBP signal, and half-life reveals whether
-     the eCLIP track successfully captured AU-rich destabilization in cardiac cells.
-
-4. Stratification by Expression / Cardiac Gene Function:
-   - Perform Gene Ontology (GO) enrichment on the top 10% highest vs. lowest miRNA/RBP bound transcripts.
-   - Cardiac-specific genes (e.g. MYH6, TNNT2, ACTC1) often have distinct UTR length architectures
-     and tighter post-transcriptional buffering compared to general housekeeping genes.
-
-5. Alternative Isoforms & Isoform-Specific Binding:
-   - Compare transcript isoforms belonging to the same gene (ensembl_gene_id): Does differential
-     inclusion of alternative 3' UTR exons lead to dramatic shifts in miRNA/RBP density and half-life?
-"""
-    report_buf.write(recommendations.strip() + "\n\n")
     report_buf.write("=" * 80 + "\n")
     report_buf.write("                    END OF ANALYSIS REPORT                    \n")
     report_buf.write("=" * 80 + "\n")
