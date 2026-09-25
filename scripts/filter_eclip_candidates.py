@@ -14,49 +14,63 @@ import argparse
 from collections import defaultdict
 import os
 from pathlib import Path
-import re
 import sys
 import time
 
 
-# Candidate definitions with classification and regex pattern for matching
-CANDIDATE_MAP = {
+# Candidate definitions with functional classification and all known aliases
+CANDIDATE_DEFINITIONS = [
     # Stabilizers
-    "ELAVL1":  {"role": "Stabilizer",   "patterns": [r"^ELAVL1\b", r"^HUR\b", r"^HUA\b"]},
-    "IGF2BP1": {"role": "Stabilizer",   "patterns": [r"^IGF2BP1\b", r"^IMP1\b", r"^ZBP1\b"]},
-    "IGF2BP2": {"role": "Stabilizer",   "patterns": [r"^IGF2BP2\b", r"^IMP2\b"]},
-    "IGF2BP3": {"role": "Stabilizer",   "patterns": [r"^IGF2BP3\b", r"^IMP3\b"]},
-    "QKI":     {"role": "Stabilizer",   "patterns": [r"^QKI\b", r"^QK\b"]},
-    "TARDBP":  {"role": "Stabilizer",   "patterns": [r"^TARDBP\b", r"^TDP43\b", r"^TDP-43\b"]},
+    {"canonical": "ELAVL1",  "role": "Stabilizer",   "aliases": ["ELAVL1", "HUR", "HUA"]},
+    {"canonical": "IGF2BP1", "role": "Stabilizer",   "aliases": ["IGF2BP1", "IMP1", "ZBP1"]},
+    {"canonical": "IGF2BP2", "role": "Stabilizer",   "aliases": ["IGF2BP2", "IMP2"]},
+    {"canonical": "IGF2BP3", "role": "Stabilizer",   "aliases": ["IGF2BP3", "IMP3"]},
+    {"canonical": "QKI",     "role": "Stabilizer",   "aliases": ["QKI", "QK"]},
+    {"canonical": "TARDBP",  "role": "Stabilizer",   "aliases": ["TARDBP", "TDP43", "TDP-43"]},
     # Destabilizers
-    "KHSRP":   {"role": "Destabilizer", "patterns": [r"^KHSRP\b", r"^KSRP\b"]},
-    "HNRNPD":  {"role": "Destabilizer", "patterns": [r"^HNRNPD\b", r"^AUF1\b"]},
-    "ZFP36L1": {"role": "Destabilizer", "patterns": [r"^ZFP36L1\b", r"^TIS11B\b", r"^BRF1\b"]},
-    "ZFP36L2": {"role": "Destabilizer", "patterns": [r"^ZFP36L2\b", r"^TIS11D\b", r"^BRF2\b"]},
-    "ZFP36":   {"role": "Destabilizer", "patterns": [r"^ZFP36\b", r"^TTP\b"]},
-    "PUM1":    {"role": "Destabilizer", "patterns": [r"^PUM1\b", r"^PUMH1\b"]},
-    "PUM2":    {"role": "Destabilizer", "patterns": [r"^PUM2\b", r"^PUMH2\b"]},
-    "YTHDF2":  {"role": "Destabilizer", "patterns": [r"^YTHDF2\b"]},
-    "UPF1":    {"role": "Destabilizer", "patterns": [r"^UPF1\b", r"^RENT1\b"]},
+    {"canonical": "KHSRP",   "role": "Destabilizer", "aliases": ["KHSRP", "KSRP"]},
+    {"canonical": "HNRNPD",  "role": "Destabilizer", "aliases": ["HNRNPD", "AUF1"]},
+    {"canonical": "ZFP36L1", "role": "Destabilizer", "aliases": ["ZFP36L1", "TIS11B", "BRF1"]},
+    {"canonical": "ZFP36L2", "role": "Destabilizer", "aliases": ["ZFP36L2", "TIS11D", "BRF2"]},
+    {"canonical": "ZFP36",   "role": "Destabilizer", "aliases": ["ZFP36", "TTP"]},
+    {"canonical": "PUM1",    "role": "Destabilizer", "aliases": ["PUM1", "PUMH1"]},
+    {"canonical": "PUM2",    "role": "Destabilizer", "aliases": ["PUM2", "PUMH2"]},
+    {"canonical": "YTHDF2",  "role": "Destabilizer", "aliases": ["YTHDF2"]},
+    {"canonical": "UPF1",    "role": "Destabilizer", "aliases": ["UPF1", "RENT1"]},
     # Regulatory / Cardiac
-    "RBFOX2":  {"role": "Regulatory",   "patterns": [r"^RBFOX2\b", r"^RBM9\b"]},
-}
+    {"canonical": "RBFOX2",  "role": "Regulatory",   "aliases": ["RBFOX2", "RBM9"]},
+]
 
-# Precompile regexes for ultra-fast matching
-COMPILED_MATCHERS = []
-for sym, info in CANDIDATE_MAP.items():
-    combined_pat = re.compile("|".join(info["patterns"]), re.IGNORECASE)
-    COMPILED_MATCHERS.append((sym, info["role"], combined_pat))
+# Build fast O(1) lookup dictionary: maps uppercase token -> (canonical_symbol, role)
+LOOKUP_DICT = {}
+for item in CANDIDATE_DEFINITIONS:
+    canon = item["canonical"]
+    role = item["role"]
+    for alias in item["aliases"]:
+        LOOKUP_DICT[alias.upper()] = (canon, role)
 
 
 def identify_rbp(peak_name: str):
-    """Identifies which candidate RBP a peak belongs to based on its name."""
+    """
+    Identifies candidate RBP from peak name (e.g. 'PUM1_K562_rep01' -> ('PUM1', 'Destabilizer')).
+    Splits by underscore, hyphen, and period for maximum robustness.
+    """
     if not peak_name or peak_name == ".":
         return None, None
-    clean_name = peak_name.strip()
-    for sym, role, pat in COMPILED_MATCHERS:
-        if pat.search(clean_name):
-            return sym, role
+
+    # ENCODE standard format: {RBP}_{CellLine}_{Replicate}
+    # 1. Primary check: First token before underscore
+    first_token = peak_name.split("_")[0].strip().upper()
+    if first_token in LOOKUP_DICT:
+        return LOOKUP_DICT[first_token]
+
+    # 2. Secondary check: Any token in name
+    # Useful if named e.g. eCLIP_PUM1_rep01 or similar
+    tokens = peak_name.replace("-", "_").replace(".", "_").upper().split("_")
+    for tok in tokens:
+        if tok in LOOKUP_DICT:
+            return LOOKUP_DICT[tok]
+
     return None, None
 
 
@@ -94,15 +108,16 @@ def main():
     stab_out_path = output_dir / "stabilizers_peaks.bed"
     destab_out_path = output_dir / "destabilizers_peaks.bed"
 
-    print(f"Input BED file:  {input_path}")
+    print(f"Input BED file:   {input_path}")
     print(f"Output directory: {output_dir}")
-    print("Beginning stream filtering line-by-line (low memory footprint)...")
+    print("Beginning stream filtering line-by-line (O(1) dictionary token matching)...")
 
     start_time = time.time()
     total_lines = 0
     matched_peaks = 0
     counts_by_rbp = defaultdict(int)
     scores_by_rbp = defaultdict(list)
+    all_unique_prefixes = set()
 
     with open(input_path, "r", encoding="utf-8", errors="ignore") as f_in, \
          open(all_out_path, "w", encoding="utf-8") as f_all, \
@@ -119,20 +134,27 @@ def main():
                 continue
 
             peak_name = parts[3]
+            
+            # Record unique prefix for diagnostics (first 100k lines)
+            if total_lines <= 100000:
+                p_tok = peak_name.split("_")[0].strip()
+                if p_tok and p_tok != ".":
+                    all_unique_prefixes.add(p_tok)
+
             rbp_symbol, role = identify_rbp(peak_name)
 
             if rbp_symbol is not None:
                 matched_peaks += 1
                 counts_by_rbp[rbp_symbol] += 1
 
-                # Parse signalValue if available (column 6 in standard narrowPeak)
+                # Parse signalValue if available (column 6 in narrowPeak)
                 if len(parts) >= 7:
                     try:
                         scores_by_rbp[rbp_symbol].append(float(parts[6]))
                     except ValueError:
                         pass
 
-                # Write to the all-curated file
+                # Write to all-curated file
                 f_all.write(line)
 
                 # Route to role-specific BED files
@@ -141,10 +163,9 @@ def main():
                 elif role == "Destabilizer":
                     f_destab.write(line)
                 elif role == "Regulatory":
-                    # RBFOX2 is written to all_out, and can optionally be examined
                     pass
 
-            if total_lines % 500000 == 0:
+            if total_lines % 5000000 == 0:
                 print(f"  Processed {total_lines:,} lines | Matched {matched_peaks:,} candidate peaks...")
 
     elapsed = time.time() - start_time
@@ -158,8 +179,9 @@ def main():
     print(f"{'Symbol':<12} {'Role':<15} {'Found Peaks':<15} {'Mean Signal':<12} {'Max Signal':<12}")
     print("-" * 70)
 
-    for sym, info in CANDIDATE_MAP.items():
-        role = info["role"]
+    for item in CANDIDATE_DEFINITIONS:
+        sym = item["canonical"]
+        role = item["role"]
         cnt = counts_by_rbp[sym]
         scores = scores_by_rbp[sym]
         mean_s = f"{sum(scores)/len(scores):.2f}" if scores else "-"
@@ -168,7 +190,7 @@ def main():
 
     print("-" * 70)
     print(f"\nGenerated Filtered BED Files:")
-    print(f"1. All 16 Candidates:      {all_out_path}")
+    print(f"1. All Candidates:         {all_out_path}")
     print(f"2. Stabilizers Only:       {stab_out_path}")
     print(f"3. Destabilizers Only:     {destab_out_path}")
     print("=" * 80)
