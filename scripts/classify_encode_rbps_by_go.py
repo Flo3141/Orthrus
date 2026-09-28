@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
 """
-Filter and Classify 150 ENCODE eCLIP RBPs using the Master Node GO:0006402 (mRNA catabolic process).
+Filter and Classify 150 ENCODE eCLIP RBPs using Master Node GO:0006402 (mRNA catabolic process)
+with explicit biological context filters for Mitochondrial and Histone-specific special cases.
 
-Step 1 (Inclusion Filter):
-- Live queries QuickGO API for all official descendant terms of GO:0006402 (mRNA catabolic process).
-- Filters the 150 ENCODE RBPs to only those that possess an annotation within this subtree.
+Biological Workflow:
+1. Master Node Filter:
+   - Live queries QuickGO API for all 71 official descendant terms of GO:0006402 (mRNA catabolic process).
+   - Identifies which of the 150 ENCODE RBPs are annotated in this tree.
 
-Step 2 (Directional Classification):
-- Evaluates the matched GO terms of each included RBP:
-  * Stabilizer: Exclusively annotated with stabilization or negative regulation of decay/catabolism.
-  * Destabilizer: Exclusively annotated with destabilization, direct catabolic decay, decapping, or positive regulation of decay.
-  * Undefined (Dual Role): Annotated with BOTH stabilizing AND destabilizing terms (context-dependent dual function).
-  * Undefined (Generic Term): Annotated only with generic parent terms (e.g. GO:0043488 regulation of mRNA stability).
+2. Biological Substrate & Compartment Exclusion:
+   - Excluded (Mitochondrial Specific): RBPs whose only catabolic terms act strictly within the
+     mitochondrial matrix (e.g. SUPV3L1, FASTKD2, TBRG4). They cannot access cytoplasmic mRNAs.
+   - Excluded (Histone Specific): RBPs whose only catabolic terms act strictly on replication-dependent,
+     non-polyadenylated histone mRNAs via stem-loops (e.g. LSM11, CSTF2, MTPAP, SSB).
 
-Robustness:
-- Resilient chunked queries (chunk_size=20) with exponential backoff retry to prevent HTTP 502 Bad Gateway errors.
-- Displays triggering GO terms for unambiguous classes, and lists all terms plus vote count for Undefined ones.
+3. Directional Classification (Canonical Cytoplasmic mRNAs):
+   - Evaluates remaining canonical cytoplasmic mRNA terms for directionality:
+     * Stabilizer: Exclusively annotated with stabilization or negative regulation of decay/catabolism.
+     * Destabilizer: Exclusively annotated with destabilization, direct catabolic decay, decapping, or positive regulation of decay.
+     * Undefined (Dual Role): Annotated with BOTH stabilizing and destabilizing canonical terms.
+     * Undefined (Generic Term): Annotated only with top-level generic parent terms (e.g. GO:0043488).
+
+Output:
+- Detailed breakdown with triggering GO terms and explicit exclusion reasons.
+- Exports full CSV and summary TXT reports.
 """
 
 import argparse
@@ -72,7 +80,6 @@ def fetch_quickgo_descendants(parent_id: str = MASTER_NODE_ID) -> set:
             print(f"[Warning] QuickGO attempt {attempt} failed ({e}). Retrying in {attempt * 2}s...")
             time.sleep(attempt * 2)
 
-    # Fallback core set if network completely fails
     return {MASTER_NODE_ID, "GO:0043488", "GO:0061157", "GO:0048255", "GO:0000184", "GO:0000956"}
 
 
@@ -96,7 +103,6 @@ def query_mygene_chunk_with_retry(chunk: list, max_retries: int = 4) -> list:
                 return json.loads(resp.read().decode("utf-8"))
         except Exception as e:
             if attempt == max_retries:
-                # If chunk of e.g. 20 fails repeatedly, recursively split into micro-chunks
                 if len(chunk) > 5:
                     print(f"[Fallback] Splitting failed chunk of {len(chunk)} genes into smaller micro-chunks...")
                     half = len(chunk) // 2
@@ -113,10 +119,8 @@ def fetch_live_gene_ontology(symbols: list, chunk_size: int = 20) -> dict:
     annotations = {}
     print(f"[MyGene.info] Fetching annotations for {len(symbols)} RBPs in robust chunks of {chunk_size}...")
 
-    total_chunks = (len(symbols) + chunk_size - 1) // chunk_size
     for i in range(0, len(symbols), chunk_size):
         chunk = symbols[i : i + chunk_size]
-        chunk_num = (i // chunk_size) + 1
         results = query_mygene_chunk_with_retry(chunk)
 
         for entry in results:
@@ -188,7 +192,7 @@ def classify_go_term_direction(term_name: str) -> str:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Filter and Classify ENCODE eCLIP RBPs via Master Node GO:0006402."
+        description="Filter and Classify ENCODE eCLIP RBPs via Master Node GO:0006402 with Mito/Histone filters."
     )
     parser.add_argument(
         "--output_csv",
@@ -219,7 +223,7 @@ def main():
     records = []
     filtered_rbps = []
 
-    print("\n[Processing] Filtering RBPs against GO:0006402 subtree and classifying direction...")
+    print("\n[Processing] Filtering RBPs against GO:0006402 subtree and applying biological filters...")
 
     for sym in ALL_ENCODE_RBPS:
         info = anno_data.get(sym, {"name": "", "summary": "", "go_bp": []})
@@ -244,24 +248,44 @@ def main():
 
         is_in_tree = len(matched_tree_terms) > 0
 
-        # Step 2: Directional Classification
+        # Step 2: Compartment & Substrate Exclusion Filters
         if is_in_tree:
-            stabs = [t for t in matched_tree_terms if t["direction"] == "Stabilizer"]
-            destabs = [t for t in matched_tree_terms if t["direction"] == "Destabilizer"]
-            neutrals = [t for t in matched_tree_terms if t["direction"] == "Neutral"]
+            # Separate into canonical cytoplasmic vs. mitochondrial vs. histone terms
+            mito_terms = [t for t in matched_tree_terms if "mitochondrial" in t["term"].lower()]
+            histone_terms = [t for t in matched_tree_terms if "histone" in t["term"].lower()]
+            canonical_terms = [
+                t for t in matched_tree_terms
+                if "mitochondrial" not in t["term"].lower() and "histone" not in t["term"].lower()
+            ]
 
-            if stabs and not destabs:
-                classification = "Stabilizer"
-                trigger_str = f"{stabs[0]['id']}: {stabs[0]['term']}"
-            elif destabs and not stabs:
-                classification = "Destabilizer"
-                trigger_str = f"{destabs[0]['id']}: {destabs[0]['term']}"
-            elif stabs and destabs:
-                classification = f"Undefined (Dual Role: {len(stabs)} Stab / {len(destabs)} Destab)"
-                trigger_str = " | ".join(f"[{t['direction'][0]}] {t['id']}: {t['term']}" for t in matched_tree_terms)
+            # Special Case A: Strictly Mitochondrial (No canonical cytoplasmic terms)
+            if mito_terms and not canonical_terms:
+                classification = "Excluded (Mitochondrial Specific)"
+                trigger_str = " | ".join(f"{t['id']}: {t['term']}" for t in mito_terms)
+
+            # Special Case B: Strictly Histone-Specific (No canonical cytoplasmic terms)
+            elif histone_terms and not canonical_terms:
+                classification = "Excluded (Histone Specific)"
+                trigger_str = " | ".join(f"{t['id']}: {t['term']}" for t in histone_terms)
+
+            # Case C: Canonical Cytoplasmic mRNA Decay / Stability
             else:
-                classification = "Undefined (Generic Parent Term)"
-                trigger_str = " | ".join(f"{t['id']}: {t['term']}" for t in matched_tree_terms)
+                eval_terms = canonical_terms if canonical_terms else matched_tree_terms
+                stabs = [t for t in eval_terms if t["direction"] == "Stabilizer"]
+                destabs = [t for t in eval_terms if t["direction"] == "Destabilizer"]
+
+                if stabs and not destabs:
+                    classification = "Stabilizer"
+                    trigger_str = f"{stabs[0]['id']}: {stabs[0]['term']}"
+                elif destabs and not stabs:
+                    classification = "Destabilizer"
+                    trigger_str = f"{destabs[0]['id']}: {destabs[0]['term']}"
+                elif stabs and destabs:
+                    classification = f"Undefined (Dual Role: {len(stabs)} Stab / {len(destabs)} Destab)"
+                    trigger_str = " | ".join(f"[{t['direction'][0]}] {t['id']}: {t['term']}" for t in eval_terms)
+                else:
+                    classification = "Undefined (Generic Parent Term)"
+                    trigger_str = " | ".join(f"{t['id']}: {t['term']}" for t in eval_terms)
 
             filtered_rbps.append({
                 "Symbol": sym,
@@ -293,14 +317,14 @@ def main():
     lines = []
     lines.append("=" * 115)
     lines.append("     SYSTEMATIC CLASSIFICATION OF ENCODE eCLIP RBPs VIA MASTER NODE GO:0006402")
-    lines.append("     Master Node: GO:0006402 (mRNA catabolic process) & QuickGO Descendant Tree")
+    lines.append("     Master Node: GO:0006402 (mRNA catabolic process) & Substrate/Compartment Filters")
     lines.append("=" * 115)
     lines.append(f"\nTotal ENCODE RBPs Analyzed:                   {len(ALL_ENCODE_RBPS)}")
     lines.append(f"RBPs in GO:0006402 Catabolic/Stability Tree: {len(filtered_rbps)} ({len(filtered_rbps)/len(ALL_ENCODE_RBPS)*100:.1f}%)")
     lines.append(f"Excluded Non-Catabolic RBPs:                  {len(ALL_ENCODE_RBPS) - len(filtered_rbps)} (Splicing, Ribosome, Translation)\n")
 
     lines.append("-" * 115)
-    lines.append(f"{'Symbol':<10} {'Classification':<35} {'Triggering GO Term (or ALL terms if Undefined)'}")
+    lines.append(f"{'Symbol':<10} {'Classification':<35} {'Triggering GO Term (or Excluded Terms)'}")
     lines.append("-" * 115)
 
     def sort_key(item):
@@ -308,7 +332,10 @@ def main():
         if c == "Stabilizer": return (1, item["Symbol"])
         if c == "Destabilizer": return (2, item["Symbol"])
         if "Dual Role" in c: return (3, item["Symbol"])
-        return (4, item["Symbol"])
+        if "Generic" in c: return (4, item["Symbol"])
+        if "Mitochondrial" in c: return (5, item["Symbol"])
+        if "Histone" in c: return (6, item["Symbol"])
+        return (7, item["Symbol"])
 
     for item in sorted(filtered_rbps, key=sort_key):
         sym = item["Symbol"]
@@ -318,21 +345,25 @@ def main():
 
     lines.append("-" * 115)
 
+    # Subsets
     stab_list = [x["Symbol"] for x in filtered_rbps if x["Classification"] == "Stabilizer"]
     destab_list = [x["Symbol"] for x in filtered_rbps if x["Classification"] == "Destabilizer"]
     dual_list = [x["Symbol"] for x in filtered_rbps if "Dual Role" in x["Classification"]]
     generic_list = [x["Symbol"] for x in filtered_rbps if "Generic" in x["Classification"]]
+    mito_list = [x["Symbol"] for x in filtered_rbps if "Mitochondrial" in x["Classification"]]
+    hist_list = [x["Symbol"] for x in filtered_rbps if "Histone" in x["Classification"]]
 
-    lines.append(f"\n1. Explicit Stabilizers ({len(stab_list)}):    {', '.join(stab_list)}")
+    lines.append(f"\n--- CANONICAL CYTOPLASMIC mRNA REGULATORS (Relevant for hIPSC-CM) ---")
+    lines.append(f"1. Explicit Stabilizers ({len(stab_list)}):    {', '.join(stab_list)}")
     lines.append(f"2. Explicit Destabilizers ({len(destab_list)}):  {', '.join(destab_list)}")
     lines.append(f"3. Undefined - Dual Role ({len(dual_list)}):     {', '.join(dual_list)}")
     lines.append(f"4. Undefined - Generic ({len(generic_list)}):       {', '.join(generic_list)}")
 
-    lines.append("\nBiological Context for Undefined RBPs:")
-    lines.append("  - 'Dual Role': Biological studies have demonstrated both stabilizing and destabilizing activities")
-    lines.append("    depending on cellular context, binding position (e.g. 3' UTR vs CDS), or target transcript.")
-    lines.append("  - 'Generic': Gene is annotated with the top-level parent term (GO:0043488 regulation of mRNA stability)")
-    lines.append("    without explicit direction in the GO hierarchy.")
+    lines.append(f"\n--- SPECIAL CASE EXCLUSIONS (Not acting on Cytoplasmic Polyadenylated mRNA) ---")
+    lines.append(f"5. Excluded - Mitochondrial Specific ({len(mito_list)}): {', '.join(mito_list)}")
+    lines.append(f"   (Reason: Localized strictly within the mitochondrial matrix; sequestered from cytoplasmic mRNAs)")
+    lines.append(f"6. Excluded - Histone Specific ({len(hist_list)}):       {', '.join(hist_list)}")
+    lines.append(f"   (Reason: Acts strictly on replication-dependent non-polyadenylated histone mRNAs via stem-loops)")
     lines.append("=" * 115)
 
     report_str = "\n".join(lines)
