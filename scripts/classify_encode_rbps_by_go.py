@@ -8,14 +8,14 @@ Step 1 (Inclusion Filter):
 
 Step 2 (Directional Classification):
 - Evaluates the matched GO terms of each included RBP:
-  * Stabilizer: Annotated with stabilization or negative regulation of decay/catabolism.
-  * Destabilizer: Annotated with destabilization, direct catabolic decay, decapping, or positive regulation of decay.
-  * Undefined: Annotated only with generic parent terms (e.g. regulation of mRNA stability) or with conflicting terms.
+  * Stabilizer: Exclusively annotated with stabilization or negative regulation of decay/catabolism.
+  * Destabilizer: Exclusively annotated with destabilization, direct catabolic decay, decapping, or positive regulation of decay.
+  * Undefined (Dual Role): Annotated with BOTH stabilizing AND destabilizing terms (context-dependent dual function).
+  * Undefined (Generic Term): Annotated only with generic parent terms (e.g. GO:0043488 regulation of mRNA stability).
 
-Output:
-- For Stabilizer / Destabilizer: Displays the specific GO Term (ID and Name) that triggered the classification.
-- For Undefined: Displays ALL matched GO Terms within the GO:0006402 subtree.
-- Exports complete CSV and TXT summary reports.
+Robustness:
+- Resilient chunked queries (chunk_size=20) with exponential backoff retry to prevent HTTP 502 Bad Gateway errors.
+- Displays triggering GO terms for unambiguous classes, and lists all terms plus vote count for Undefined ones.
 """
 
 import argparse
@@ -59,75 +59,96 @@ def fetch_quickgo_descendants(parent_id: str = MASTER_NODE_ID) -> set:
         headers={"Accept": "application/json", "User-Agent": "Bioinformatics Pipeline; MasterThesis"},
     )
     print(f"[QuickGO] Querying official descendants for master node {parent_id} ({MASTER_NODE_NAME})...")
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            results = data.get("results", [])
-            if results:
-                descendants = set(results[0].get("descendants", []))
-                print(f"[QuickGO] Found {len(descendants)} official descendant GO terms under {parent_id}.")
-                return descendants
-    except Exception as e:
-        print(f"[Warning] Failed to fetch QuickGO descendants live ({e}). Falling back to cached core set.")
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                results = data.get("results", [])
+                if results:
+                    descendants = set(results[0].get("descendants", []))
+                    print(f"[QuickGO] Found {len(descendants)} official descendant GO terms under {parent_id}.")
+                    return descendants
+        except Exception as e:
+            print(f"[Warning] QuickGO attempt {attempt} failed ({e}). Retrying in {attempt * 2}s...")
+            time.sleep(attempt * 2)
 
-    # Fallback set if offline
+    # Fallback core set if network completely fails
     return {MASTER_NODE_ID, "GO:0043488", "GO:0061157", "GO:0048255", "GO:0000184", "GO:0000956"}
 
 
-def fetch_live_gene_ontology(symbols: list, chunk_size: int = 50) -> dict:
-    """Queries live NCBI Gene2GO / Ensembl GO annotations via MyGene.info API."""
+def query_mygene_chunk_with_retry(chunk: list, max_retries: int = 4) -> list:
+    """Queries MyGene.info for a small chunk of gene symbols with exponential backoff."""
     url = "https://mygene.info/v3/query"
-    annotations = {}
+    q_str = ",".join(chunk)
+    data = (
+        f"q={q_str}&scopes=symbol&fields=name,summary,go.BP&species=human&size=100"
+    ).encode("utf-8")
 
-    print(f"[MyGene.info] Fetching annotations for {len(symbols)} RBPs in chunks...")
-    for i in range(0, len(symbols), chunk_size):
-        chunk = symbols[i : i + chunk_size]
-        q_str = ",".join(chunk)
-        data = (
-            f"q={q_str}&scopes=symbol&fields=name,summary,go.BP&species=human&size=100"
-        ).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"User-Agent": "Bioinformatics Pipeline; MasterThesis"},
+    )
 
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={"User-Agent": "Bioinformatics Pipeline; MasterThesis"},
-        )
-
+    for attempt in range(1, max_retries + 1):
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
-                results = json.loads(resp.read().decode("utf-8"))
-
-            for entry in results:
-                sym = entry.get("query")
-                if not sym or sym in annotations:
-                    continue
-
-                full_name = entry.get("name", "")
-                summary = entry.get("summary", "")
-                go_bp = entry.get("go", {}).get("BP", [])
-                if isinstance(go_bp, dict):
-                    go_bp = [go_bp]
-
-                terms = []
-                for bp in go_bp:
-                    if isinstance(bp, dict):
-                        g_id = bp.get("id", "")
-                        g_term = bp.get("term", "")
-                        g_ev = bp.get("evidence", "")
-                        if g_id and g_term:
-                            terms.append({"id": g_id, "term": g_term, "evidence": g_ev})
-
-                annotations[sym] = {
-                    "symbol": sym,
-                    "name": full_name,
-                    "summary": summary,
-                    "go_bp": terms,
-                }
+                return json.loads(resp.read().decode("utf-8"))
         except Exception as e:
-            print(f"[Warning] Failed to fetch chunk {i}-{i+chunk_size}: {e}")
+            if attempt == max_retries:
+                # If chunk of e.g. 20 fails repeatedly, recursively split into micro-chunks
+                if len(chunk) > 5:
+                    print(f"[Fallback] Splitting failed chunk of {len(chunk)} genes into smaller micro-chunks...")
+                    half = len(chunk) // 2
+                    return query_mygene_chunk_with_retry(chunk[:half]) + query_mygene_chunk_with_retry(chunk[half:])
+                print(f"[Error] Failed to fetch chunk {chunk[:5]}... after {max_retries} attempts: {e}")
+                return []
+            wait_sec = attempt * 2
+            time.sleep(wait_sec)
+    return []
 
-        time.sleep(0.3)
 
+def fetch_live_gene_ontology(symbols: list, chunk_size: int = 20) -> dict:
+    """Queries live NCBI Gene2GO / Ensembl GO annotations via MyGene.info API using robust chunking."""
+    annotations = {}
+    print(f"[MyGene.info] Fetching annotations for {len(symbols)} RBPs in robust chunks of {chunk_size}...")
+
+    total_chunks = (len(symbols) + chunk_size - 1) // chunk_size
+    for i in range(0, len(symbols), chunk_size):
+        chunk = symbols[i : i + chunk_size]
+        chunk_num = (i // chunk_size) + 1
+        results = query_mygene_chunk_with_retry(chunk)
+
+        for entry in results:
+            sym = entry.get("query")
+            if not sym or sym in annotations:
+                continue
+
+            full_name = entry.get("name", "")
+            summary = entry.get("summary", "")
+            go_bp = entry.get("go", {}).get("BP", [])
+            if isinstance(go_bp, dict):
+                go_bp = [go_bp]
+
+            terms = []
+            for bp in go_bp:
+                if isinstance(bp, dict):
+                    g_id = bp.get("id", "")
+                    g_term = bp.get("term", "")
+                    g_ev = bp.get("evidence", "")
+                    if g_id and g_term:
+                        terms.append({"id": g_id, "term": g_term, "evidence": g_ev})
+
+            annotations[sym] = {
+                "symbol": sym,
+                "name": full_name,
+                "summary": summary,
+                "go_bp": terms,
+            }
+
+        time.sleep(0.4)
+
+    print(f"[MyGene.info] Successfully retrieved annotations for {len(annotations)} of {len(symbols)} RBPs.")
     return annotations
 
 
@@ -139,7 +160,6 @@ def classify_go_term_direction(term_name: str) -> str:
     t = term_name.lower()
 
     # 1. Check for Stabilization
-    # Note: 'destabiliz' must be excluded because 'stabilization' is a substring of 'destabilization'
     is_stab = False
     if "stabilization" in t and "destabiliz" not in t and "negative regulation" not in t:
         is_stab = True
@@ -168,7 +188,7 @@ def classify_go_term_direction(term_name: str) -> str:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Filter and Classify ENCODE eCLIP RBPs via Master Node GO:0006402 and Keyword Rules."
+        description="Filter and Classify ENCODE eCLIP RBPs via Master Node GO:0006402."
     )
     parser.add_argument(
         "--output_csv",
@@ -190,16 +210,16 @@ def main():
     csv_out = Path(args.output_csv)
     txt_out = Path(args.output_txt)
 
-    # 1. Fetch official descendants of Master Node GO:0006402
+    # 1. Fetch official descendants of Master Node GO:0006402 (mRNA catabolic process)
     descendant_ids = fetch_quickgo_descendants(MASTER_NODE_ID)
 
-    # 2. Fetch live Gene Ontology annotations for the 150 RBPs
-    anno_data = fetch_live_gene_ontology(ALL_ENCODE_RBPS)
+    # 2. Fetch live Gene Ontology annotations for the 150 RBPs (chunk_size=20 with retry)
+    anno_data = fetch_live_gene_ontology(ALL_ENCODE_RBPS, chunk_size=20)
 
     records = []
     filtered_rbps = []
 
-    print("\n[Processing] Filtering 150 RBPs against GO:0006402 subtree and determining direction...")
+    print("\n[Processing] Filtering RBPs against GO:0006402 subtree and classifying direction...")
 
     for sym in ALL_ENCODE_RBPS:
         info = anno_data.get(sym, {"name": "", "summary": "", "go_bp": []})
@@ -207,7 +227,7 @@ def main():
         summary = info["summary"]
         go_bp = info["go_bp"]
 
-        # Step 1: Filter terms within the GO:0006402 descendant tree
+        # Step 1: Filter terms strictly within the GO:0006402 descendant tree
         matched_tree_terms = []
         seen_term_ids = set()
         for term_obj in go_bp:
@@ -228,6 +248,7 @@ def main():
         if is_in_tree:
             stabs = [t for t in matched_tree_terms if t["direction"] == "Stabilizer"]
             destabs = [t for t in matched_tree_terms if t["direction"] == "Destabilizer"]
+            neutrals = [t for t in matched_tree_terms if t["direction"] == "Neutral"]
 
             if stabs and not destabs:
                 classification = "Stabilizer"
@@ -235,10 +256,11 @@ def main():
             elif destabs and not stabs:
                 classification = "Destabilizer"
                 trigger_str = f"{destabs[0]['id']}: {destabs[0]['term']}"
+            elif stabs and destabs:
+                classification = f"Undefined (Dual Role: {len(stabs)} Stab / {len(destabs)} Destab)"
+                trigger_str = " | ".join(f"[{t['direction'][0]}] {t['id']}: {t['term']}" for t in matched_tree_terms)
             else:
-                # Undefined (either generic parent terms like 'regulation of mRNA stability' or conflicting terms)
-                classification = "Undefined"
-                # Output ALL matched GO terms
+                classification = "Undefined (Generic Parent Term)"
                 trigger_str = " | ".join(f"{t['id']}: {t['term']}" for t in matched_tree_terms)
 
             filtered_rbps.append({
@@ -267,43 +289,51 @@ def main():
     df_all.to_csv(csv_out, index=False)
     print(f"[Saved] Full annotation table saved to: {csv_out}")
 
-    # Build and print comprehensive text report
+    # Build comprehensive text report
     lines = []
-    lines.append("=" * 110)
+    lines.append("=" * 115)
     lines.append("     SYSTEMATIC CLASSIFICATION OF ENCODE eCLIP RBPs VIA MASTER NODE GO:0006402")
     lines.append("     Master Node: GO:0006402 (mRNA catabolic process) & QuickGO Descendant Tree")
-    lines.append("=" * 110)
+    lines.append("=" * 115)
     lines.append(f"\nTotal ENCODE RBPs Analyzed:                   {len(ALL_ENCODE_RBPS)}")
     lines.append(f"RBPs in GO:0006402 Catabolic/Stability Tree: {len(filtered_rbps)} ({len(filtered_rbps)/len(ALL_ENCODE_RBPS)*100:.1f}%)")
     lines.append(f"Excluded Non-Catabolic RBPs:                  {len(ALL_ENCODE_RBPS) - len(filtered_rbps)} (Splicing, Ribosome, Translation)\n")
 
-    lines.append("-" * 110)
-    lines.append(f"{'Symbol':<10} {'Classification':<15} {'Triggering GO Term (or ALL terms if Undefined)'}")
-    lines.append("-" * 110)
+    lines.append("-" * 115)
+    lines.append(f"{'Symbol':<10} {'Classification':<35} {'Triggering GO Term (or ALL terms if Undefined)'}")
+    lines.append("-" * 115)
 
-    # Sort order: Stabilizers first, then Destabilizers, then Undefined
-    order_map = {"Stabilizer": 1, "Destabilizer": 2, "Undefined": 3}
-    for item in sorted(filtered_rbps, key=lambda x: (order_map.get(x["Classification"], 4), x["Symbol"])):
+    def sort_key(item):
+        c = item["Classification"]
+        if c == "Stabilizer": return (1, item["Symbol"])
+        if c == "Destabilizer": return (2, item["Symbol"])
+        if "Dual Role" in c: return (3, item["Symbol"])
+        return (4, item["Symbol"])
+
+    for item in sorted(filtered_rbps, key=sort_key):
         sym = item["Symbol"]
         cls = item["Classification"]
         trig = item["Trigger_GO_Terms"]
-        lines.append(f"{sym:<10} {cls:<15} {trig}")
+        lines.append(f"{sym:<10} {cls:<35} {trig}")
 
-    lines.append("-" * 110)
+    lines.append("-" * 115)
 
-    # Breakdown counts
     stab_list = [x["Symbol"] for x in filtered_rbps if x["Classification"] == "Stabilizer"]
     destab_list = [x["Symbol"] for x in filtered_rbps if x["Classification"] == "Destabilizer"]
-    undef_list = [x["Symbol"] for x in filtered_rbps if x["Classification"] == "Undefined"]
+    dual_list = [x["Symbol"] for x in filtered_rbps if "Dual Role" in x["Classification"]]
+    generic_list = [x["Symbol"] for x in filtered_rbps if "Generic" in x["Classification"]]
 
-    lines.append(f"\n1. Stabilizers ({len(stab_list)}):    {', '.join(stab_list)}")
-    lines.append(f"2. Destabilizers ({len(destab_list)}):  {', '.join(destab_list)}")
-    lines.append(f"3. Undefined ({len(undef_list)}):     {', '.join(undef_list)}")
-    lines.append("\nNote for Undefined RBPs:")
-    lines.append("  Undefined RBPs possess annotations within the GO:0006402 tree, but their terms either")
-    lines.append("  represent generic parent terms (e.g. GO:0043488 regulation of mRNA stability)")
-    lines.append("  or feature conflicting regulatory evidence across different contexts.")
-    lines.append("=" * 110)
+    lines.append(f"\n1. Explicit Stabilizers ({len(stab_list)}):    {', '.join(stab_list)}")
+    lines.append(f"2. Explicit Destabilizers ({len(destab_list)}):  {', '.join(destab_list)}")
+    lines.append(f"3. Undefined - Dual Role ({len(dual_list)}):     {', '.join(dual_list)}")
+    lines.append(f"4. Undefined - Generic ({len(generic_list)}):       {', '.join(generic_list)}")
+
+    lines.append("\nBiological Context for Undefined RBPs:")
+    lines.append("  - 'Dual Role': Biological studies have demonstrated both stabilizing and destabilizing activities")
+    lines.append("    depending on cellular context, binding position (e.g. 3' UTR vs CDS), or target transcript.")
+    lines.append("  - 'Generic': Gene is annotated with the top-level parent term (GO:0043488 regulation of mRNA stability)")
+    lines.append("    without explicit direction in the GO hierarchy.")
+    lines.append("=" * 115)
 
     report_str = "\n".join(lines)
     print("\n" + report_str)
