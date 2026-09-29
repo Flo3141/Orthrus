@@ -14,136 +14,36 @@ import numpy as np
 
 
 # Curated list of mRNA stability / decay regulators with functional annotation
-RBP_CANDIDATES = [
-    {
-        "symbol": "ELAVL1",
-        "alias": ["HUR", "HUA"],
-        "ensembl_id": "ENSG00000066044",
-        "category": "ARE Regulation",
-        "role": "Stabilizer",
-        "mechanism": "Binds AREs; protects from deadenylation & decay",
-    },
-    {
-        "symbol": "KHSRP",
-        "alias": ["KSRP", "FUBP2"],
-        "ensembl_id": "ENSG00000088247",
-        "category": "ARE Regulation",
-        "role": "Destabilizer",
-        "mechanism": "Recruits exosome and PARN deadenylase",
-    },
-    {
-        "symbol": "HNRNPD",
-        "alias": ["AUF1"],
-        "ensembl_id": "ENSG00000139667",
-        "category": "ARE Regulation",
-        "role": "Destabilizer",
-        "mechanism": "Promotes ARE-mediated mRNA decay",
-    },
-    {
-        "symbol": "ZFP36L1",
-        "alias": ["TIS11B", "BRF1"],
-        "ensembl_id": "ENSG00000185650",
-        "category": "ARE Regulation (TTP family)",
-        "role": "Destabilizer",
-        "mechanism": "Recruits CNOT deadenylase complex",
-    },
-    {
-        "symbol": "ZFP36L2",
-        "alias": ["TIS11D", "BRF2"],
-        "ensembl_id": "ENSG00000152518",
-        "category": "ARE Regulation (TTP family)",
-        "role": "Destabilizer",
-        "mechanism": "Accelerates mRNA decay",
-    },
-    {
-        "symbol": "ZFP36",
-        "alias": ["TTP", "GOS24"],
-        "ensembl_id": "ENSG00000128016",
-        "category": "ARE Regulation (TTP family)",
-        "role": "Destabilizer",
-        "mechanism": "Prototypical Tristetraprolin decay factor",
-    },
-    {
-        "symbol": "PUM1",
-        "alias": ["PUMH1"],
-        "ensembl_id": "ENSG00000134640",
-        "category": "Pumilio Repression",
-        "role": "Destabilizer",
-        "mechanism": "Binds PRE (UGUAHAUA); recruits CNOT deadenylases",
-    },
-    {
-        "symbol": "PUM2",
-        "alias": ["PUMH2"],
-        "ensembl_id": "ENSG00000055917",
-        "category": "Pumilio Repression",
-        "role": "Destabilizer",
-        "mechanism": "Binds PRE; represses translation & accelerates decay",
-    },
-    {
-        "symbol": "YTHDF2",
-        "alias": ["HGRG8"],
-        "ensembl_id": "ENSG00000198492",
-        "category": "m6A-Mediated Decay",
-        "role": "Destabilizer",
-        "mechanism": "m6A reader; directs transcripts to CCR4-NOT / decay",
-    },
-    {
-        "symbol": "IGF2BP1",
-        "alias": ["IMP1", "ZBP1", "CRD-BP"],
-        "ensembl_id": "ENSG00000159489",
-        "category": "m6A Reader / Shield",
-        "role": "Stabilizer",
-        "mechanism": "Protects m6A-modified mRNAs from degradation",
-    },
-    {
-        "symbol": "IGF2BP2",
-        "alias": ["IMP2", "VICKZ2"],
-        "ensembl_id": "ENSG00000073792",
-        "category": "m6A Reader / Shield",
-        "role": "Stabilizer",
-        "mechanism": "Post-transcriptional stabilizer of target mRNAs",
-    },
-    {
-        "symbol": "IGF2BP3",
-        "alias": ["IMP3", "KOC1"],
-        "ensembl_id": "ENSG00000136231",
-        "category": "m6A Reader / Shield",
-        "role": "Stabilizer",
-        "mechanism": "Promotes mRNA stability and translation",
-    },
-    {
-        "symbol": "UPF1",
-        "alias": ["RENT1", "NORF1"],
-        "ensembl_id": "ENSG00000005001",
-        "category": "NMD Surveillance",
-        "role": "Destabilizer",
-        "mechanism": "Key helicase initiating Nonsense-Mediated Decay",
-    },
-    {
-        "symbol": "QKI",
-        "alias": ["QK", "QK1", "QK3"],
-        "ensembl_id": "ENSG00000112531",
-        "category": "Cardiomyocyte / Muscle Regulation",
-        "role": "Dual / Stabilizer",
-        "mechanism": "Controls cardiac myofibrillogenesis and mRNA stability",
-    },
-    {
-        "symbol": "TARDBP",
-        "alias": ["TDP-43", "TDP43"],
-        "ensembl_id": "ENSG00000120948",
-        "category": "Cardiomyocyte / Muscle Regulation",
-        "role": "Dual / Stabilizer",
-        "mechanism": "Regulates mRNA stability & neuromuscular transcripts",
-    },
-    {
-        "symbol": "RBFOX2",
-        "alias": ["RBM9", "HRNBP2"],
-        "ensembl_id": "ENSG00000100320",
-        "category": "Cardiomyocyte Splicing & Stability",
-        "role": "Regulatory",
-        "mechanism": "Crucial for heart development; regulates 3' UTR events",
-    },
-]
+RBP_STABILIZERS = ["BCLAF1", "FUS", "HNRNPC", "HNRNPU", "IGF2BP1", "IGF2BP2", "IGF2BP3", "SRSF1", "TAF15", "YBX3", "QKI"]
+RBP_DESTABILIZERS = ["DDX6", "EXOSC5", "FTO", "FXR2", "KHSRP", "NCBP2", "PABPN1", "PUM1", "PUM2", "SND1", "XRN2", "UPF1"]
+
+
+# Known gene aliases to ensure matches even if alternate nomenclature is used
+KNOWN_ALIASES = {
+    "UPF1": ["RENT1", "NORF1", "HUPF1"],
+    "QKI": ["QK", "QK1", "QK3"],
+    "KHSRP": ["KSRP", "FUBP2"],
+    "NCBP2": ["CBP20", "NIP1"],
+    "IGF2BP1": ["IMP1", "CRD-BP", "ZBP1"],
+    "IGF2BP2": ["IMP2", "VICKZ2"],
+    "IGF2BP3": ["IMP3", "KOC1"],
+    "PUM1": ["PUMH1"],
+    "PUM2": ["PUMH2"],
+    "DDX6": ["RCK", "HLR2"],
+    "EXOSC5": ["RRP46", "RRP41L"],
+    "FTO": ["ALKBH9"],
+    "FXR2": ["FMR1L2"],
+    "PABPN1": ["PAB2", "PABP2", "OPMD"],
+    "SND1": ["TDRD11", "P100"],
+    "XRN2": ["DHP1"],
+    "BCLAF1": ["BTF"],
+    "FUS": ["TLS", "FUS1", "HNRPP2"],
+    "HNRNPC": ["HNRPC", "HNPC"],
+    "HNRNPU": ["HNRPU", "HNPU", "SAF-A"],
+    "SRSF1": ["ASF", "SF2", "SFRS1"],
+    "TAF15": ["RBP56", "TAF2N", "TSR"],
+    "YBX3": ["CSDA", "DBPA", "ZONAB"],
+}
 
 
 def parse_args():
@@ -160,7 +60,7 @@ def parse_args():
         "--output_txt",
         type=str,
         default=None,
-        help="Optional path to save text report",
+        help="Optional path to save text/tsv report",
     )
     return parser.parse_args()
 
@@ -179,27 +79,27 @@ def main():
 
     # Clean columns
     df["hgnc_symbol_upper"] = df["hgnc_symbol"].fillna("").astype(str).str.strip().str.upper()
-    if "ensembl_gene_id" in df.columns:
-        df["ensembl_gene_id_clean"] = df["ensembl_gene_id"].fillna("").astype(str).str.strip()
-    else:
-        df["ensembl_gene_id_clean"] = ""
+
+    candidates = []
+    for sym in RBP_STABILIZERS:
+        candidates.append({"symbol": sym, "role": "Stabilizer"})
+    for sym in RBP_DESTABILIZERS:
+        candidates.append({"symbol": sym, "role": "Destabilizer"})
 
     results = []
 
-    print("\n" + "=" * 95)
+    print("\n" + "=" * 105)
     print("                RBP CANDIDATE EXPRESSION CHECK IN hIPSC-CM DATASET")
-    print("=" * 95)
+    print("=" * 105)
 
-    for cand in RBP_CANDIDATES:
+    for cand in candidates:
         sym = cand["symbol"].upper()
-        aliases = [a.upper() for a in cand["alias"]]
-        ens_id = cand["ensembl_id"]
+        aliases = [a.upper() for a in KNOWN_ALIASES.get(sym, [])]
 
-        # Search by symbol or aliases or ensembl gene id
+        # Search by symbol or known aliases
         mask = (
             (df["hgnc_symbol_upper"] == sym)
             | (df["hgnc_symbol_upper"].isin(aliases))
-            | (df["ensembl_gene_id_clean"] == ens_id)
         )
         matches = df[mask]
 
@@ -209,46 +109,59 @@ def main():
         if is_expressed:
             hwz_mean = matches["half_life"].mean() if "half_life" in matches.columns else np.nan
             hwz_median = matches["half_life"].median() if "half_life" in matches.columns else np.nan
-            tx_ids = ", ".join(matches["ensembl_transcript_id"].astype(str).tolist()[:3])
-            if num_tx > 3:
-                tx_ids += f" (+{num_tx - 3} more)"
+            matched_sym = matches["hgnc_symbol_upper"].iloc[0]
+            tx_ids = ", ".join(matches["ensembl_transcript_id"].astype(str).tolist()[:2])
+            if num_tx > 2:
+                tx_ids += f" (+{num_tx - 2} more)"
         else:
             hwz_mean = np.nan
             hwz_median = np.nan
+            matched_sym = "-"
             tx_ids = "-"
 
         results.append({
             "Symbol": cand["symbol"],
-            "Category": cand["category"],
             "Role": cand["role"],
             "Status": "EXPRESSED" if is_expressed else "NOT FOUND",
+            "Matched_Gene": matched_sym,
             "Num_Transcripts": num_tx,
             "Mean_Half_Life_h": round(hwz_mean, 2) if not np.isnan(hwz_mean) else "-",
             "Median_Half_Life_h": round(hwz_median, 2) if not np.isnan(hwz_median) else "-",
             "Sample_Transcripts": tx_ids,
-            "Mechanism": cand["mechanism"],
         })
 
     res_df = pd.DataFrame(results)
 
     # Format table for output
-    summary_cols = ["Symbol", "Role", "Status", "Num_Transcripts", "Mean_Half_Life_h", "Category"]
+    summary_cols = ["Symbol", "Role", "Status", "Num_Transcripts", "Mean_Half_Life_h", "Sample_Transcripts"]
     print(res_df[summary_cols].to_string(index=False))
 
     expressed_count = (res_df["Status"] == "EXPRESSED").sum()
     total_count = len(res_df)
 
-    print("\n" + "=" * 95)
+    stab_df = res_df[res_df["Role"] == "Stabilizer"]
+    destab_df = res_df[res_df["Role"] == "Destabilizer"]
+
+    stab_exp = (stab_df["Status"] == "EXPRESSED").sum()
+    destab_exp = (destab_df["Status"] == "EXPRESSED").sum()
+
+    print("\n" + "=" * 105)
     print(f"Summary: {expressed_count} of {total_count} candidate RBPs are CONFIRMED EXPRESSED in hIPSC-CMs.")
-    print("=" * 95)
+    print(f"  - Stabilizers:   {stab_exp} of {len(stab_df)} expressed")
+    print(f"  - Destabilizers: {destab_exp} of {len(destab_df)} expressed")
+    print("=" * 105)
 
-    print("\nRecommended Next Steps for ENCORI:")
-    expressed_symbols = res_df[res_df["Status"] == "EXPRESSED"]["Symbol"].tolist()
-    stabilizers = res_df[(res_df["Status"] == "EXPRESSED") & (res_df["Role"].str.contains("Stabilizer"))]["Symbol"].tolist()
-    destabilizers = res_df[(res_df["Status"] == "EXPRESSED") & (res_df["Role"].str.contains("Destabilizer"))]["Symbol"].tolist()
+    stab_list = stab_df[stab_df["Status"] == "EXPRESSED"]["Symbol"].tolist()
+    destab_list = destab_df[destab_df["Status"] == "EXPRESSED"]["Symbol"].tolist()
 
-    print(f"1. Confirmed Stabilizers ({len(stabilizers)}):   {', '.join(stabilizers)}")
-    print(f"2. Confirmed Destabilizers ({len(destabilizers)}): {', '.join(destabilizers)}")
+    print(f"\n1. Confirmed Stabilizers ({len(stab_list)}):   {', '.join(stab_list)}")
+    print(f"2. Confirmed Destabilizers ({len(destab_list)}): {', '.join(destab_list)}")
+
+    missing = res_df[res_df["Status"] != "EXPRESSED"]["Symbol"].tolist()
+    if missing:
+        print(f"\n[Warning] Not found in hIPSC-CM ({len(missing)}): {', '.join(missing)}")
+    else:
+        print("\n[Success] All tested candidates are actively expressed in hIPSC-CM!")
 
     if args.output_txt:
         out_p = Path(args.output_txt)
