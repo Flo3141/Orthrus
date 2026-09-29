@@ -18,36 +18,49 @@ import sys
 import time
 
 
-# Candidate definitions with functional classification and all known aliases
-CANDIDATE_DEFINITIONS = [
-    # Stabilizers
-    {"canonical": "ELAVL1",  "role": "Stabilizer",   "aliases": ["ELAVL1", "HUR", "HUA"]},
-    {"canonical": "IGF2BP1", "role": "Stabilizer",   "aliases": ["IGF2BP1", "IMP1", "ZBP1"]},
-    {"canonical": "IGF2BP2", "role": "Stabilizer",   "aliases": ["IGF2BP2", "IMP2"]},
-    {"canonical": "IGF2BP3", "role": "Stabilizer",   "aliases": ["IGF2BP3", "IMP3"]},
-    {"canonical": "QKI",     "role": "Stabilizer",   "aliases": ["QKI", "QK"]},
-    {"canonical": "TARDBP",  "role": "Stabilizer",   "aliases": ["TARDBP", "TDP43", "TDP-43"]},
-    # Destabilizers
-    {"canonical": "KHSRP",   "role": "Destabilizer", "aliases": ["KHSRP", "KSRP"]},
-    {"canonical": "HNRNPD",  "role": "Destabilizer", "aliases": ["HNRNPD", "AUF1"]},
-    {"canonical": "ZFP36L1", "role": "Destabilizer", "aliases": ["ZFP36L1", "TIS11B", "BRF1"]},
-    {"canonical": "ZFP36L2", "role": "Destabilizer", "aliases": ["ZFP36L2", "TIS11D", "BRF2"]},
-    {"canonical": "ZFP36",   "role": "Destabilizer", "aliases": ["ZFP36", "TTP"]},
-    {"canonical": "PUM1",    "role": "Destabilizer", "aliases": ["PUM1", "PUMH1"]},
-    {"canonical": "PUM2",    "role": "Destabilizer", "aliases": ["PUM2", "PUMH2"]},
-    {"canonical": "YTHDF2",  "role": "Destabilizer", "aliases": ["YTHDF2"]},
-    {"canonical": "UPF1",    "role": "Destabilizer", "aliases": ["UPF1", "RENT1"]},
-    # Regulatory / Cardiac
-    {"canonical": "RBFOX2",  "role": "Regulatory",   "aliases": ["RBFOX2", "RBM9"]},
-]
+# Curated list of mRNA stability / decay regulators with functional annotation
+RBP_STABILIZERS = ["BCLAF1", "FUS", "HNRNPC", "HNRNPU", "IGF2BP1", "IGF2BP2", "IGF2BP3", "SRSF1", "TAF15", "YBX3", "QKI"]
+RBP_DESTABILIZERS = ["DDX6", "EXOSC5", "FTO", "FXR2", "KHSRP", "NCBP2", "PABPN1", "PUM1", "PUM2", "SND1", "XRN2", "UPF1"]
+
+
+# Known gene aliases to ensure matches even if alternate nomenclature is used
+KNOWN_ALIASES = {
+    "UPF1": ["RENT1", "NORF1", "HUPF1"],
+    "QKI": ["QK", "QK1", "QK3"],
+    "KHSRP": ["KSRP", "FUBP2"],
+    "NCBP2": ["CBP20", "NIP1"],
+    "IGF2BP1": ["IMP1", "CRD-BP", "ZBP1"],
+    "IGF2BP2": ["IMP2", "VICKZ2"],
+    "IGF2BP3": ["IMP3", "KOC1"],
+    "PUM1": ["PUMH1"],
+    "PUM2": ["PUMH2"],
+    "DDX6": ["RCK", "HLR2"],
+    "EXOSC5": ["RRP46", "RRP41L"],
+    "FTO": ["ALKBH9"],
+    "FXR2": ["FMR1L2"],
+    "PABPN1": ["PAB2", "PABP2", "OPMD"],
+    "SND1": ["TDRD11", "P100"],
+    "XRN2": ["DHP1"],
+    "BCLAF1": ["BTF"],
+    "FUS": ["TLS", "FUS1", "HNRPP2"],
+    "HNRNPC": ["HNRPC", "HNPC"],
+    "HNRNPU": ["HNRPU", "HNPU", "SAF-A"],
+    "SRSF1": ["ASF", "SF2", "SFRS1"],
+    "TAF15": ["RBP56", "TAF2N", "TSR"],
+    "YBX3": ["CSDA", "DBPA", "ZONAB"],
+}
 
 # Build fast O(1) lookup dictionary: maps uppercase token -> (canonical_symbol, role)
 LOOKUP_DICT = {}
-for item in CANDIDATE_DEFINITIONS:
-    canon = item["canonical"]
-    role = item["role"]
-    for alias in item["aliases"]:
-        LOOKUP_DICT[alias.upper()] = (canon, role)
+for sym in RBP_STABILIZERS:
+    LOOKUP_DICT[sym.upper()] = (sym, "Stabilizer")
+    for alias in KNOWN_ALIASES.get(sym, []):
+        LOOKUP_DICT[alias.upper()] = (sym, "Stabilizer")
+
+for sym in RBP_DESTABILIZERS:
+    LOOKUP_DICT[sym.upper()] = (sym, "Destabilizer")
+    for alias in KNOWN_ALIASES.get(sym, []):
+        LOOKUP_DICT[alias.upper()] = (sym, "Destabilizer")
 
 
 def identify_rbp(peak_name: str):
@@ -104,12 +117,13 @@ def main():
         sys.exit(1)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    all_out_path = output_dir / "curated_16_rbp_peaks.bed"
+    all_out_path = output_dir / "curated_rbp_peaks_merged.bed"
     stab_out_path = output_dir / "stabilizers_peaks.bed"
     destab_out_path = output_dir / "destabilizers_peaks.bed"
 
     print(f"Input BED file:   {input_path}")
     print(f"Output directory: {output_dir}")
+    print(f"Tracking {len(RBP_STABILIZERS)} Stabilizers and {len(RBP_DESTABILIZERS)} Destabilizers...")
     print("Beginning stream filtering line-by-line (O(1) dictionary token matching)...")
 
     start_time = time.time()
@@ -162,8 +176,6 @@ def main():
                     f_stab.write(line)
                 elif role == "Destabilizer":
                     f_destab.write(line)
-                elif role == "Regulatory":
-                    pass
 
             if total_lines % 5000000 == 0:
                 print(f"  Processed {total_lines:,} lines | Matched {matched_peaks:,} candidate peaks...")
@@ -179,20 +191,37 @@ def main():
     print(f"{'Symbol':<12} {'Role':<15} {'Found Peaks':<15} {'Mean Signal':<12} {'Max Signal':<12}")
     print("-" * 70)
 
-    for item in CANDIDATE_DEFINITIONS:
-        sym = item["canonical"]
-        role = item["role"]
+    total_stab_peaks = 0
+    for sym in sorted(RBP_STABILIZERS):
+        role = "Stabilizer"
         cnt = counts_by_rbp[sym]
+        total_stab_peaks += cnt
         scores = scores_by_rbp[sym]
         mean_s = f"{sum(scores)/len(scores):.2f}" if scores else "-"
         max_s = f"{max(scores):.2f}" if scores else "-"
         print(f"{sym:<12} {role:<15} {cnt:<15,} {mean_s:<12} {max_s:<12}")
 
     print("-" * 70)
-    print(f"\nGenerated Filtered BED Files:")
-    print(f"1. All Candidates:         {all_out_path}")
-    print(f"2. Stabilizers Only:       {stab_out_path}")
-    print(f"3. Destabilizers Only:     {destab_out_path}")
+    total_destab_peaks = 0
+    for sym in sorted(RBP_DESTABILIZERS):
+        role = "Destabilizer"
+        cnt = counts_by_rbp[sym]
+        total_destab_peaks += cnt
+        scores = scores_by_rbp[sym]
+        mean_s = f"{sum(scores)/len(scores):.2f}" if scores else "-"
+        max_s = f"{max(scores):.2f}" if scores else "-"
+        print(f"{sym:<12} {role:<15} {cnt:<15,} {mean_s:<12} {max_s:<12}")
+
+    print("-" * 70)
+    print(f"Total Stabilizer Peaks:   {total_stab_peaks:,}")
+    print(f"Total Destabilizer Peaks: {total_destab_peaks:,}")
+    print(f"Total Curated Peaks:      {matched_peaks:,}")
+
+    print("\n" + "=" * 80)
+    print(f"Generated Filtered BED Files:")
+    print(f"1. Stabilizers Only:       {stab_out_path}")
+    print(f"2. Destabilizers Only:     {destab_out_path}")
+    print(f"3. All Curated Combined:   {all_out_path}")
     print("=" * 80)
 
 
