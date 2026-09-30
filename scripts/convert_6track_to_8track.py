@@ -23,6 +23,8 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoConfig
 
+from util import reset_peak_memory_stats, print_memory_profile
+
 
 def convert_6track_to_8track(
     base_model_name: str,
@@ -143,6 +145,7 @@ def convert_6track_to_8track(
     # 5. Verification forward pass
     print("\n[5/5] Running verification forward pass with dummy 8-track input...")
     dev = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
+    reset_peak_memory_stats(dev)
     model_8t.to(dev)
 
     dummy_seq_len = 128
@@ -158,6 +161,7 @@ def convert_6track_to_8track(
     print(f"      Unpooled output shape:     {tuple(unpooled.shape)} (expected: (2, {dummy_seq_len}, {d_model}))")
 
     assert rep.shape == (2, d_model), f"Shape mismatch: {rep.shape} vs (2, {d_model})"
+    print_memory_profile(device=dev, title="ORTHRUS 6-TO-8 TRACK CONVERSION SPEICHER-PROFILING")
     print("\n" + "=" * 70)
     print("SUCCESS: 8-Track Orthrus model created and verified!")
     print(f"You can now load it via:")

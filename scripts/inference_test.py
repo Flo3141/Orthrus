@@ -1,9 +1,11 @@
 import torch
 from transformers import AutoModel
+from util import reset_peak_memory_stats, print_memory_profile
 
 # 1. Select device (GPU if available, otherwise CPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
+reset_peak_memory_stats(device)
 
 # 2. Load pre-trained model from Hugging Face
 # (Variants: 'quietflamingo/orthrus-base-4-track' or 'quietflamingo/orthrus-large-4-track')
@@ -31,3 +33,5 @@ with torch.no_grad():
 print("Inference successful!")
 print("Pooled Embedding Shape:  ", embedding.shape)  # e.g. (1, 256)
 print("Unpooled Embedding Shape:", unpooled.shape)   # e.g. (1, length, 256)
+
+print_memory_profile(device=device, title="ORTHRUS INFERENCE TEST SPEICHER-PROFILING")

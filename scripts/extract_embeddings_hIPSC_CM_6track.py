@@ -17,6 +17,8 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModel
 
+from util import reset_peak_memory_stats, print_memory_profile
+
 
 def seq_to_one_hot(seq: str) -> np.ndarray:
     """
@@ -288,6 +290,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nUsing device: {device}")
+    reset_peak_memory_stats(device)
 
     # Extract metadata arrays
     transcript_ids = df["ensembl_transcript_id"].astype(str).values if "ensembl_transcript_id" in df.columns else np.array([""] * len(df))
@@ -407,6 +410,8 @@ def main():
     print("Successfully saved!")
     print(f"Embedding shape: {all_embeddings.shape}")
     print(f"Saved to:        {save_file}")
+
+    print_memory_profile(device=device, title="ORTHRUS 6-TRACK EMBEDDINGS SPEICHER-PROFILING")
 
 
 if __name__ == "__main__":

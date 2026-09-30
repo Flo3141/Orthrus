@@ -34,6 +34,8 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 from tqdm import tqdm
 from transformers import AutoModel
 
+from util import reset_peak_memory_stats, print_memory_profile
+
 # Headless backend for cluster servers without display
 import matplotlib
 matplotlib.use("Agg")
@@ -1236,6 +1238,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    reset_peak_memory_stats(device)
 
     # 1. Load multi-track NPZ dataset
     data_file = Path(args.data_path)
@@ -1437,6 +1440,16 @@ def main():
                 "std_val_pearson_r": float(np.std(val_rs)) if val_rs else None,
             }, f, indent=2)
         print(f"All folds summary saved to: {overall_summary_file}")
+
+    # Memory profiling summary
+    mem_prof = print_memory_profile(device=device, title="ORTHRUS 8-TRACK FINETUNING SPEICHER-PROFILING")
+    mem_profile_file = output_dir / "memory_profile.json"
+    try:
+        with open(mem_profile_file, "w") as f:
+            json.dump(mem_prof, f, indent=2)
+        print(f"Memory profile saved to: {mem_profile_file}")
+    except Exception as e:
+        print(f"Notice: Could not write {mem_profile_file}: {e}")
 
 
 if __name__ == "__main__":

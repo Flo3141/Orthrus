@@ -16,6 +16,8 @@ from tqdm import tqdm
 from transformers import AutoModel
 import pandas as pd
 
+from util import reset_peak_memory_stats, print_memory_profile
+
 def extract_embeddings_for_8track(
     tracks: list,
     model: torch.nn.Module,
@@ -188,6 +190,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nUsing device: {device}")
+    reset_peak_memory_stats(device)
 
     # 3. Extract embeddings
     if is_4fold:
@@ -321,6 +324,8 @@ def main():
     print(f"Successfully saved! Embedding array shape: {all_embeddings.shape}")
     print(f"Saved to:        {save_file}")
     print("=" * 70 + "\n")
+
+    print_memory_profile(device=device, title="ORTHRUS 8-TRACK EMBEDDINGS SPEICHER-PROFILING")
 
 
 if __name__ == "__main__":

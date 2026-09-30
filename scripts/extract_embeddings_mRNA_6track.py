@@ -14,6 +14,8 @@ from tqdm import tqdm
 from transformers import AutoModel
 import mrna_bench as mb
 
+from util import reset_peak_memory_stats, print_memory_profile
+
 
 def seq_to_one_hot(seq: str) -> np.ndarray:
     """
@@ -213,6 +215,7 @@ def main():
     # Initialize device & model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    reset_peak_memory_stats(device)
     
     print(f"Loading Orthrus 6-track model '{args.model_name}'...")
     model = AutoModel.from_pretrained(args.model_name, trust_remote_code=True)
@@ -263,6 +266,7 @@ def main():
         print(f"Successfully saved! Embedding shape: {result['embeddings'].shape}")
 
     print("\nAll embeddings were successfully extracted and saved.")
+    print_memory_profile(device=device, title="ORTHRUS MRNA EMBEDDINGS SPEICHER-PROFILING")
 
 
 if __name__ == "__main__":
