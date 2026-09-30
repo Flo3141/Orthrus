@@ -294,6 +294,489 @@ def save_csv_log(history: list, csv_path: Path):
             })
 
 
+# =============================================================================
+# 3b. Explainable AI (xAI): Channel Saliency, Ablation & 2D Sequence Heatmaps
+# =============================================================================
+
+CHANNEL_NAMES = [
+    "A", "C", "G", "U",
+    "CDS", "Splice",
+    "RBP_Stabilizer", "RBP_Destabilizer",
+]
+
+CHANNEL_COLORS = [
+    "#4e79a7",  # A (Blue)
+    "#f28e2c",  # C (Orange)
+    "#59a14f",  # G (Green)
+    "#e15759",  # U (Red)
+    "#b07aa1",  # CDS (Purple)
+    "#76b7b2",  # Splice (Cyan)
+    "#2ca02c",  # RBP Stabilizer (Green)
+    "#d62728",  # RBP Destabilizer (Crimson)
+]
+
+
+def compute_embedding_norms(model: nn.Module) -> list:
+    """
+    Computes L2 norm of the learned input embedding weights for each channel 0..7.
+    Shows the direct parametric weight assigned to each track.
+    """
+    for name, param in model.backbone.named_parameters():
+        if "embedding" in name and "weight" in name:
+            w = param.detach()
+            norms = []
+            for c in range(8):
+                if w.ndim == 2:
+                    col = w[:, c]
+                elif w.ndim == 3:
+                    col = w[:, c, :]
+                else:
+                    col = w[c]
+                norms.append(float(torch.norm(col.float(), p=2).item()))
+            return norms
+    return [0.0] * 8
+
+
+def compute_channel_importance_gradients(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    max_samples: int = 500,
+    amp_dtype: torch.dtype = torch.bfloat16,
+) -> dict:
+    """
+    Computes global channel attribution across test samples using Input * Gradient (Feature Saliency).
+    Returns mean absolute attribution per channel and percentage contribution.
+    """
+    model.eval()
+    total_attribution = torch.zeros(8, device=device, dtype=torch.float64)
+    total_valid_nt = 0
+    samples_processed = 0
+
+    pbar = tqdm(dataloader, desc="[xAI] Computing Input*Gradient Channel Saliency")
+    for batch in pbar:
+        if samples_processed >= max_samples:
+            break
+
+        x = batch["x"].to(device).clone().detach().requires_grad_(True)
+        lengths = batch["lengths"].to(device)
+        b_size = x.shape[0]
+
+        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda" and amp_dtype != torch.float32)):
+            preds = model(x, lengths)
+            loss = preds.sum()
+
+        model.zero_grad()
+        loss.backward()
+
+        if x.grad is not None:
+            sal = torch.abs(x.detach() * x.grad.detach())
+            for i in range(b_size):
+                l_i = lengths[i].item()
+                total_attribution += sal[i, :l_i, :].sum(dim=0).to(torch.float64)
+                total_valid_nt += l_i
+                samples_processed += 1
+                if samples_processed >= max_samples:
+                    break
+
+    mean_attribution = (total_attribution / max(1, total_valid_nt)).cpu().numpy()
+    sum_attr = float(mean_attribution.sum())
+    pct_attribution = (mean_attribution / sum_attr * 100.0) if sum_attr > 0 else np.zeros(8)
+
+    results = {}
+    for idx, name in enumerate(CHANNEL_NAMES):
+        results[name] = {
+            "channel_index": idx,
+            "mean_attribution": float(mean_attribution[idx]),
+            "pct_attribution": float(pct_attribution[idx]),
+        }
+    return results
+
+
+def compute_channel_ablation(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    loss_fn: nn.Module,
+    baseline_metrics: dict,
+    amp_dtype: torch.dtype = torch.bfloat16,
+) -> dict:
+    """
+    Evaluates model performance drop when each channel is systematically ablated (zeroed out).
+    Delta r = baseline_r - ablated_r. A higher drop indicates greater reliance on that channel.
+    """
+    model.eval()
+    baseline_r = baseline_metrics["pearson_r"]
+    baseline_rho = baseline_metrics["spearman_rho"]
+    baseline_mse = baseline_metrics["mse"]
+
+    ablation_results = {}
+
+    for c_idx, c_name in enumerate(tqdm(CHANNEL_NAMES, desc="[xAI] Computing Channel Ablation Impact")):
+        total_loss = 0.0
+        all_preds = []
+        all_targets = []
+
+        with torch.no_grad():
+            for batch in dataloader:
+                x = batch["x"].to(device).clone()
+                lengths = batch["lengths"].to(device)
+                targets = batch["targets"].to(device)
+
+                # Systematically zero out channel c_idx
+                x[:, :, c_idx] = 0.0
+
+                with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda" and amp_dtype != torch.float32)):
+                    preds = model(x, lengths)
+                    loss = loss_fn(preds, targets)
+
+                if not (torch.isnan(loss) or torch.isinf(loss)):
+                    total_loss += loss.item() * len(targets)
+                all_preds.extend(preds.detach().cpu().float().numpy())
+                all_targets.extend(targets.detach().cpu().float().numpy())
+
+        y_true = np.array(all_targets)
+        y_pred = np.array(all_preds)
+        valid_mask = ~np.isnan(y_pred) & ~np.isnan(y_true)
+        if valid_mask.sum() > 2:
+            p_corr, _ = pearsonr(y_true[valid_mask], y_pred[valid_mask])
+            s_corr, _ = spearmanr(y_true[valid_mask], y_pred[valid_mask])
+        else:
+            p_corr, s_corr = 0.0, 0.0
+        mse = float(mean_squared_error(y_true, y_pred))
+
+        drop_r = float(baseline_r - p_corr)
+        drop_rho = float(baseline_rho - s_corr)
+        delta_mse = float(mse - baseline_mse)
+
+        ablation_results[c_name] = {
+            "channel_index": c_idx,
+            "ablated_pearson_r": float(p_corr),
+            "drop_pearson_r": drop_r,
+            "ablated_spearman_rho": float(s_corr),
+            "drop_spearman_rho": drop_rho,
+            "ablated_mse": mse,
+            "delta_mse": delta_mse,
+        }
+
+    return ablation_results
+
+
+def plot_channel_importance_summary(
+    grad_results: dict,
+    ablation_results: dict,
+    embedding_norms: list,
+    output_png: Path,
+):
+    """
+    Plots a 3-panel publication-grade summary of channel importance:
+    1. Input * Gradient Attribution (% of total)
+    2. Channel Ablation Drop in Pearson r (Delta r)
+    3. Embedding Weight L2 Norms
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
+
+    names = CHANNEL_NAMES
+    colors = CHANNEL_COLORS
+
+    # 1. Gradient Attribution
+    grad_pcts = [grad_results[n]["pct_attribution"] for n in names]
+    axes[0].bar(range(len(names)), grad_pcts, color=colors, edgecolor="black", linewidth=0.8)
+    axes[0].set_title("Feature Saliency (Input * Grad)", fontsize=13, fontweight="bold")
+    axes[0].set_ylabel("Attribution Share (%)", fontsize=11, fontweight="bold")
+    axes[0].set_xticks(range(len(names)))
+    axes[0].set_xticklabels(names, rotation=35, ha="right", fontsize=10)
+    axes[0].grid(axis="y", alpha=0.3)
+    for i, h in enumerate(grad_pcts):
+        axes[0].annotate(f"{h:.1f}%",
+                         xy=(i, h),
+                         xytext=(0, 3), textcoords="offset points",
+                         ha="center", va="bottom", fontsize=9, fontweight="bold")
+
+    # 2. Channel Ablation Delta r
+    ablation_drops = [ablation_results[n]["drop_pearson_r"] for n in names]
+    axes[1].bar(range(len(names)), ablation_drops, color=colors, edgecolor="black", linewidth=0.8)
+    axes[1].set_title("Channel Ablation Impact", fontsize=13, fontweight="bold")
+    axes[1].set_ylabel("Drop in Pearson r (Delta r)", fontsize=11, fontweight="bold")
+    axes[1].set_xticks(range(len(names)))
+    axes[1].set_xticklabels(names, rotation=35, ha="right", fontsize=10)
+    axes[1].grid(axis="y", alpha=0.3)
+    axes[1].axhline(0, color="gray", linestyle="--", linewidth=0.8)
+    for i, h in enumerate(ablation_drops):
+        va = "bottom" if h >= 0 else "top"
+        axes[1].annotate(f"{h:.3f}",
+                         xy=(i, h),
+                         xytext=(0, 3 if h >= 0 else -10), textcoords="offset points",
+                         ha="center", va=va, fontsize=9, fontweight="bold")
+
+    # 3. Embedding L2 Norms
+    axes[2].bar(range(len(names)), embedding_norms, color=colors, edgecolor="black", linewidth=0.8)
+    axes[2].set_title("Embedding Weight Norms", fontsize=13, fontweight="bold")
+    axes[2].set_ylabel("L2 Norm (||W[:, c]||)", fontsize=11, fontweight="bold")
+    axes[2].set_xticks(range(len(names)))
+    axes[2].set_xticklabels(names, rotation=35, ha="right", fontsize=10)
+    axes[2].grid(axis="y", alpha=0.3)
+    for i, h in enumerate(embedding_norms):
+        axes[2].annotate(f"{h:.2f}",
+                         xy=(i, h),
+                         xytext=(0, 3), textcoords="offset points",
+                         ha="center", va="bottom", fontsize=9, fontweight="bold")
+
+    plt.tight_layout()
+    fig.savefig(output_png, dpi=200)
+    pdf_path = output_png.with_suffix(".pdf")
+    fig.savefig(pdf_path)
+    plt.close(fig)
+    print(f"[xAI] Saved channel importance summary to: {output_png} and {pdf_path}")
+
+
+def generate_saliency_heatmaps(
+    model: nn.Module,
+    dataset: MultiTrackDataset,
+    device: torch.device,
+    output_dir: Path,
+    num_heatmaps: int = 5,
+    specific_tx_ids: str = None,
+):
+    """
+    Generates 2D Sequence Saliency Heatmaps (8 Channels x Position) for selected transcripts.
+    Prioritizes transcripts with active Stabilizer and Destabilizer RBP peaks to demonstrate functional focus.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    samples = dataset.samples
+
+    # Select candidates
+    selected_indices = []
+    if specific_tx_ids:
+        target_ids = {t.strip() for t in specific_tx_ids.split(",") if t.strip()}
+        for idx, s in enumerate(samples):
+            if s["tx_id"] in target_ids or s["tx_id"].split(".")[0] in target_ids:
+                selected_indices.append(idx)
+
+    if not selected_indices:
+        # Categorize candidates based on RBP signal presence
+        both_rbp = []
+        stab_only = []
+        destab_only = []
+        others = []
+
+        for idx, s in enumerate(samples):
+            has_s = bool(torch.any(s["track"][:, 6] > 0).item())
+            has_d = bool(torch.any(s["track"][:, 7] > 0).item())
+            if has_s and has_d:
+                both_rbp.append(idx)
+            elif has_s:
+                stab_only.append(idx)
+            elif has_d:
+                destab_only.append(idx)
+            else:
+                others.append(idx)
+
+        # Pick diverse set
+        for pool in [both_rbp, destab_only, stab_only, others]:
+            for idx in pool:
+                if len(selected_indices) >= num_heatmaps:
+                    break
+                if idx not in selected_indices:
+                    selected_indices.append(idx)
+            if len(selected_indices) >= num_heatmaps:
+                break
+
+    print(f"\n[xAI] Generating 2D Saliency Heatmaps for {len(selected_indices)} transcripts...")
+    heatmap_records = []
+
+    for idx in selected_indices:
+        sample = samples[idx]
+        tx_id = sample["tx_id"]
+        gene = sample["gene"]
+        seq_len = sample["length"]
+        target = sample["target"]
+
+        x = sample["track"].unsqueeze(0).to(device).clone().detach().requires_grad_(True)
+        length = torch.tensor([seq_len], dtype=torch.long, device=device)
+
+        model.eval()
+        model.zero_grad()
+        pred = model(x, length)
+        pred_val = float(pred.item())
+        pred.backward()
+
+        if x.grad is None:
+            continue
+
+        # Attribution: signed (x * grad)
+        grad = x.grad.detach()
+        signed_attr = (x.detach() * grad)[0, :seq_len, :].cpu().numpy()  # (L, 8)
+        x_raw = x.detach()[0, :seq_len, :].cpu().numpy()  # (L, 8)
+
+        attr_t = signed_attr.T  # (8, L)
+
+        # Calculate symmetric color limits based on 99th percentile of attribution
+        vlim = float(np.percentile(np.abs(attr_t), 99.0))
+        if vlim <= 1e-6:
+            vlim = float(np.max(np.abs(attr_t)))
+        if vlim <= 1e-6:
+            vlim = 1.0
+
+        # Plot 3-panel figure: 2D Heatmap, Input Annotations, 1D Importance Profile
+        fig, axes = plt.subplots(3, 1, figsize=(16, 9), gridspec_kw={"height_ratios": [3.2, 1.2, 1.4]}, sharex=True)
+
+        # 1. 2D Saliency Heatmap
+        im = axes[0].imshow(
+            attr_t,
+            aspect="auto",
+            cmap="coolwarm",
+            vmin=-vlim,
+            vmax=vlim,
+            interpolation="nearest",
+        )
+        axes[0].set_yticks(range(8))
+        axes[0].set_yticklabels(CHANNEL_NAMES, fontsize=10, fontweight="bold")
+        axes[0].set_title(
+            f"Transcript: {tx_id} ({gene}) | Length: {seq_len} nt | True HL: {target:.2f} | Pred HL: {pred_val:.2f}",
+            fontsize=13, fontweight="bold", pad=10
+        )
+        cbar = fig.colorbar(im, ax=axes[0], orientation="vertical", pad=0.015, fraction=0.02)
+        cbar.set_label("Attribution (x * Grad)\nBlue: Destabilizing | Red: Stabilizing", fontsize=9, fontweight="bold")
+
+        # 2. Input Track Annotations
+        positions = np.arange(seq_len)
+        axes[1].fill_between(positions, 0, x_raw[:, 4], color="#b07aa1", alpha=0.35, label="CDS (Ch 4)")
+        if np.any(x_raw[:, 5] > 0):
+            axes[1].plot(positions, x_raw[:, 5], color="#76b7b2", lw=1.2, label="Splice Sites (Ch 5)")
+        if np.any(x_raw[:, 6] > 0):
+            axes[1].fill_between(positions, 0, x_raw[:, 6], color="#2ca02c", alpha=0.6, label="RBP Stabilizer (Ch 6)")
+        if np.any(x_raw[:, 7] > 0):
+            axes[1].fill_between(positions, 0, x_raw[:, 7], color="#d62728", alpha=0.6, label="RBP Destabilizer (Ch 7)")
+        axes[1].set_ylabel("Input Signals", fontsize=10, fontweight="bold")
+        axes[1].set_ylim(-0.05, 1.1)
+        axes[1].legend(loc="upper right", fontsize=8.5, framealpha=0.85)
+        axes[1].grid(True, alpha=0.3)
+
+        # 3. 1D Integrated Position Importance Profile
+        # Sum of absolute attributions across all 8 channels
+        pos_importance = np.sum(np.abs(signed_attr), axis=1)
+        axes[2].fill_between(positions, 0, pos_importance, color="#4a148c", alpha=0.45)
+        axes[2].plot(positions, pos_importance, color="#4a148c", lw=1.2, label="Positional Impact (Sum |Attr|)")
+        # Also net attribution (dashed line)
+        net_attr = np.sum(signed_attr, axis=1)
+        axes[2].plot(positions, net_attr, color="#ff7f0e", lw=1.0, linestyle="--", label="Net Direction (Sum Attr)")
+        axes[2].axhline(0, color="gray", linestyle=":", lw=0.8)
+        axes[2].set_ylabel("1D Saliency", fontsize=10, fontweight="bold")
+        axes[2].set_xlabel("Nucleotide Position along mRNA (5' -> 3')", fontsize=11, fontweight="bold")
+        axes[2].legend(loc="upper right", fontsize=8.5, framealpha=0.85)
+        axes[2].grid(True, alpha=0.3)
+
+        clean_tx = tx_id.replace(".", "_")
+        clean_gene = gene.replace(" ", "_") if gene else "unknown"
+        png_path = output_dir / f"heatmap_{clean_tx}_{clean_gene}.png"
+        pdf_path = output_dir / f"heatmap_{clean_tx}_{clean_gene}.pdf"
+
+        plt.tight_layout()
+        fig.savefig(png_path, dpi=200)
+        fig.savefig(pdf_path)
+        plt.close(fig)
+
+        heatmap_records.append({
+            "transcript_id": tx_id,
+            "gene": gene,
+            "length": seq_len,
+            "target": target,
+            "prediction": pred_val,
+            "png_file": str(png_path.name),
+            "pdf_file": str(pdf_path.name),
+        })
+
+    print(f"[xAI] Saved {len(heatmap_records)} 2D Saliency Heatmaps to: {output_dir}")
+    return heatmap_records
+
+
+def run_xai_analysis(
+    model: nn.Module,
+    test_loader: DataLoader,
+    device: torch.device,
+    loss_fn: nn.Module,
+    test_metrics: dict,
+    output_dir: Path,
+    num_heatmaps: int = 5,
+    specific_tx_ids: str = None,
+    amp_dtype: torch.dtype = torch.bfloat16,
+) -> dict:
+    """
+    Master xAI evaluation orchestrator:
+    - 1. Embedding Weight L2-Norms
+    - 2. Input * Gradient Channel Saliency Attribution (%)
+    - 3. Systematic Channel Ablation (Drop in Pearson r / Delta r)
+    - 4. Summary Bar Charts (PNG & PDF)
+    - 5. 2D Sequence Saliency Heatmaps (8 Channels x Position)
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Embedding norms
+    norms = compute_embedding_norms(model)
+
+    # 2. Input * Gradient attribution
+    grad_results = compute_channel_importance_gradients(
+        model=model,
+        dataloader=test_loader,
+        device=device,
+        max_samples=500,
+        amp_dtype=amp_dtype,
+    )
+
+    # 3. Channel ablation
+    ablation_results = compute_channel_ablation(
+        model=model,
+        dataloader=test_loader,
+        device=device,
+        loss_fn=loss_fn,
+        baseline_metrics=test_metrics,
+        amp_dtype=amp_dtype,
+    )
+
+    # Print summary table
+    print("\n" + "=" * 80)
+    print(f"{'Channel':<18} {'Input*Grad (%)':<16} {'Ablation Drop (Delta r)':<25} {'Embedding Norm':<15}")
+    print("=" * 80)
+    for idx, name in enumerate(CHANNEL_NAMES):
+        g_pct = grad_results[name]["pct_attribution"]
+        drop_r = ablation_results[name]["drop_pearson_r"]
+        e_norm = norms[idx]
+        print(f"{name:<18} {g_pct:>10.2f}% {drop_r:>20.4f} {e_norm:>16.4f}")
+    print("=" * 80)
+
+    # 4. Summary plots
+    summary_plot = output_dir / "xai_channel_summary.png"
+    plot_channel_importance_summary(grad_results, ablation_results, norms, summary_plot)
+
+    # 5. 2D Sequence Heatmaps
+    heatmaps_dir = output_dir / "xai_heatmaps"
+    heatmap_records = generate_saliency_heatmaps(
+        model=model,
+        dataset=test_loader.dataset,
+        device=device,
+        output_dir=heatmaps_dir,
+        num_heatmaps=num_heatmaps,
+        specific_tx_ids=specific_tx_ids,
+    )
+
+    summary = {
+        "channel_names": CHANNEL_NAMES,
+        "embedding_norms": {name: norms[i] for i, name in enumerate(CHANNEL_NAMES)},
+        "gradient_attribution": grad_results,
+        "channel_ablation": ablation_results,
+        "heatmaps": heatmap_records,
+    }
+
+    summary_file = output_dir / "xai_channel_summary.json"
+    with open(summary_file, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[xAI] Saved comprehensive xAI summary report to: {summary_file}")
+
+    return summary
+
+
 def train_model(
     model: nn.Module,
     train_loader: DataLoader,
@@ -310,6 +793,9 @@ def train_model(
     resume: bool = True,
     loss_fn_name: str = "huber",
     max_grad_norm: float = 1.0,
+    compute_xai: bool = True,
+    xai_num_heatmaps: int = 5,
+    xai_tx_ids: str = None,
 ):
     # Loss Function: Huber loss prevents gradient explosions from outliers
     if loss_fn_name == "huber":
@@ -560,6 +1046,29 @@ def train_model(
                 print(f"  {k:20s}: {v:.4f}")
         print("=" * 60)
 
+        # 4. Run xAI Analysis Pipeline if enabled
+        xai_summary = None
+        if compute_xai:
+            print("\n" + "=" * 60)
+            print("                 xAI ANALYSIS PIPELINE                 ")
+            print("=" * 60)
+            try:
+                xai_summary = run_xai_analysis(
+                    model=model,
+                    test_loader=test_loader,
+                    device=device,
+                    loss_fn=loss_fn,
+                    test_metrics=test_metrics,
+                    output_dir=output_dir,
+                    num_heatmaps=xai_num_heatmaps,
+                    specific_tx_ids=xai_tx_ids,
+                    amp_dtype=amp_dtype,
+                )
+            except Exception as e:
+                print(f"[Warning] xAI analysis encountered an error: {e}")
+                import traceback
+                traceback.print_exc()
+
         # Save training summary
         summary_file = output_dir / "training_summary.json"
         summary_data = {
@@ -567,6 +1076,7 @@ def train_model(
             "best_epoch": best_epoch,
             "best_val_pearson_r": best_val_r,
             "test_metrics": test_metrics,
+            "xai_summary": xai_summary,
             "history": history,
         }
         with open(summary_file, "w") as f:
@@ -577,6 +1087,7 @@ def train_model(
         "best_epoch": best_epoch,
         "best_val_pearson_r": best_val_r,
         "test_metrics": test_metrics if (test_loader is not None and best_ckpt_path.exists()) else None,
+        "xai_summary": xai_summary if (test_loader is not None and best_ckpt_path.exists() and compute_xai) else None,
     }
 
 
@@ -692,6 +1203,24 @@ def main():
         type=float,
         default=1.0,
         help="Maximum gradient norm for gradient clipping (default: 1.0)",
+    )
+    parser.add_argument(
+        "--compute_xai",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run xAI analyses (Input*Grad, Channel Ablation, Embedding Norms, 2D Heatmaps) after training (default: True)",
+    )
+    parser.add_argument(
+        "--xai_num_heatmaps",
+        type=int,
+        default=5,
+        help="Number of representative transcripts with RBP peaks to generate 2D saliency heatmaps for (default: 5)",
+    )
+    parser.add_argument(
+        "--xai_tx_ids",
+        type=str,
+        default=None,
+        help="Optional comma-separated transcript IDs to generate 2D saliency heatmaps for",
     )
     args = parser.parse_args()
 
@@ -876,6 +1405,9 @@ def main():
             resume=args.resume,
             loss_fn_name=args.loss_fn,
             max_grad_norm=args.max_grad_norm,
+            compute_xai=args.compute_xai,
+            xai_num_heatmaps=args.xai_num_heatmaps,
+            xai_tx_ids=args.xai_tx_ids,
         )
         all_fold_summaries[fold_id] = fold_summary
 
