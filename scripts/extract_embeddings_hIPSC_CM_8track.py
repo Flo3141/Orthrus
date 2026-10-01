@@ -50,8 +50,8 @@ def extract_embeddings_for_8track(
     if truncated_count > 0:
         print(f"Notice: {truncated_count} sequences were truncated to {max_length} bp.")
 
-    # Sort by length to minimize batch padding
-    sorted_samples = sorted(sample_data, key=lambda s: s["length"])
+    # Sort by length descending to check peak VRAM early and minimize batch padding
+    sorted_samples = sorted(sample_data, key=lambda s: s["length"], reverse=True)
     embeddings_list = [None] * len(sample_data)
 
     for i in tqdm(range(0, len(sorted_samples), batch_size), desc=desc):
@@ -128,6 +128,12 @@ def main():
         default="auto",
         help="Whether the checkpoint is fine-tuned ('auto', 'true', or 'false')",
     )
+    parser.add_argument(
+        "--start_fresh",
+        action="store_true",
+        default=False,
+        help="Ignore existing checkpoints or completed output files and force extraction from scratch",
+    )
     args = parser.parse_args()
 
     data_file = Path(args.data_path)
@@ -160,6 +166,26 @@ def main():
     norm_val = str(npz_data.get("normalization", "none")).strip().lower()
     if norm_val and norm_val not in ["none", "nan"] and not save_file.stem.endswith(f"_{norm_val}"):
         save_file = save_file.parent / f"{save_file.stem}_{norm_val}{save_file.suffix}"
+
+    checkpoint_file = output_dir / f".ckpt_{save_file.stem}.npz"
+
+    # Check if final archive already exists
+    if save_file.exists() and not args.start_fresh:
+        try:
+            with np.load(save_file) as f_existing:
+                if "embeddings" in f_existing and len(f_existing["embeddings"]) == len(npz_data["tracks"]):
+                    print(f"[*] Final embedding archive '{save_file.name}' already exists and is complete ({len(f_existing['embeddings'])} samples).")
+                    print(f"    Skipping extraction. (Pass --start_fresh to force recomputing from scratch).")
+                    return
+        except Exception:
+            print(f"[!] Warning: Existing file '{save_file.name}' could not be verified. Proceeding with extraction...")
+
+    if args.start_fresh and checkpoint_file.exists():
+        try:
+            checkpoint_file.unlink()
+            print(f"[*] --start_fresh active: Removed old checkpoint '{checkpoint_file.name}'.")
+        except Exception as e:
+            print(f"[!] Warning: Could not remove old checkpoint ({e}).")
 
     print("=" * 70)
     print("         Orthrus 8-Track Embedding Extraction Pipeline          ")
@@ -230,7 +256,24 @@ def main():
 
         print(f"\n4-Fold CV Extraction: Total Samples = {n_samples}, Test Samples [8, 9] = {len(test_idx)}")
 
+        completed_folds = set()
+        if not args.start_fresh and checkpoint_file.exists():
+            print(f"[*] Found checkpoint: {checkpoint_file}")
+            try:
+                with np.load(checkpoint_file, allow_pickle=True) as ckpt:
+                    all_embeddings = ckpt["embeddings"].copy()
+                    fold_assignment = ckpt["fold_assignment"].copy()
+                    test_accum = ckpt["test_accum"].copy()
+                    completed_folds = set(ckpt["completed_folds"].tolist())
+                print(f"[*] Resuming from checkpoint: Folds {sorted(completed_folds)} already completed.")
+            except Exception as e:
+                print(f"[!] Warning: Failed to load checkpoint ({e}). Starting folds from scratch.")
+
         for k in range(4):
+            if k in completed_folds:
+                print(f"\n--- [Fold {k}] Already completed in checkpoint. Skipping ---")
+                continue
+
             val_splits = fold_val_splits[k]
             val_idx = np.where(np.isin(sample_splits, val_splits))[0]
             val_tracks = [tracks[i] for i in val_idx]
@@ -269,6 +312,25 @@ def main():
             del fold_model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+            # Save checkpoint after completing fold
+            completed_folds.add(k)
+            ckpt_dict = {
+                "embeddings": all_embeddings,
+                "fold_assignment": fold_assignment,
+                "test_accum": test_accum,
+                "completed_folds": np.array(list(completed_folds), dtype=np.int32),
+            }
+            tmp_ckpt = checkpoint_file.with_suffix(".tmp.npz")
+            np.savez_compressed(tmp_ckpt, **ckpt_dict)
+            tmp_ckpt.replace(checkpoint_file)
+            print(f"[✓] Checkpoint saved after Fold {k} (completed: {sorted(completed_folds)}).")
+
+        if checkpoint_file.exists():
+            try:
+                checkpoint_file.unlink()
+            except OSError:
+                pass
 
         print("\nComputing Ensemble Mean Embedding for Test Set [8, 9] across all 4 folds...")
         all_embeddings[test_idx] = test_accum / 4.0
