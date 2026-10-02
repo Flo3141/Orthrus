@@ -164,6 +164,13 @@ def load_hIPSC_CM_npz(file_path: Path, target_col: str) -> dict:
 
     is_4fold_cv = bool(data.get("is_4fold_cv", False)) or ("fold_assignment" in data)
 
+    track_type_data = None
+    if "track_type" in data:
+        try:
+            track_type_data = str(data["track_type"]).strip().lower()
+        except Exception:
+            pass
+
     return {
         "embeddings": data["embeddings"],
         "targets": targets.astype(np.float32),
@@ -175,6 +182,7 @@ def load_hIPSC_CM_npz(file_path: Path, target_col: str) -> dict:
         "is_4fold_cv": is_4fold_cv,
         "archive_keys": available_keys,
         "raw_half_life": raw_half_life,
+        "track_type": track_type_data,
     }
 
 
@@ -185,7 +193,7 @@ def resolve_track_and_normalization(
     user_normalization: str = "auto",
 ) -> tuple:
     """
-    Infers the track type ('6track' vs '8track') and normalization scheme.
+    Infers the track type ('6track' vs '8track' vs '8track_2rbp') and normalization scheme.
     Returns: (track_type, normalization)
     """
     path_str = str(file_path).lower()
@@ -194,8 +202,17 @@ def resolve_track_and_normalization(
     # 1. Resolve track type
     if user_track_type != "auto":
         track_type = user_track_type.lower()
+        if track_type in ["8track-2rbp", "8_track_2rbp", "2rbp"]:
+            track_type = "8track_2rbp"
     else:
-        if "8track" in path_str or "8_track" in path_str or "8-track" in path_str:
+        track_from_data = data.get("track_type")
+        if track_from_data and str(track_from_data).lower() in ["8track_2rbp", "2rbp"]:
+            track_type = "8track_2rbp"
+        elif "8track_2rbp" in path_str or "8_track_2rbp" in path_str or "8track-2rbp" in path_str or "2rbp" in path_str:
+            track_type = "8track_2rbp"
+        elif track_from_data and str(track_from_data).lower() in ["8track", "6track"]:
+            track_type = str(track_from_data).lower()
+        elif "8track" in path_str or "8_track" in path_str or "8-track" in path_str:
             track_type = "8track"
         elif "6track" in path_str or "6_track" in path_str or "6-track" in path_str:
             track_type = "6track"
@@ -206,7 +223,7 @@ def resolve_track_and_normalization(
         else:
             track_type = "6track"
 
-    # 2. Resolve normalization (for 8track)
+    # 2. Resolve normalization (for 8track / 8track_2rbp)
     if user_normalization != "auto":
         normalization = user_normalization.lower()
     else:
@@ -233,8 +250,9 @@ def resolve_output_dir(
 ) -> Path:
     """
     Constructs the structured output folder:
-    - 6-track:  <base_output_dir>/6track/pretrained or <base_output_dir>/6track/finetuned
-    - 8-track:  <base_output_dir>/8track/<normalization>
+    - 6-track:      <base_output_dir>/6track/pretrained or <base_output_dir>/6track/finetuned
+    - 8-track:      <base_output_dir>/8track/<normalization>
+    - 8-track 2rbp: <base_output_dir>/8track_2rbp/<normalization>
     Avoids redundant nesting if the user already passed the full subfolder path.
     """
     norm_clean = normalization.lower().strip() if normalization else "none"
@@ -250,6 +268,16 @@ def resolve_output_dir(
             target_dir = base_output_dir / variant
         else:
             target_dir = base_output_dir / "6track" / variant
+    elif track_type == "8track_2rbp":
+        if (
+            base_output_dir.name.lower() == norm_clean
+            and base_output_dir.parent.name.lower() == "8track_2rbp"
+        ):
+            target_dir = base_output_dir
+        elif base_output_dir.name.lower() == "8track_2rbp":
+            target_dir = base_output_dir / norm_clean
+        else:
+            target_dir = base_output_dir / "8track_2rbp" / norm_clean
     else:  # 8track
         if (
             base_output_dir.name.lower() == norm_clean
@@ -278,15 +306,15 @@ def parse_args():
     parser.add_argument(
         "--track_type",
         type=str,
-        choices=["auto", "6track", "8track"],
+        choices=["auto", "6track", "8track", "8track_2rbp"],
         default="auto",
-        help="Track representation type ('6track', '8track', or 'auto' to infer from embeddings file)",
+        help="Track representation type ('6track', '8track', '8track_2rbp', or 'auto' to infer from embeddings file)",
     )
     parser.add_argument(
         "--normalization",
         type=str,
         default="auto",
-        help="Normalization method for 8-track ('none', 'minmax', 'log', or 'auto' to infer from file)",
+        help="Normalization method for 8-track / 8track_2rbp ('none', 'minmax', 'log', or 'auto' to infer from file)",
     )
     parser.add_argument(
         "--splits_lookup_path",
@@ -298,7 +326,7 @@ def parse_args():
         "--output_dir",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/results/Orthrus/hIPSC_CM",
-        help="Base output directory (subfolders '6track' or '8track/<normalization>' will be created automatically)",
+        help="Base output directory (subfolders '6track', '8track/<normalization>', or '8track_2rbp/<normalization>' will be created automatically)",
     )
     parser.add_argument(
         "--target_col",
@@ -387,7 +415,7 @@ def main():
     print("=" * 75)
     print(f"Embeddings file:    {emb_path}")
     print(f"Track type:         {track_type.upper()}")
-    if track_type == "8track":
+    if track_type in ["8track", "8track_2rbp"]:
         print(f"Normalization:      {normalization.upper()}")
     elif track_type == "6track":
         print(f"Model variant:      {'Fine-Tuned' if is_finetuned else 'Pretrained Base'}")
@@ -714,7 +742,7 @@ def main():
         "track_type": track_type,
         "is_finetuned": is_finetuned,
         "is_4fold_cv": is_4fold_cv,
-        "normalization": normalization if track_type == "8track" else None,
+        "normalization": normalization if track_type in ["8track", "8track_2rbp"] else None,
         "target_col": args.target_col,
         "embeddings_path": str(emb_path),
         "split_mechanism": "lookup_10folds",
@@ -745,7 +773,9 @@ def main():
     # 4. Save scatter plot (y_true vs. y_pred)
     if args.plot:
         try:
-            if track_type == "8track":
+            if track_type == "8track_2rbp":
+                emb_label = f"8-Track 2-RBP ({normalization.upper()})"
+            elif track_type == "8track":
                 emb_label = f"8-Track ({normalization.upper()})"
             elif is_finetuned:
                 emb_label = "6-Track (Fine-Tuned)"
