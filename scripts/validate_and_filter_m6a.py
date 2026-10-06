@@ -122,34 +122,29 @@ def load_and_filter_dmr(
     if not os.path.exists(dmr_path):
         raise FileNotFoundError(f"DMR file not found at: {dmr_path}")
 
-    # Read tab-separated DMR file, skipping comment lines
+    # Read tab-separated DMR file (header begins with '#chrom')
     df_dmr = pd.read_csv(
         dmr_path,
         sep="\t",
-        comment="#",
-        names=[
-            "chrom", "start", "end", "name", "score", "strand",
-            "a_counts", "a_total", "b_counts", "b_total",
-            "a_mod_percentages", "b_mod_percentages",
-            "a_pct_modified", "b_pct_modified",
-            "map_pvalue", "effect_size",
-            "balanced_map_pvalue", "balanced_effect_size",
-            "pct_a_samples", "pct_b_samples",
-            "replicate_map_pvalues", "replicate_effect_sizes",
-            "cohen_h", "cohen_h_low", "cohen_h_high"
-        ] if False else None,  # Will auto-detect header if present
         low_memory=False
     )
 
-    # Rename first column if it contains '#chrom'
-    if df_dmr.columns[0].startswith("#"):
-        df_dmr.rename(columns={df_dmr.columns[0]: "chrom"}, inplace=True)
+    # Clean up column names: strip leading '#' and whitespace
+    df_dmr.columns = [str(c).lstrip("#").strip() for c in df_dmr.columns]
+
+    if "chrom" not in df_dmr.columns:
+        raise KeyError(
+            f"Could not find 'chrom' column in DMR file. Detected columns: {list(df_dmr.columns)}"
+        )
+
+    # Remove any internal comment rows if present
+    df_dmr = df_dmr[~df_dmr["chrom"].astype(str).str.startswith("#")].copy()
 
     total_sites = len(df_dmr)
     print(f"      Total DMR candidate sites loaded: {total_sites:,}")
 
     # Normalize chromosome strings
-    df_dmr["chrom"] = df_dmr["chrom"].astype(str).apply(normalize_chrom)
+    df_dmr["chrom"] = df_dmr["chrom"].astype(str).str.replace(r"\.0$", "", regex=True).apply(normalize_chrom)
     df_dmr["start"] = pd.to_numeric(df_dmr["start"], errors="coerce")
     df_dmr["end"] = pd.to_numeric(df_dmr["end"], errors="coerce")
     df_dmr["effect_size"] = pd.to_numeric(df_dmr["effect_size"], errors="coerce")
@@ -193,9 +188,11 @@ def load_and_filter_dmr(
           f"({len(df_dmr_validated)/max(1, total_sites):.1%})")
 
     # Create coordinate lookup key: (chrom, start, strand)
+    df_dmr_validated.dropna(subset=["chrom", "start", "strand"], inplace=True)
+    df_dmr_validated["start"] = df_dmr_validated["start"].astype(np.int64)
     df_dmr_validated["site_key"] = (
         df_dmr_validated["chrom"] + ":" +
-        df_dmr_validated["start"].astype(int).astype(str) + ":" +
+        df_dmr_validated["start"].astype(str) + ":" +
         df_dmr_validated["strand"]
     )
 
@@ -236,10 +233,13 @@ def load_and_aggregate_ctrl_beds(
     total_calls = len(df_all_ctrl)
     print(f"      Total raw individual replicate calls across all files: {total_calls:,}")
 
+    df_all_ctrl.dropna(subset=["Chr", "Gstart", "Strand"], inplace=True)
+    df_all_ctrl["Gstart"] = df_all_ctrl["Gstart"].astype(np.int64)
+
     # Create site key for genomic location
     df_all_ctrl["site_key"] = (
         df_all_ctrl["Chr"] + ":" +
-        df_all_ctrl["Gstart"].astype(int).astype(str) + ":" +
+        df_all_ctrl["Gstart"].astype(str) + ":" +
         df_all_ctrl["Strand"]
     )
 
