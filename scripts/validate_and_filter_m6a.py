@@ -339,62 +339,80 @@ def check_drach_motifs(
         df_sites["is_drach"] = False
         return df_sites, {"drach_percentage": 0.0}
 
+# =============================================================================
+# 5. DRACH Motif Validation (Genome Reference Check)
+# =============================================================================
+
+def check_drach_motifs(
+    df_sites: pd.DataFrame,
+    fasta_path: Optional[str] = None
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """
+    Extracts 5-mer sequences from reference genome FASTA and checks for DRACH motif using pysam.
+    Raises ImportError if pysam is not installed.
+    """
+    if not fasta_path or not os.path.exists(fasta_path):
+        print("\n[4/5] Reference FASTA not provided or not found. Skipping DRACH motif extraction.")
+        df_sites["motif_5mer"] = "NA"
+        df_sites["is_drach"] = False
+        return df_sites, {"drach_percentage": 0.0}
+
     print(f"\n[4/5] Extracting 5-mer genomic sequences & checking DRACH motif from {Path(fasta_path).name}...")
 
+    # Strict check: raise error if pysam is not installed
     try:
         import pysam
-        has_pysam = True
-    except ImportError:
-        has_pysam = False
-        print("      [WARN] 'pysam' library not installed. Attempting pure Python FASTA index lookup.")
+    except ImportError as e:
+        raise ImportError(
+            "\n" + "!" * 80 + "\n"
+            "[ERROR] Die Bibliothek 'pysam' ist in der aktuellen Python-Umgebung nicht installiert!\n"
+            "Sie wird für die Genom-Sequenz-Extraktion und den DRACH-Motiv-Check zwingend benötigt.\n\n"
+            "Bitte installieren Sie pysam in Ihrer Umgebung mit:\n"
+            "    pip install pysam\n"
+            + "!" * 80 + "\n"
+        ) from e
+
+    fasta = pysam.FastaFile(fasta_path)
+    fasta_chroms = set(fasta.references)
 
     drach_results = []
     motifs = []
 
-    if has_pysam:
-        fasta = pysam.FastaFile(fasta_path)
-        fasta_chroms = set(fasta.references)
+    for _, row in df_sites.iterrows():
+        chrom = str(row["Chr"])
+        # Match FASTA chromosome naming convention
+        if chrom not in fasta_chroms and f"chr{chrom}" in fasta_chroms:
+            target_chrom = f"chr{chrom}"
+        elif chrom in fasta_chroms:
+            target_chrom = chrom
+        else:
+            motifs.append("CHR_NOT_FOUND")
+            drach_results.append(False)
+            continue
 
-        for _, row in df_sites.iterrows():
-            chrom = str(row["Chr"])
-            # Match FASTA chromosome naming convention
-            if chrom not in fasta_chroms and f"chr{chrom}" in fasta_chroms:
-                target_chrom = f"chr{chrom}"
-            elif chrom in fasta_chroms:
-                target_chrom = chrom
+        # 0-based coordinate for Gstart
+        gstart = int(row["Gstart"])
+        strand = str(row["Strand"])
+
+        # 5-mer: 2 bp upstream, central base, 2 bp downstream
+        start_pos = max(0, gstart - 2)
+        end_pos = gstart + 3
+
+        try:
+            seq = fasta.fetch(target_chrom, start_pos, end_pos).upper()
+            if len(seq) == 5:
+                if strand == "-":
+                    seq = reverse_complement(seq)
+                motifs.append(seq)
+                drach_results.append(is_drach_motif(seq))
             else:
-                motifs.append("CHR_NOT_FOUND")
+                motifs.append("EDGE_TRUNCATED")
                 drach_results.append(False)
-                continue
+        except Exception:
+            motifs.append("FETCH_ERROR")
+            drach_results.append(False)
 
-            # 0-based coordinate for Gstart
-            # modkit / bed: Gstart is 0-based coordinate of the modified base
-            gstart = int(row["Gstart"])
-            strand = str(row["Strand"])
-
-            # 5-mer: 2 bp upstream, central base, 2 bp downstream
-            start_pos = max(0, gstart - 2)
-            end_pos = gstart + 3
-
-            try:
-                seq = fasta.fetch(target_chrom, start_pos, end_pos).upper()
-                if len(seq) == 5:
-                    if strand == "-":
-                        seq = reverse_complement(seq)
-                    motifs.append(seq)
-                    drach_results.append(is_drach_motif(seq))
-                else:
-                    motifs.append("EDGE_TRUNCATED")
-                    drach_results.append(False)
-            except Exception:
-                motifs.append("FETCH_ERROR")
-                drach_results.append(False)
-
-        fasta.close()
-    else:
-        # Fallback without pysam
-        motifs = ["NO_PYSAM"] * len(df_sites)
-        drach_results = [False] * len(df_sites)
+    fasta.close()
 
     df_sites["motif_5mer"] = motifs
     df_sites["is_drach"] = drach_results
@@ -473,7 +491,7 @@ def export_results(
     drach_stats: Dict,
     args: argparse.Namespace
 ) -> None:
-    """Exports TSV tables, BED tracks, and markdown validation report."""
+    """Exports TSV tables, BED tracks, and text validation report."""
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
@@ -503,44 +521,56 @@ def export_results(
                     f"{row['TxId']}_m6A\t{min(1000, max(0, s_int))}\t{row['Strand']}\n")
     print(f"[OK] Saved genomic BED file for IGV to: {bed_path}")
 
-    # 5. Markdown Report
-    report_path = out_path / "m6a_validation_report.md"
+    # 5. Text Report
+    report_path = out_path / "m6a_validation_report.txt"
     with open(report_path, "w", encoding="utf-8") as f:
-        f.write("# Qualitäts- und Validierungsbericht: m6A-Modifikationen in hiPSC-CM\n\n")
-        f.write("## 1. Übersicht & Filter-Parameter\n\n")
-        f.write("| Parameter | Gewählter Wert | Beschreibung |\n")
-        f.write("| :--- | :--- | :--- |\n")
-        f.write(f"| `min_effect_size` | **{args.min_effect_size}** (min. {args.min_effect_size*100:.0f} % Rückgang) | Minimale Modifikationsreduktion durch M3inh |\n")
-        f.write(f"| `max_fdr` | **{args.max_fdr}** | Benjamini-Hochberg FDR Signifikanz-Schwelle |\n")
-        f.write(f"| `min_rep_count` | **{args.min_rep_count}** | Mindestanzahl bestätigender Kontroll-Replikate |\n")
-        f.write(f"| `min_pct_a_samples` | **{args.min_pct_samples} %** | Mindest-Abdeckung in Control-Replikaten im DMR |\n")
-        f.write(f"| `min_a_pct_modified` | **{args.min_ctrl_mod}** | Mindest-Modifikationsrate in Control |\n\n")
+        div_main = "=" * 80
+        div_sub = "-" * 80
 
-        f.write("## 2. Statistische Filter-Kaskade\n\n")
-        f.write("| Schritt / Merkmal | Anzahl Positionen | Anteil / Status |\n")
-        f.write("| :--- | :---: | :--- |\n")
-        f.write(f"| Roh-Kandidaten im DMR-File | {dmr_stats.get('total_dmr_records', 0):,} | 100,0 % |\n")
-        f.write(f"| Ausreichende Coverage in Ctrl | {dmr_stats.get('passed_replicate_presence', 0):,} | {dmr_stats.get('passed_replicate_presence', 0)/max(1, dmr_stats.get('total_dmr_records', 1)):.1%} |\n")
-        f.write(f"| Signifikante Inhibitor-Reduktion | {dmr_stats.get('validated_mettl3_dependent_dmr', 0):,} | Echte METTL3-abhängige Sites |\n")
-        f.write(f"| Eindeutige Transkript-Sites in Ctrl | {ctrl_stats.get('unique_transcript_sites', 0):,} | Replikats-Pool |\n")
-        f.write(f"| Replikat-Konsens (>= {args.min_rep_count} Replikate) | {ctrl_stats.get(f'sites_recurrent_ge{args.min_rep_count}', 0):,} | Reproduzierbar |\n")
-        f.write(f"| **Final validierte bona fide m6A Sites** | **{len(df_validated_final):,}** | **Hohe Konfidenz für Modell-Track** |\n\n")
+        f.write(f"{div_main}\n")
+        f.write(" QUALITÄTS- UND VALIDIERUNGSBERICHT: m6A-MODIFIKATIONEN IN hiPSC-CM\n")
+        f.write(f"{div_main}\n\n")
+
+        f.write("1. ÜBERSICHT & FILTER-PARAMETER\n")
+        f.write(f"{div_sub}\n")
+        f.write(f"{'Parameter':<22} | {'Gewählter Wert':<16} | {'Beschreibung'}\n")
+        f.write(f"{'-'*22}-+-{'-'*16}-+-{'-'*38}\n")
+        f.write(f"{'min_effect_size':<22} | {str(args.min_effect_size) + f' (-{args.min_effect_size*100:.0f}%)':<16} | Minimale Modifikationsreduktion durch M3inh\n")
+        f.write(f"{'max_fdr':<22} | {str(args.max_fdr):<16} | Benjamini-Hochberg FDR Signifikanz-Schwelle\n")
+        f.write(f"{'min_rep_count':<22} | {str(args.min_rep_count):<16} | Mindestanzahl bestätigender Kontroll-Replikate\n")
+        f.write(f"{'min_pct_a_samples':<22} | {str(args.min_pct_samples) + ' %':<16} | Mindest-Abdeckung in Control-Replikaten im DMR\n")
+        f.write(f"{'min_a_pct_modified':<22} | {str(args.min_ctrl_mod):<16} | Mindest-Modifikationsrate in Control\n\n")
+
+        f.write("2. STATISTISCHE FILTER-KASKADE\n")
+        f.write(f"{div_sub}\n")
+        f.write(f"{'Schritt / Merkmal':<40} | {'Anzahl Positionen':>18} | {'Anteil / Status'}\n")
+        f.write(f"{'-'*40}-+-{'-'*18}-+-{'-'*30}\n")
+        f.write(f"{'Roh-Kandidaten im DMR-File':<40} | {dmr_stats.get('total_dmr_records', 0):>18,} | 100,0 %\n")
+        ctrl_cov_pct = dmr_stats.get('passed_replicate_presence', 0) / max(1, dmr_stats.get('total_dmr_records', 1))
+        f.write(f"{'Ausreichende Coverage in Ctrl':<40} | {dmr_stats.get('passed_replicate_presence', 0):>18,} | {ctrl_cov_pct:.1%}\n")
+        f.write(f"{'Signifikante Inhibitor-Reduktion':<40} | {dmr_stats.get('validated_mettl3_dependent_dmr', 0):>18,} | Echte METTL3-abhängige Sites\n")
+        f.write(f"{'Eindeutige Transkript-Sites in Ctrl':<40} | {ctrl_stats.get('unique_transcript_sites', 0):>18,} | Replikats-Pool\n")
+        f.write(f"{f'Replikat-Konsens (>= {args.min_rep_count} Replikate)':<40} | {ctrl_stats.get(f'sites_recurrent_ge{args.min_rep_count}', 0):>18,} | Reproduzierbar\n")
+        f.write(f"{'Final validierte bona fide m6A Sites':<40} | {len(df_validated_final):>18,} | Hohe Konfidenz für Modell-Track\n\n")
 
         if drach_stats.get("drach_percentage", 0) > 0:
-            f.write("## 3. DRACH-Konsensus-Motiv Validierung\n\n")
-            f.write(f"* **DRACH-Trefferquote ([A/G/U][A/G]AC[A/C/U]):** **{drach_stats['drach_percentage']:.1f} %** "
-                    f"({drach_stats.get('drach_count', 0):,} von geprüften Sites).\n")
-            f.write("* *Interpretation:* Hohe Übereinstimmung mit dem klassischen DRACH-Motiv belegt biologische Validität "
-                    "und filtert unspezifisches Nanopore-Rauschen erfolgreich aus.\n\n")
+            f.write("3. DRACH-KONSENSUS-MOTIV VALIDIERUNG\n")
+            f.write(f"{div_sub}\n")
+            f.write(f"- DRACH-Trefferquote ([A/G/U][A/G]AC[A/C/U]): {drach_stats['drach_percentage']:.1f} % "
+                    f"({drach_stats.get('drach_count', 0):,} von geprüften Sites)\n")
+            f.write("- Interpretation: Hohe Übereinstimmung mit dem klassischen DRACH-Motiv belegt biologische Validität\n"
+                    "  und filtert unspezifisches Nanopore-Rauschen erfolgreich aus.\n\n")
 
-        f.write("## 4. Verteilung auf Transkripte\n\n")
-        f.write(f"* Transkripte mit mindestens einer validen m6A-Site: **{len(tx_summary):,}**\n")
-        f.write(f"* Mittlere Anzahl m6A-Sites pro modifiziertem Transkript: **{tx_summary['num_m6a_sites'].mean():.2f}**\n")
-        f.write(f"* Verteilung nach Regionen: **5'UTR:** {tx_summary['sites_5utr'].sum():,} | "
-                f"**CDS:** {tx_summary['sites_cds'].sum():,} | "
-                f"**3'UTR:** {tx_summary['sites_3utr'].sum():,}\n")
+        f.write("4. VERTEILUNG AUF TRANSKRIPTE\n")
+        f.write(f"{div_sub}\n")
+        f.write(f"- Transkripte mit mindestens einer validen m6A-Site: {len(tx_summary):,}\n")
+        f.write(f"- Mittlere Anzahl m6A-Sites pro modifiziertem Transkript: {tx_summary['num_m6a_sites'].mean():.2f}\n")
+        f.write(f"- Verteilung nach Regionen:\n")
+        f.write(f"    * 5'UTR: {tx_summary['sites_5utr'].sum():,}\n")
+        f.write(f"    * CDS:   {tx_summary['sites_cds'].sum():,}\n")
+        f.write(f"    * 3'UTR: {tx_summary['sites_3utr'].sum():,}\n")
 
-    print(f"[OK] Saved comprehensive Markdown validation report to: {report_path}")
+    print(f"[OK] Saved comprehensive text validation report to: {report_path}")
 
 
 # =============================================================================
