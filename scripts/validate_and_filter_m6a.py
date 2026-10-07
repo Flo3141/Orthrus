@@ -245,7 +245,6 @@ def load_and_aggregate_ctrl_beds(
 
     # Group by Transcript and cDNA position to aggregate replicate calls
     group_cols = ["TxId", "cDNAstart", "cDNAend", "Chr", "Gstart", "Gend", "Strand"]
-    meta_cols = ["txlen", "cdslen", "utr5_len", "utr3_len"]
 
     agg_df = df_all_ctrl.groupby(group_cols).agg(
         rep_count=("score", "count"),
@@ -320,24 +319,6 @@ def intersect_ctrl_with_dmr(
 
     return df_validated_final, df_merged
 
-
-# =============================================================================
-# 5. DRACH Motif Validation (Genome Reference Check)
-# =============================================================================
-
-def check_drach_motifs(
-    df_sites: pd.DataFrame,
-    fasta_path: Optional[str] = None
-) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    """
-    Extracts 5-mer sequences from reference genome FASTA and checks for DRACH motif.
-    Returns enriched dataframe and motif frequency metrics.
-    """
-    if not fasta_path or not os.path.exists(fasta_path):
-        print("\n[4/5] Reference FASTA not provided or not found. Skipping DRACH motif extraction.")
-        df_sites["motif_5mer"] = "NA"
-        df_sites["is_drach"] = False
-        return df_sites, {"drach_percentage": 0.0}
 
 # =============================================================================
 # 5. DRACH Motif Validation (Genome Reference Check)

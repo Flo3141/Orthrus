@@ -38,8 +38,9 @@ fi
 # Step 1: Weight Surgery (Convert 6-Track to 8-Track Checkpoint)
 # -----------------------------------------------------------------------------
 echo -e "\n[STEP 1/4] Converting 6-track checkpoint to 8-track model..."
-python "${SCRIPTS_DIR}/convert_6track_to_8track.py" \
+python "${SCRIPTS_DIR}/convert_6track_to_ntrack.py" \
     --base_model "quietflamingo/orthrus-large-6-track" \
+    --n_target_tracks 8 \
     --output_dir "${CHECKPOINT_8T_DIR}" \
     --init_method "normal" \
     --init_std 0.02

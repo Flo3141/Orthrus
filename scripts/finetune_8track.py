@@ -1112,7 +1112,7 @@ def main():
         "--model_checkpoint",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus/orthrus_8track_from_finetuned_6track",
-        help="Path to 8-track converted Orthrus model directory (from convert_6track_to_8track.py)",
+        help="Path to converted Orthrus model directory (from convert_6track_to_ntrack.py)",
     )
     parser.add_argument(
         "--fold",
