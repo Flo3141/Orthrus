@@ -423,7 +423,7 @@ def parse_args():
         "--m6a_dir",
         dest="m6a_file",
         type=str,
-        default="./results/m6a_validated_tracks/validated_m6a_sites.tsv",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/m6a/validated_m6a_sites.tsv",
         help="Path to 'validated_m6a_sites.tsv' or the directory containing it",
     )
     parser.add_argument(
