@@ -597,7 +597,7 @@ def parse_args():
     parser.add_argument(
         "--min-ctrl-mod",
         type=float,
-        default=0.10,
+        default=0.20,
         help="Minimum modification frequency in Control condition (default: 0.10 = 10%%)"
     )
     parser.add_argument(
