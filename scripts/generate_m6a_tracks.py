@@ -15,13 +15,6 @@ Channel Configuration (Total: 7 channels):
   - Channel 5:    Splice-site / Exon-Junction marker (1.0 at 'ej', 0.0 elsewhere)
   - Channel 6:    m6A Modification Track (quantitative modification frequency or binary flag)
 
-Mapping Strategy:
-  - Exclusively cDNA coordinate mapping: Uses 'cDNAstart' and 'cDNAend' directly
-    from 'validated_m6a_sites.tsv'.
-  - Strict validation: If 'validated_m6a_sites.tsv' does not exist or if required
-    columns ('TxId', 'cDNAstart', 'cDNAend', score column) are missing, an error
-    is raised immediately (no fallback).
-
 Features:
   - Multiple scoring metrics:
       * 'mean_score': Mean modification percentage across biological replicates (0-100%)
@@ -40,63 +33,30 @@ Features:
 """
 
 import argparse
-import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-
-# =============================================================================
-# 1. Base Saluki 6-Track Parser
-# =============================================================================
-
-def parse_saluki_base_tracks(raw_seq: str) -> Tuple[np.ndarray, int, int, List[int]]:
-    """
-    Parses comma-separated tokens from Saluki/Orthrus dataset representation:
-      - Tokens: e.g. "a", "c", "G", "ejA", "T", etc.
-      - Uppercase characters indicate CDS.
-      - 'ej' indicates exon junction / splice site.
-    Returns:
-      six_track: array of shape (L, 6)
-      l: sequence length
-      utr3_start: index where 3' UTR starts
-      upper_indices: list of CDS token indices
-    """
-    tokens = [tok.strip() for tok in raw_seq.split(",") if tok.strip()]
-    l = len(tokens)
-    if l == 0:
-        return np.zeros((0, 6), dtype=np.float32), 0, 0, []
-
-    clean_seq = "".join(tok[0] for tok in tokens)
-
-    seq_bytes = np.frombuffer(clean_seq.upper().encode("ascii"), dtype=np.uint8)
-    oh = np.zeros((l, 4), dtype=np.float32)
-    oh[seq_bytes == 65, 0] = 1.0  # A
-    oh[seq_bytes == 67, 1] = 1.0  # C
-    oh[seq_bytes == 71, 2] = 1.0  # G
-    oh[(seq_bytes == 84) | (seq_bytes == 85), 3] = 1.0  # T or U
-
-    cds_track = np.array([1.0 if tok[0].isupper() else 0.0 for tok in tokens], dtype=np.float32).reshape(-1, 1)
-    splice_track = np.array([1.0 if "ej" in tok.lower() else 0.0 for tok in tokens], dtype=np.float32).reshape(-1, 1)
-
-    six_track = np.concatenate([oh, cds_track, splice_track], axis=1)
-
-    upper_indices = [i for i, tok in enumerate(tokens) if tok[0].isupper()]
-    utr3_start = (max(upper_indices) + 3) if upper_indices else 0
-    utr3_start = min(utr3_start, l)
-
-    return six_track, l, utr3_start, upper_indices
+from six_track_dataset import SixTrackDatasetLoader
 
 
 # =============================================================================
-# 2. Loading & Indexing Validated m6A Sites (Strict: validated_m6a_sites.tsv only)
+# Fixed Reference File Paths (Cluster Constants)
+# =============================================================================
+VALIDATED_M6A_PATH = Path(
+    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/m6a/validated_m6a_sites.tsv"
+)
+
+
+# =============================================================================
+# 1. Loading & Indexing Validated m6A Sites (Strict: validated_m6a_sites.tsv only)
 # =============================================================================
 
 def load_validated_m6a_data(
-    m6a_input_path: str,
+    m6a_input_path: Union[str, Path] = VALIDATED_M6A_PATH,
     score_col: str = "mean_score",
     filter_drach: bool = False
 ) -> Tuple[Dict[str, List[dict]], Dict[str, int]]:
@@ -202,7 +162,7 @@ def load_validated_m6a_data(
 
 
 # =============================================================================
-# 3. Normalization for m6A Modification Track (Channel 6)
+# 2. Normalization for m6A Modification Track (Channel 6)
 # =============================================================================
 
 def compute_m6a_dynamic_quantile(
@@ -226,7 +186,7 @@ def compute_m6a_dynamic_quantile(
 
     all_vals = []
     for _, row in eval_df.iterrows():
-        tx_id = str(row.get("ensembl_transcript_id", ""))
+        tx_id = str(row["ensembl_transcript_id"])
         clean_tx = tx_id.split(".")[0]
 
         sites = cdna_lookup.get(tx_id) or cdna_lookup.get(clean_tx)
@@ -236,13 +196,14 @@ def compute_m6a_dynamic_quantile(
                 if val > 0:
                     all_vals.append(val)
 
-    if all_vals:
-        q_val = float(np.percentile(all_vals, q_pct))
-        print(f"      Calculated m6A q{int(q_pct)}: {q_val:.4f} (from {len(all_vals):,} active positions)")
-        return q_val
-    else:
-        print("      [Warning] No positive m6A values found during sampling. Defaulting to 100.0.")
-        return 100.0
+    if not all_vals:
+        raise RuntimeError(
+            "[Quantile Estimation] No positive m6A modification scores found in dataset sample! "
+            "Please verify m6A file path, cDNA coordinate mapping, and score metric."
+        )
+    q_val = float(np.percentile(all_vals, q_pct))
+    print(f"      Calculated m6A q{int(q_pct)}: {q_val:.4f} (from {len(all_vals):,} active positions)")
+    return q_val
 
 
 def normalize_m6a_track(
@@ -290,29 +251,37 @@ def normalize_m6a_track(
 
 
 # =============================================================================
-# 4. Incremental Chunk Storage & Merging
+# 3. Incremental Chunk Storage & Merging
 # =============================================================================
 
 def save_chunk(
     chunk_idx: int,
     chunk_items: list,
     chunks_dir: Path,
-    normalization: str,
-    score_column: str,
+    dataset: str = "unknown",
+    normalization: str = "none",
+    score_column: str = "mean_score",
     m6a_q99: Optional[float] = None,
 ):
     """Saves a block of processed transcripts incrementally as an NPZ archive."""
     chunk_file = chunks_dir / f"chunk_{chunk_idx:05d}.npz"
+    tx_arr = np.array([item["ensembl_transcript_id"] for item in chunk_items])
+    gene_id_arr = np.array([item["ensembl_gene_id"] for item in chunk_items])
+    gene_arr = np.array([item["gene"] for item in chunk_items])
+    target_arr = np.array([item["target"] for item in chunk_items], dtype=np.float32)
+    target_raw_arr = np.array([item["target_raw"] for item in chunk_items], dtype=np.float32)
+    lens_arr = np.array([item["length"] for item in chunk_items], dtype=np.int32)
+
     np.savez_compressed(
         chunk_file,
         tracks=np.array([item["track"] for item in chunk_items], dtype=object),
-        ensembl_transcript_id=np.array([item["transcript_id"] for item in chunk_items]),
-        ensembl_gene_id=np.array([item["gene_id"] for item in chunk_items]),
-        hgnc_symbol=np.array([item["gene_symbol"] for item in chunk_items]),
-        half_life_transformed=np.array([item["half_life_transformed"] for item in chunk_items], dtype=np.float32),
-        half_life=np.array([item["half_life"] for item in chunk_items], dtype=np.float32),
-        rate=np.array([item["rate"] for item in chunk_items], dtype=np.float32),
-        seq_lens=np.array([item["length"] for item in chunk_items], dtype=np.int32),
+        target=target_arr,
+        target_raw=target_raw_arr,
+        ensembl_transcript_id=tx_arr,
+        ensembl_gene_id=gene_id_arr,
+        gene=gene_arr,
+        seq_lens=lens_arr,
+        dataset=str(dataset),
         has_m6a=np.array([item["has_m6a"] for item in chunk_items], dtype=bool),
         num_m6a_sites=np.array([item["num_m6a_sites"] for item in chunk_items], dtype=np.int32),
         mean_m6a_score=np.array([item["mean_m6a_score"] for item in chunk_items], dtype=np.float32),
@@ -325,8 +294,9 @@ def save_chunk(
 def merge_all_chunks(
     chunks_dir: Path,
     output_file: Path,
-    normalization: str,
-    score_column: str,
+    dataset: str = "unknown",
+    normalization: str = "none",
+    score_column: str = "mean_score",
     m6a_q99: Optional[float] = None,
 ):
     """Merges all generated chunk archives into the final master NPZ."""
@@ -338,10 +308,9 @@ def merge_all_chunks(
     all_tracks = []
     tx_ids = []
     gene_ids = []
-    gene_symbols = []
-    hl_trans = []
-    hl_raw = []
-    rates = []
+    genes = []
+    targets = []
+    targets_raw = []
     lens = []
     has_m6a_flags = []
     site_counts = []
@@ -350,12 +319,11 @@ def merge_all_chunks(
     for cf in tqdm(chunk_files, desc="Merging chunks"):
         data = np.load(cf, allow_pickle=True)
         all_tracks.extend(data["tracks"])
+        targets.extend(data["target"])
+        targets_raw.extend(data["target_raw"])
         tx_ids.extend(data["ensembl_transcript_id"])
         gene_ids.extend(data["ensembl_gene_id"])
-        gene_symbols.extend(data["hgnc_symbol"])
-        hl_trans.extend(data["half_life_transformed"])
-        hl_raw.extend(data["half_life"])
-        rates.extend(data["rate"])
+        genes.extend(data["gene"])
         lens.extend(data["seq_lens"])
         has_m6a_flags.extend(data["has_m6a"])
         site_counts.extend(data["num_m6a_sites"])
@@ -364,13 +332,13 @@ def merge_all_chunks(
     np.savez_compressed(
         output_file,
         tracks=np.array(all_tracks, dtype=object),
+        target=np.array(targets, dtype=np.float32),
+        target_raw=np.array(targets_raw, dtype=np.float32),
         ensembl_transcript_id=np.array(tx_ids),
         ensembl_gene_id=np.array(gene_ids),
-        hgnc_symbol=np.array(gene_symbols),
-        half_life_transformed=np.array(hl_trans, dtype=np.float32),
-        half_life=np.array(hl_raw, dtype=np.float32),
-        rate=np.array(rates, dtype=np.float32),
+        gene=np.array(genes),
         seq_lens=np.array(lens, dtype=np.int32),
+        dataset=str(dataset),
         has_m6a=np.array(has_m6a_flags, dtype=bool),
         num_m6a_sites=np.array(site_counts, dtype=np.int32),
         mean_m6a_score=np.array(mean_scores, dtype=np.float32),
@@ -386,6 +354,7 @@ def merge_all_chunks(
     print("\n" + "=" * 70)
     print("             m6A 7-TRACK DATASET GENERATION REPORT            ")
     print("=" * 70)
+    print(f"Dataset:                             {dataset}")
     print(f"Total transcripts processed:         {n_total:,}")
     print(f"Transcripts with validated m6A:      {n_with_m6a:,} ({n_with_m6a / max(1, n_total) * 100:.2f} %)")
     print(f"Total m6A modification sites mapped: {total_sites:,}")
@@ -403,7 +372,7 @@ def merge_all_chunks(
 
 
 # =============================================================================
-# 5. Main Pipeline Routine
+# 4. Main Pipeline Routine
 # =============================================================================
 
 def parse_args():
@@ -411,26 +380,24 @@ def parse_args():
         description="Generate continuous/discrete m6A modification tracks (7-track) for the Orthrus model using cDNA coordinates."
     )
     parser.add_argument(
-        "--saluki_data",
-        "--data_path",
-        dest="saluki_data",
+        "--dataset",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_ej_cds_transformed.txt",
-        help="Path to hIPSC_CM base dataset file (tab-separated)",
+        required=True,
+        choices=["hipsc_cm", "mrna_bench"],
+        help="Dataset to process: 'hipsc_cm' or 'mrna_bench' (required)",
     )
     parser.add_argument(
-        "--m6a_file",
-        "--m6a_dir",
-        dest="m6a_file",
+        "--species",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/m6a/validated_m6a_sites.tsv",
-        help="Path to 'validated_m6a_sites.tsv' or the directory containing it",
+        default=None,
+        choices=["human", "mouse"],
+        help="Species for mRNABench: 'human' or 'mouse' (required if --dataset is 'mrna_bench')",
     )
     parser.add_argument(
         "--output_file",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/hIPSC_CM_7track_m6a.npz",
-        help="Destination NPZ archive path (automatically suffixed with normalization method)",
+        required=True,
+        help="Destination NPZ archive path (automatically suffixed with normalization method, required)",
     )
     parser.add_argument(
         "--score_col",
@@ -442,9 +409,9 @@ def parse_args():
     parser.add_argument(
         "--normalization",
         type=str,
-        default="unit",
+        required=True,
         choices=["unit", "minmax", "binary", "log", "none"],
-        help="Normalization method for m6A track (channel 6): 'unit' (0-100%% -> [0, 1]), 'minmax' (robust q99 log-scaling), 'binary', 'log', 'none'",
+        help="Normalization method for m6A track (channel 6): 'unit', 'minmax', 'binary', 'log', 'none' (required)",
     )
     parser.add_argument(
         "--m6a_q99",
@@ -486,7 +453,11 @@ def parse_args():
 def main():
     args = parse_args()
 
+    if args.dataset == "mrna_bench" and not args.species:
+        raise ValueError("--species ('human' or 'mouse') must be specified when --dataset is 'mrna_bench'!")
+
     norm_method = args.normalization.lower()
+    dataset_name = f"{args.dataset}_{args.species}" if args.species else args.dataset
     out_file = Path(args.output_file)
 
     # Append normalization suffix if not already present
@@ -502,6 +473,7 @@ def main():
     print("=" * 75)
     print("   ORTHRUS 7-TRACK m6A DATASET GENERATOR (cDNA Mapping)   ")
     print("=" * 75)
+    print(f"Dataset:            {dataset_name}")
     print(f"Mapping:            cDNA Coordinates (direct)")
     print(f"Score metric:       {args.score_col}")
     print(f"Normalization:      {norm_method.upper()}")
@@ -534,29 +506,21 @@ def main():
 
     # 1. Strict loading of validated m6A data (validated_m6a_sites.tsv only, no fallback)
     cdna_lookup, m6a_stats = load_validated_m6a_data(
-        m6a_input_path=args.m6a_file,
+        m6a_input_path=VALIDATED_M6A_PATH,
         score_col=args.score_col,
         filter_drach=args.filter_drach
     )
 
-    # 2. Load base dataset
-    saluki_path = Path(args.saluki_data)
-    print(f"\n[Dataset] Loading base transcript sequences from: {saluki_path}...")
-    if not saluki_path.exists():
-        raise FileNotFoundError(f"[ERROR] Base dataset file not found at: {saluki_path}")
-
-    df_base = pd.read_csv(saluki_path, sep="\t")
-
-    # Verify base columns
-    required_base_cols = ["ensembl_transcript_id", "sequence"]
-    missing_base_cols = [c for c in required_base_cols if c not in df_base.columns]
-    if missing_base_cols:
-        raise KeyError(
-            f"[ERROR] Required column(s) missing in base dataset '{saluki_path}': {missing_base_cols}!"
-        )
-
+    # 2. Load base 6-track dataset
+    print(f"\n[Dataset] Loading 6-track dataset via SixTrackDatasetLoader (dataset='{args.dataset}', species={args.species})...")
+    loader = SixTrackDatasetLoader(
+        dataset=args.dataset,
+        species=args.species,
+        require_transcript_id=True,
+    )
+    df_base = loader.get_data()
     total_transcripts = len(df_base)
-    print(f"          Total entries in base dataset: {total_transcripts:,}")
+    print(f"          Total entries loaded: {total_transcripts:,}")
 
     # 3. Dynamic quantile estimation for minmax normalization
     m6a_q99 = args.m6a_q99
@@ -595,10 +559,8 @@ def main():
             if tx_id in completed_tx_ids or clean_tx in completed_tx_ids:
                 continue
 
-            raw_seq = str(row["sequence"])
-
-            # Channels 0-5 (A, C, G, U, CDS, Splice)
-            six_track, l, utr3_start, upper_indices = parse_saluki_base_tracks(raw_seq)
+            six_track = row["track"]
+            l = int(row["length"])
             if l > args.max_length:
                 six_track = six_track[:args.max_length, :]
                 l = args.max_length
@@ -636,14 +598,18 @@ def main():
 
             mean_score_val = float(np.mean(m6a_1d[m6a_1d > 0])) if has_m6a else 0.0
 
+            target_val = float(row["target"])
+            target_raw_val = float(row["target_raw"])
+            gene_name = str(row["gene"])
+            gene_id_val = str(row["ensembl_gene_id"])
+
             current_chunk_items.append({
                 "track": multi_track,
-                "transcript_id": tx_id,
-                "gene_id": str(row.get("ensembl_gene_id", "")),
-                "gene_symbol": str(row.get("hgnc_symbol", "")),
-                "half_life_transformed": float(row.get("half_life_transformed", np.nan)),
-                "half_life": float(row.get("half_life", np.nan)),
-                "rate": float(row.get("rate", np.nan)),
+                "ensembl_transcript_id": tx_id,
+                "ensembl_gene_id": gene_id_val,
+                "gene": gene_name,
+                "target": target_val,
+                "target_raw": target_raw_val,
                 "length": l,
                 "has_m6a": has_m6a,
                 "num_m6a_sites": num_sites,
@@ -657,6 +623,7 @@ def main():
                     chunk_idx=chunk_idx,
                     chunk_items=current_chunk_items,
                     chunks_dir=chunks_dir,
+                    dataset=dataset_name,
                     normalization=norm_method,
                     score_column=args.score_col,
                     m6a_q99=m6a_q99,
@@ -670,6 +637,7 @@ def main():
                 chunk_idx=chunk_idx,
                 chunk_items=current_chunk_items,
                 chunks_dir=chunks_dir,
+                dataset=dataset_name,
                 normalization=norm_method,
                 score_column=args.score_col,
                 m6a_q99=m6a_q99,
@@ -679,6 +647,7 @@ def main():
     merge_all_chunks(
         chunks_dir=chunks_dir,
         output_file=out_file,
+        dataset=dataset_name,
         normalization=norm_method,
         score_column=args.score_col,
         m6a_q99=m6a_q99,

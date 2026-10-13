@@ -10,10 +10,6 @@ Channels (Total: 8):
   6:   Stabilizer RBPs (ENCODE eCLIP peaks of curated stabilizing factors)
   7:   Destabilizer RBPs (ENCODE eCLIP peaks of curated destabilizing factors)
 
-Note:
-  TargetScan miRNA channel was retired due to low dataset coverage (74% zero-inflation).
-  The two separate RBP channels provide directional regulatory signals without mutual cancellation.
-
 Features:
 - Fast binary search (np.searchsorted): Drastically reduces runtime
 - Incremental storage in chunks (resumable upon interruption)
@@ -22,13 +18,25 @@ Features:
 """
 
 import argparse
-import os
 from pathlib import Path
-from collections import defaultdict
 import gffutils
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+from six_track_dataset import SixTrackDatasetLoader
+
+
+# =============================================================================
+# Fixed Reference File Paths (Cluster Constants)
+# =============================================================================
+GTF_DB_PATH = Path("/beegfs/prj/RNA_NLP/AlphaGenome/data/Homo_sapiens.GRCh38.108.gtf.db")
+STABILIZERS_BED_PATH = Path(
+    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/eclip/curated_candidates/stabilizers_peaks.bed"
+)
+DESTABILIZERS_BED_PATH = Path(
+    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/eclip/curated_candidates/destabilizers_peaks.bed"
+)
 
 
 # =============================================================================
@@ -223,39 +231,7 @@ def load_bed_indexed(bed_path: Path, label: str = "BED") -> dict:
 
 
 # =============================================================================
-# 4. Saluki 6-Track Base Parser
-# =============================================================================
-
-def parse_saluki_base_tracks(raw_seq: str) -> tuple:
-    """
-    Parses comma-separated token sequence into Saluki 6-track format:
-    Channels 0-3: One-hot nucleotides (A, C, G, U)
-    Channel 4:    CDS (1.0 if token is uppercase, 0.0 otherwise)
-    Channel 5:    Splice site / Exon junction (1.0 if 'ej' in token)
-    """
-    tokens = [tok.strip() for tok in raw_seq.split(",") if tok.strip()]
-    l = len(tokens)
-    if l == 0:
-        return np.zeros((0, 6), dtype=np.float32), 0
-
-    clean_seq = "".join(tok[0] for tok in tokens)
-    seq_bytes = np.frombuffer(clean_seq.upper().encode("ascii"), dtype=np.uint8)
-
-    oh = np.zeros((l, 4), dtype=np.float32)
-    oh[seq_bytes == 65, 0] = 1.0  # A
-    oh[seq_bytes == 67, 1] = 1.0  # C
-    oh[seq_bytes == 71, 2] = 1.0  # G
-    oh[(seq_bytes == 84) | (seq_bytes == 85), 3] = 1.0  # T or U
-
-    cds_track = np.array([1.0 if tok[0].isupper() else 0.0 for tok in tokens], dtype=np.float32).reshape(-1, 1)
-    splice_track = np.array([1.0 if "ej" in tok.lower() else 0.0 for tok in tokens], dtype=np.float32).reshape(-1, 1)
-
-    six_track = np.concatenate([oh, cds_track, splice_track], axis=1)
-    return six_track, l
-
-
-# =============================================================================
-# 5. Normalization for RBP Tracks (Channels 6 & 7)
+# 4. Normalization for RBP Tracks (Channels 6 & 7)
 # =============================================================================
 
 def compute_dynamic_quantiles(
@@ -285,10 +261,9 @@ def compute_dynamic_quantiles(
     all_destab_vals = []
 
     for _, row in tqdm(eval_df.iterrows(), total=len(eval_df), desc="Estimating quantiles"):
-        tx_id = str(row.get("ensembl_transcript_id", ""))
+        tx_id = str(row["ensembl_transcript_id"])
         clean_tx = tx_id.split(".")[0]
-        raw_seq = str(row["sequence"])
-        l = min(len(raw_seq.split(",")), max_length)
+        l = min(int(row["length"]), max_length)
 
         tx_info = gtf_helper.get_transcript_exons(clean_tx)
         if tx_info is not None:
@@ -309,21 +284,23 @@ def compute_dynamic_quantiles(
                 if len(nz_destab) > 0:
                     all_destab_vals.append(nz_destab)
 
-    if all_stab_vals:
-        flat_stab = np.concatenate(all_stab_vals)
-        stab_q = float(np.percentile(flat_stab, q_pct))
-        print(f"[Quantile Estimation] Stabilizer RBP {q_pct:.1f}% percentile: {stab_q:.4f} (from {len(flat_stab):,} active positions)")
-    else:
-        stab_q = 600.0
-        print(f"[Quantile Estimation] Warning: No positive Stabilizer RBP values found, fallback to {stab_q:.4f}")
+    if not all_stab_vals:
+        raise RuntimeError(
+            "[Quantile Estimation] No positive Stabilizer RBP peaks found in dataset sample! "
+            "Please verify BED file paths, chromosome formatting, and species compatibility."
+        )
+    flat_stab = np.concatenate(all_stab_vals)
+    stab_q = float(np.percentile(flat_stab, q_pct))
+    print(f"[Quantile Estimation] Stabilizer RBP {q_pct:.1f}% percentile: {stab_q:.4f} (from {len(flat_stab):,} active positions)")
 
-    if all_destab_vals:
-        flat_destab = np.concatenate(all_destab_vals)
-        destab_q = float(np.percentile(flat_destab, q_pct))
-        print(f"[Quantile Estimation] Destabilizer RBP {q_pct:.1f}% percentile: {destab_q:.4f} (from {len(flat_destab):,} active positions)")
-    else:
-        destab_q = 600.0
-        print(f"[Quantile Estimation] Warning: No positive Destabilizer RBP values found, fallback to {destab_q:.4f}")
+    if not all_destab_vals:
+        raise RuntimeError(
+            "[Quantile Estimation] No positive Destabilizer RBP peaks found in dataset sample! "
+            "Please verify BED file paths, chromosome formatting, and species compatibility."
+        )
+    flat_destab = np.concatenate(all_destab_vals)
+    destab_q = float(np.percentile(flat_destab, q_pct))
+    print(f"[Quantile Estimation] Destabilizer RBP {q_pct:.1f}% percentile: {destab_q:.4f} (from {len(flat_destab):,} active positions)")
 
     return stab_q, destab_q
 
@@ -375,29 +352,37 @@ def normalize_rbp_tracks(
 
 
 # =============================================================================
-# 6. Incremental Chunking & Merging
+# 5. Incremental Chunking & Merging
 # =============================================================================
 
 def save_chunk(
     chunk_idx: int,
     chunk_items: list,
     chunks_dir: Path,
+    dataset: str = "unknown",
     normalization: str = "none",
     stab_q99: float = None,
     destab_q99: float = None,
 ):
     """Saves a block of transcripts incrementally as NPZ."""
     chunk_file = chunks_dir / f"chunk_{chunk_idx:05d}.npz"
+    tx_arr = np.array([item["ensembl_transcript_id"] for item in chunk_items])
+    gene_id_arr = np.array([item["ensembl_gene_id"] for item in chunk_items])
+    gene_arr = np.array([item["gene"] for item in chunk_items])
+    target_arr = np.array([item["target"] for item in chunk_items], dtype=np.float32)
+    target_raw_arr = np.array([item["target_raw"] for item in chunk_items], dtype=np.float32)
+    lens_arr = np.array([item["length"] for item in chunk_items], dtype=np.int32)
+
     np.savez_compressed(
         chunk_file,
         tracks=np.array([item["track"] for item in chunk_items], dtype=object),
-        ensembl_transcript_id=np.array([item["transcript_id"] for item in chunk_items]),
-        ensembl_gene_id=np.array([item["gene_id"] for item in chunk_items]),
-        hgnc_symbol=np.array([item["gene_symbol"] for item in chunk_items]),
-        half_life_transformed=np.array([item["half_life_transformed"] for item in chunk_items], dtype=np.float32),
-        half_life=np.array([item["half_life"] for item in chunk_items], dtype=np.float32),
-        rate=np.array([item["rate"] for item in chunk_items], dtype=np.float32),
-        seq_lens=np.array([item["length"] for item in chunk_items], dtype=np.int32),
+        target=target_arr,
+        target_raw=target_raw_arr,
+        ensembl_transcript_id=tx_arr,
+        ensembl_gene_id=gene_id_arr,
+        gene=gene_arr,
+        seq_lens=lens_arr,
+        dataset=str(dataset),
         has_stab_rbp=np.array([item["has_stab_rbp"] for item in chunk_items], dtype=bool),
         has_destab_rbp=np.array([item["has_destab_rbp"] for item in chunk_items], dtype=bool),
         has_gtf=np.array([item["has_gtf"] for item in chunk_items], dtype=bool),
@@ -410,6 +395,7 @@ def save_chunk(
 def merge_all_chunks(
     chunks_dir: Path,
     output_file: Path,
+    dataset: str = "unknown",
     normalization: str = "none",
     stab_q99: float = None,
     destab_q99: float = None,
@@ -424,10 +410,9 @@ def merge_all_chunks(
     all_tracks = []
     tx_ids = []
     gene_ids = []
-    gene_symbols = []
-    hl_trans = []
-    hl_raw = []
-    rates = []
+    genes = []
+    targets = []
+    targets_raw = []
     lens = []
     stab_flags = []
     destab_flags = []
@@ -436,12 +421,11 @@ def merge_all_chunks(
     for cf in tqdm(chunk_files, desc="Merging chunks"):
         data = np.load(cf, allow_pickle=True)
         all_tracks.extend(data["tracks"])
+        targets.extend(data["target"])
+        targets_raw.extend(data["target_raw"])
         tx_ids.extend(data["ensembl_transcript_id"])
         gene_ids.extend(data["ensembl_gene_id"])
-        gene_symbols.extend(data["hgnc_symbol"])
-        hl_trans.extend(data["half_life_transformed"])
-        hl_raw.extend(data["half_life"])
-        rates.extend(data["rate"])
+        genes.extend(data["gene"])
         lens.extend(data["seq_lens"])
         stab_flags.extend(data["has_stab_rbp"])
         destab_flags.extend(data["has_destab_rbp"])
@@ -450,13 +434,13 @@ def merge_all_chunks(
     np.savez_compressed(
         output_file,
         tracks=np.array(all_tracks, dtype=object),
+        target=np.array(targets, dtype=np.float32),
+        target_raw=np.array(targets_raw, dtype=np.float32),
         ensembl_transcript_id=np.array(tx_ids),
         ensembl_gene_id=np.array(gene_ids),
-        hgnc_symbol=np.array(gene_symbols),
-        half_life_transformed=np.array(hl_trans, dtype=np.float32),
-        half_life=np.array(hl_raw, dtype=np.float32),
-        rate=np.array(rates, dtype=np.float32),
+        gene=np.array(genes),
         seq_lens=np.array(lens, dtype=np.int32),
+        dataset=str(dataset),
         has_stab_rbp=np.array(stab_flags, dtype=bool),
         has_destab_rbp=np.array(destab_flags, dtype=bool),
         has_gtf=np.array(gtf_flags, dtype=bool),
@@ -469,6 +453,7 @@ def merge_all_chunks(
     print("\n" + "=" * 70)
     print("             COVERAGE & STATISTICS REPORT (2 RBP TRACKS)             ")
     print("=" * 70)
+    print(f"Dataset:                               {dataset}")
     print(f"Total transcripts:                     {n}")
     print(f"Successfully mapped in GTF DB:         {sum(gtf_flags)} ({sum(gtf_flags)/n*100:.2f} %)")
     print(f"Transcripts with Stabilizer RBP peaks: {sum(stab_flags)} ({sum(stab_flags)/n*100:.2f} %)")
@@ -485,51 +470,39 @@ def merge_all_chunks(
 
 
 # =============================================================================
-# 7. Main Pipeline
+# 6. Main Pipeline
 # =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate continuous 2-channel RBP density tracks (Stabilizers & Destabilizers) for hIPSC_CM"
+        description="Generate continuous 2-channel RBP density tracks (Stabilizers & Destabilizers) for hIPSC_CM or mRNABench"
     )
     parser.add_argument(
-        "--saluki_data",
-        "--data_path",
-        dest="saluki_data",
+        "--dataset",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_ej_cds_transformed.txt",
-        help="Path to hIPSC_CM data file (tab-separated)",
+        required=True,
+        choices=["hipsc_cm", "mrna_bench"],
+        help="Dataset to process: 'hipsc_cm' or 'mrna_bench' (required)",
     )
     parser.add_argument(
-        "--gtf_db",
+        "--species",
         type=str,
-        default="/beegfs/prj/RNA_NLP/AlphaGenome/data/Homo_sapiens.GRCh38.108.gtf.db",
-        help="Path to GTF SQLite DB",
-    )
-    parser.add_argument(
-        "--stabilizers_bed",
-        type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/eclip/curated_candidates/stabilizers_peaks.bed",
-        help="Path to Stabilizers eCLIP BED file (Channel 6)",
-    )
-    parser.add_argument(
-        "--destabilizers_bed",
-        type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/eclip/curated_candidates/destabilizers_peaks.bed",
-        help="Path to Destabilizers eCLIP BED file (Channel 7)",
+        default=None,
+        choices=["human", "mouse"],
+        help="Species for mRNABench: 'human' or 'mouse' (required if --dataset is 'mrna_bench')",
     )
     parser.add_argument(
         "--output_file",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/hIPSC_CM_8track_2rbp.npz",
-        help="Output file for the 8-track NPZ archive (automatically appended with normalization suffix)",
+        required=True,
+        help="Output file for the 8-track NPZ archive (automatically appended with normalization suffix, required)",
     )
     parser.add_argument(
         "--normalization",
         type=str,
-        default="minmax",
+        required=True,
         choices=["none", "log", "minmax"],
-        help="Normalization method for RBP tracks (channels 6 & 7): 'none', 'log', or 'minmax' (default: minmax)",
+        help="Normalization method for RBP tracks (channels 6 & 7): 'none', 'log', or 'minmax' (required)",
     )
     parser.add_argument(
         "--stab_q99",
@@ -574,7 +547,11 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.dataset == "mrna_bench" and not args.species:
+        parser.error("--species ('human' or 'mouse') must be specified when --dataset is 'mrna_bench'!")
+
     norm_method = args.normalization.lower()
+    dataset_name = f"{args.dataset}_{args.species}" if args.species else args.dataset
     out_file = Path(args.output_file)
 
     # Dynamically adjust filename and chunk folder according to normalization
@@ -590,6 +567,7 @@ def main():
     print("=" * 80)
     print("   Generation of 2-Channel Directional RBP Tracks (Stabilizers vs. Destabilizers)   ")
     print("=" * 80)
+    print(f"Dataset:            {dataset_name}")
     print(f"Normalization:      {norm_method.upper()} (Global Robust Quantile Scaling)")
     print(f"Output file:        {out_file}")
     print(f"Chunk directory:    {chunks_dir} (Chunk size: {args.chunk_size})")
@@ -618,17 +596,20 @@ def main():
             print(f"[Resume] Found {len(completed_tx_ids)} already processed transcripts in {len(existing_chunks)} chunks!")
 
     # 1. Load GTF database & indexed RBP BED files
-    gtf_helper = GtfDbHelper(Path(args.gtf_db))
-    stab_data = load_bed_indexed(Path(args.stabilizers_bed), label="Stabilizers RBP")
-    destab_data = load_bed_indexed(Path(args.destabilizers_bed), label="Destabilizers RBP")
+    gtf_helper = GtfDbHelper(GTF_DB_PATH)
+    stab_data = load_bed_indexed(STABILIZERS_BED_PATH, label="Stabilizers RBP")
+    destab_data = load_bed_indexed(DESTABILIZERS_BED_PATH, label="Destabilizers RBP")
 
-    # 2. Load hIPSC_CM dataset
-    data_path = Path(args.saluki_data)
-    print(f"\nLoading hIPSC_CM dataset: {data_path}...")
-    df = pd.read_csv(data_path, sep="\t")
-
+    # 2. Load 6-track base dataset
+    print(f"\nLoading 6-track dataset via SixTrackDatasetLoader (dataset='{args.dataset}', species={args.species})...")
+    loader = SixTrackDatasetLoader(
+        dataset=args.dataset,
+        species=args.species,
+        require_transcript_id=True,
+    )
+    df = loader.get_data()
     total_samples = len(df)
-    print(f"Total entries in hIPSC_CM: {total_samples}")
+    print(f"Total entries loaded: {total_samples}")
 
     # Dynamic quantile determination for global scaling
     stab_q99 = args.stab_q99
@@ -674,17 +655,15 @@ def main():
     print("\nProcessing transcripts (with fast O(log N) lookup & incremental saving)...")
     with tqdm(total=total_samples, desc="Progress", initial=len(completed_tx_ids)) as pbar:
         for idx, row in df.iterrows():
-            tx_id = str(row.get("ensembl_transcript_id", ""))
+            tx_id = str(row["ensembl_transcript_id"])
             clean_tx = tx_id.split(".")[0]
 
             # Skip already completed transcripts
             if tx_id in completed_tx_ids or clean_tx in completed_tx_ids:
                 continue
 
-            raw_seq = str(row["sequence"])
-
-            # Base 6-tracks (A, C, G, U, CDS, Splice)
-            six_track, l = parse_saluki_base_tracks(raw_seq)
+            six_track = row["track"]
+            l = int(row["length"])
             if l > args.max_length:
                 six_track = six_track[:args.max_length, :]
                 l = args.max_length
@@ -731,14 +710,18 @@ def main():
             # Concatenate to (L, 8)
             multi_track = np.concatenate([six_track, stab_track, destab_track], axis=1)
 
+            target_val = float(row["target"])
+            target_raw_val = float(row["target_raw"])
+            gene_name = str(row["gene"])
+            gene_id_val = str(row["ensembl_gene_id"])
+
             current_chunk_items.append({
                 "track": multi_track,
-                "transcript_id": tx_id,
-                "gene_id": str(row.get("ensembl_gene_id", "")),
-                "gene_symbol": str(row.get("hgnc_symbol", "")),
-                "half_life_transformed": float(row.get("half_life_transformed", np.nan)),
-                "half_life": float(row.get("half_life", np.nan)),
-                "rate": float(row.get("rate", np.nan)),
+                "ensembl_transcript_id": tx_id,
+                "ensembl_gene_id": gene_id_val,
+                "gene": gene_name,
+                "target": target_val,
+                "target_raw": target_raw_val,
                 "length": l,
                 "has_stab_rbp": has_stab_rbp,
                 "has_destab_rbp": has_destab_rbp,
@@ -752,6 +735,7 @@ def main():
                     chunk_idx,
                     current_chunk_items,
                     chunks_dir,
+                    dataset=dataset_name,
                     normalization=norm_method,
                     stab_q99=stab_q99,
                     destab_q99=destab_q99,
@@ -765,6 +749,7 @@ def main():
                 chunk_idx,
                 current_chunk_items,
                 chunks_dir,
+                dataset=dataset_name,
                 normalization=norm_method,
                 stab_q99=stab_q99,
                 destab_q99=destab_q99,
@@ -774,6 +759,7 @@ def main():
     merge_all_chunks(
         chunks_dir,
         out_file,
+        dataset=dataset_name,
         normalization=norm_method,
         stab_q99=stab_q99,
         destab_q99=destab_q99,

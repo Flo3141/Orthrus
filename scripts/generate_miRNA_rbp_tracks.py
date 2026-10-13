@@ -15,12 +15,25 @@ Features:
 """
 
 import argparse
-import os
 from pathlib import Path
 import gffutils
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+from six_track_dataset import SixTrackDatasetLoader
+
+
+# =============================================================================
+# Fixed Reference File Paths (Cluster Constants)
+# =============================================================================
+GTF_DB_PATH = Path("/beegfs/prj/RNA_NLP/AlphaGenome/data/Homo_sapiens.GRCh38.108.gtf.db")
+TARGETSCAN_FILE_PATH = Path(
+    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/targetscan/Predicted_Targets_Context_Scores.default_predictions.txt"
+)
+ENCODE_ECLIP_FILE_PATH = Path(
+    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/eclip/all_rbp_peaks_merged.bed"
+)
 
 
 # =============================================================================
@@ -246,38 +259,7 @@ def load_eclip_indexed(bed_path: Path) -> dict:
 
 
 # =============================================================================
-# 4. Saluki 6-Track Base Parser
-# =============================================================================
-
-def parse_saluki_base_tracks(raw_seq: str) -> tuple:
-    tokens = [tok.strip() for tok in raw_seq.split(",") if tok.strip()]
-    l = len(tokens)
-    if l == 0:
-        return np.zeros((0, 6), dtype=np.float32), 0, 0, []
-
-    clean_seq = "".join(tok[0] for tok in tokens)
-
-    seq_bytes = np.frombuffer(clean_seq.upper().encode("ascii"), dtype=np.uint8)
-    oh = np.zeros((l, 4), dtype=np.float32)
-    oh[seq_bytes == 65, 0] = 1.0
-    oh[seq_bytes == 67, 1] = 1.0
-    oh[seq_bytes == 71, 2] = 1.0
-    oh[(seq_bytes == 84) | (seq_bytes == 85), 3] = 1.0
-
-    cds_track = np.array([1.0 if tok[0].isupper() else 0.0 for tok in tokens], dtype=np.float32).reshape(-1, 1)
-    splice_track = np.array([1.0 if "ej" in tok.lower() else 0.0 for tok in tokens], dtype=np.float32).reshape(-1, 1)
-
-    six_track = np.concatenate([oh, cds_track, splice_track], axis=1)
-
-    upper_indices = [i for i, tok in enumerate(tokens) if tok[0].isupper()]
-    utr3_start = (max(upper_indices) + 3) if upper_indices else 0
-    utr3_start = min(utr3_start, l)
-
-    return six_track, l, utr3_start, upper_indices
-
-
-# =============================================================================
-# 5. Normalization for Continuous Trans-Factor Tracks (Channels 6 & 7)
+# 4. Normalization for Continuous Trans-Factor Tracks (Channels 6 & 7)
 # =============================================================================
 
 def compute_dynamic_quantiles(
@@ -307,25 +289,26 @@ def compute_dynamic_quantiles(
     all_eclip_vals = []
 
     for _, row in tqdm(eval_df.iterrows(), total=len(eval_df), desc="Estimating quantiles"):
-        tx_id = str(row.get("ensembl_transcript_id", ""))
+        tx_id = str(row["ensembl_transcript_id"])
         clean_tx = tx_id.split(".")[0]
-        raw_seq = str(row["sequence"])
-        l = min(len(raw_seq), max_length)
+        if not clean_tx:
+            continue
+
+        l = min(int(row["length"]), max_length)
 
         # miRNA channel: TargetScan on 3' UTR
         if clean_tx in ts_data:
-            upper_indices = [i for i, c in enumerate(raw_seq[:l]) if c.isupper()]
-            utr3_start = (upper_indices[-1] + 3) if upper_indices else 0
-
-            mirna_1d = np.zeros(l, dtype=np.float32)
-            for start, end, score in ts_data[clean_tx]:
-                abs_start = utr3_start + (start - 1)
-                abs_end = utr3_start + end
-                if abs_start < l:
-                    mirna_1d[abs_start:min(abs_end, l)] += score
-            nz_mirna = mirna_1d[mirna_1d > 0]
-            if len(nz_mirna) > 0:
-                all_mirna_vals.append(nz_mirna)
+            utr3_start = int(row["utr3_start"])
+            if utr3_start > 0:
+                mirna_1d = np.zeros(l, dtype=np.float32)
+                for start, end, score in ts_data[clean_tx]:
+                    abs_start = utr3_start + (start - 1)
+                    abs_end = utr3_start + end
+                    if abs_start < l:
+                        mirna_1d[abs_start:min(abs_end, l)] += score
+                nz_mirna = mirna_1d[mirna_1d > 0]
+                if len(nz_mirna) > 0:
+                    all_mirna_vals.append(nz_mirna)
 
         # eCLIP channel: ENCODE peaks mapped to exons
         tx_info = gtf_helper.get_transcript_exons(clean_tx)
@@ -341,21 +324,23 @@ def compute_dynamic_quantiles(
                 if len(nz_eclip) > 0:
                     all_eclip_vals.append(nz_eclip)
 
-    if all_mirna_vals:
-        flat_mirna = np.concatenate(all_mirna_vals)
-        mirna_q = float(np.percentile(flat_mirna, q_pct))
-        print(f"[Quantile Estimation] TargetScan miRNA {q_pct:.1f}% percentile: {mirna_q:.4f} (from {len(flat_mirna):,} active positions)")
-    else:
-        mirna_q = 5.0
-        print(f"[Quantile Estimation] Warning: No positive miRNA values found, fallback to {mirna_q:.4f}")
+    if not all_mirna_vals:
+        raise RuntimeError(
+            "[Quantile Estimation] No positive TargetScan miRNA binding sites found in dataset sample! "
+            "Please verify TargetScan file path, transcript ID mapping, and 3' UTR coordinates."
+        )
+    flat_mirna = np.concatenate(all_mirna_vals)
+    mirna_q = float(np.percentile(flat_mirna, q_pct))
+    print(f"[Quantile Estimation] TargetScan miRNA {q_pct:.1f}% percentile: {mirna_q:.4f} (from {len(flat_mirna):,} active positions)")
 
-    if all_eclip_vals:
-        flat_eclip = np.concatenate(all_eclip_vals)
-        eclip_q = float(np.percentile(flat_eclip, q_pct))
-        print(f"[Quantile Estimation] ENCODE eCLIP {q_pct:.1f}% percentile: {eclip_q:.4f} (from {len(flat_eclip):,} active positions)")
-    else:
-        eclip_q = 600.0
-        print(f"[Quantile Estimation] Warning: No positive eCLIP values found, fallback to {eclip_q:.4f}")
+    if not all_eclip_vals:
+        raise RuntimeError(
+            "[Quantile Estimation] No positive ENCODE eCLIP peaks found in dataset sample! "
+            "Please verify eCLIP file path, chromosome formatting, and species compatibility."
+        )
+    flat_eclip = np.concatenate(all_eclip_vals)
+    eclip_q = float(np.percentile(flat_eclip, q_pct))
+    print(f"[Quantile Estimation] ENCODE eCLIP {q_pct:.1f}% percentile: {eclip_q:.4f} (from {len(flat_eclip):,} active positions)")
 
     return mirna_q, eclip_q
 
@@ -423,22 +408,30 @@ def save_chunk(
     chunk_idx: int,
     chunk_items: list,
     chunks_dir: Path,
+    dataset: str = "unknown",
     normalization: str = "none",
     mirna_q99: float = None,
     eclip_q99: float = None,
 ):
     """Saves a block of transcripts incrementally as NPZ."""
     chunk_file = chunks_dir / f"chunk_{chunk_idx:05d}.npz"
+    tx_arr = np.array([item["ensembl_transcript_id"] for item in chunk_items])
+    gene_id_arr = np.array([item["ensembl_gene_id"] for item in chunk_items])
+    gene_arr = np.array([item["gene"] for item in chunk_items])
+    target_arr = np.array([item["target"] for item in chunk_items], dtype=np.float32)
+    target_raw_arr = np.array([item["target_raw"] for item in chunk_items], dtype=np.float32)
+    lens_arr = np.array([item["length"] for item in chunk_items], dtype=np.int32)
+
     np.savez_compressed(
         chunk_file,
         tracks=np.array([item["track"] for item in chunk_items], dtype=object),
-        ensembl_transcript_id=np.array([item["transcript_id"] for item in chunk_items]),
-        ensembl_gene_id=np.array([item["gene_id"] for item in chunk_items]),
-        hgnc_symbol=np.array([item["gene_symbol"] for item in chunk_items]),
-        half_life_transformed=np.array([item["half_life_transformed"] for item in chunk_items], dtype=np.float32),
-        half_life=np.array([item["half_life"] for item in chunk_items], dtype=np.float32),
-        rate=np.array([item["rate"] for item in chunk_items], dtype=np.float32),
-        seq_lens=np.array([item["length"] for item in chunk_items], dtype=np.int32),
+        target=target_arr,
+        target_raw=target_raw_arr,
+        ensembl_transcript_id=tx_arr,
+        ensembl_gene_id=gene_id_arr,
+        gene=gene_arr,
+        seq_lens=lens_arr,
+        dataset=str(dataset),
         has_mirna=np.array([item["has_mirna"] for item in chunk_items], dtype=bool),
         has_eclip=np.array([item["has_eclip"] for item in chunk_items], dtype=bool),
         has_gtf=np.array([item["has_gtf"] for item in chunk_items], dtype=bool),
@@ -451,6 +444,7 @@ def save_chunk(
 def merge_all_chunks(
     chunks_dir: Path,
     output_file: Path,
+    dataset: str = "unknown",
     normalization: str = "none",
     mirna_q99: float = None,
     eclip_q99: float = None,
@@ -463,12 +457,11 @@ def merge_all_chunks(
 
     print(f"\nMerging {len(chunk_files)} chunks into {output_file}...")
     all_tracks = []
+    targets = []
+    targets_raw = []
     tx_ids = []
     gene_ids = []
-    gene_symbols = []
-    hl_trans = []
-    hl_raw = []
-    rates = []
+    genes = []
     lens = []
     mirna_flags = []
     eclip_flags = []
@@ -477,12 +470,11 @@ def merge_all_chunks(
     for cf in tqdm(chunk_files, desc="Merging chunks"):
         data = np.load(cf, allow_pickle=True)
         all_tracks.extend(data["tracks"])
+        targets.extend(data["target"])
+        targets_raw.extend(data["target_raw"])
         tx_ids.extend(data["ensembl_transcript_id"])
         gene_ids.extend(data["ensembl_gene_id"])
-        gene_symbols.extend(data["hgnc_symbol"])
-        hl_trans.extend(data["half_life_transformed"])
-        hl_raw.extend(data["half_life"])
-        rates.extend(data["rate"])
+        genes.extend(data["gene"])
         lens.extend(data["seq_lens"])
         mirna_flags.extend(data["has_mirna"])
         eclip_flags.extend(data["has_eclip"])
@@ -491,13 +483,13 @@ def merge_all_chunks(
     np.savez_compressed(
         output_file,
         tracks=np.array(all_tracks, dtype=object),
+        target=np.array(targets, dtype=np.float32),
+        target_raw=np.array(targets_raw, dtype=np.float32),
         ensembl_transcript_id=np.array(tx_ids),
         ensembl_gene_id=np.array(gene_ids),
-        hgnc_symbol=np.array(gene_symbols),
-        half_life_transformed=np.array(hl_trans, dtype=np.float32),
-        half_life=np.array(hl_raw, dtype=np.float32),
-        rate=np.array(rates, dtype=np.float32),
+        gene=np.array(genes),
         seq_lens=np.array(lens, dtype=np.int32),
+        dataset=str(dataset),
         has_mirna=np.array(mirna_flags, dtype=bool),
         has_eclip=np.array(eclip_flags, dtype=bool),
         has_gtf=np.array(gtf_flags, dtype=bool),
@@ -510,6 +502,7 @@ def merge_all_chunks(
     print("\n" + "=" * 65)
     print("             COVERAGE & STATISTICS REPORT             ")
     print("=" * 65)
+    print(f"Dataset:                             {dataset}")
     print(f"Total transcripts:                   {n}")
     print(f"Successfully mapped in GTF DB:       {sum(gtf_flags)} ({sum(gtf_flags)/n*100:.2f} %)")
     print(f"Transcripts with TargetScan miRNAs:  {sum(mirna_flags)} ({sum(mirna_flags)/n*100:.2f} %)")
@@ -531,46 +524,34 @@ def merge_all_chunks(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate continuous trans-factor density tracks for hIPSC_CM (with incremental saving)"
+        description="Generate continuous trans-factor density tracks (TargetScan miRNA, ENCODE eCLIP) for hIPSC_CM or mRNABench"
     )
     parser.add_argument(
-        "--saluki_data",
-        "--data_path",
-        dest="saluki_data",
+        "--dataset",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_ej_cds_transformed.txt",
-        help="Path to hIPSC_CM data file (tab-separated)",
+        required=True,
+        choices=["hipsc_cm", "mrna_bench"],
+        help="Dataset to process: 'hipsc_cm' or 'mrna_bench' (required)",
     )
     parser.add_argument(
-        "--gtf_db",
+        "--species",
         type=str,
-        default="/beegfs/prj/RNA_NLP/AlphaGenome/data/Homo_sapiens.GRCh38.108.gtf.db",
-        help="Path to GTF SQLite DB",
-    )
-    parser.add_argument(
-        "--targetscan_file",
-        type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/targetscan/Predicted_Targets_Context_Scores.default_predictions.txt",
-        help="Path to TargetScan prediction table",
-    )
-    parser.add_argument(
-        "--encode_eclip_file",
-        type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/eclip/all_rbp_peaks_merged.bed",
-        help="Path to ENCODE eCLIP BED/narrowPeak file",
+        default=None,
+        choices=["human", "mouse"],
+        help="Species for mRNABench: 'human' or 'mouse' (required if --dataset is 'mrna_bench')",
     )
     parser.add_argument(
         "--output_file",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/hIPSC_CM_8track.npz",
-        help="Output file for the augmented NPZ archive (automatically appended with normalization suffix)",
+        required=True,
+        help="Output file for the augmented NPZ archive (automatically appended with normalization suffix, required)",
     )
     parser.add_argument(
         "--normalization",
         type=str,
-        default="none",
+        required=True,
         choices=["none", "log", "minmax"],
-        help="Normalization method for trans-factor tracks (channels 6 & 7): 'none' (raw values), 'log' (np.log1p(x)), or 'minmax' (Log-transformation with robust quantile scaling to [0, 1]: min(1.0, log(1 + x) / log(1 + q99)) using dynamically estimated dataset q99 bounds)",
+        help="Normalization method for trans-factor tracks (channels 6 & 7): 'none' (raw values), 'log' (np.log1p(x)), or 'minmax' (Log-transformation with robust quantile scaling to [0, 1])",
     )
     parser.add_argument(
         "--mirna_q99",
@@ -619,7 +600,12 @@ def main():
     )
     args = parser.parse_args()
 
+    # Enforce species requirement for mrna_bench
+    if args.dataset == "mrna_bench" and not args.species:
+        parser.error("--species ('human' or 'mouse') must be specified when --dataset is 'mrna_bench'!")
+
     norm_method = args.normalization.lower()
+    dataset_name = f"{args.dataset}_{args.species}" if args.species else args.dataset
     out_file = Path(args.output_file)
 
     # Dynamically adjust filename and chunk folder according to normalization
@@ -637,6 +623,7 @@ def main():
     print("=" * 75)
     print("   Generation of Trans-Factor Density Tracks (TargetScan, ENCODE eCLIP)   ")
     print("=" * 75)
+    print(f"Dataset:            {args.dataset}" + (f" ({args.species})" if args.species else ""))
     print(f"Normalization:      {norm_method.upper()} (Global Robust Quantile Scaling)")
     print(f"Output file:        {out_file}")
     print(f"Chunk directory:    {chunks_dir} (Chunk size: {args.chunk_size})")
@@ -664,18 +651,22 @@ def main():
         if completed_tx_ids:
             print(f"[Resume] Found {len(completed_tx_ids)} already processed transcripts in {len(existing_chunks)} chunks!")
 
-    # 1. Load databases & lookup tables
-    gtf_helper = GtfDbHelper(Path(args.gtf_db))
-    ts_data = load_targetscan_data(Path(args.targetscan_file))
-    eclip_data = load_eclip_indexed(Path(args.encode_eclip_file))
+    # 1. Load databases & lookup tables via fixed constants
+    gtf_helper = GtfDbHelper(GTF_DB_PATH)
+    ts_data = load_targetscan_data(TARGETSCAN_FILE_PATH)
+    eclip_data = load_eclip_indexed(ENCODE_ECLIP_FILE_PATH)
 
-    # 2. Load hIPSC_CM dataset
-    data_path = Path(args.saluki_data)
-    print(f"\nLoading hIPSC_CM dataset: {data_path}...")
-    df = pd.read_csv(data_path, sep="\t")
+    # 2. Load dataset via modular SixTrackDatasetLoader
+    print(f"\nLoading dataset via SixTrackDatasetLoader: {args.dataset}" + (f" ({args.species})" if args.species else "") + "...")
+    loader = SixTrackDatasetLoader(
+        dataset=args.dataset,
+        species=args.species,
+        require_transcript_id=True,  # Discards unmapped transcripts without valid ENST ID
+    )
+    df = loader.get_data()
 
     total_samples = len(df)
-    print(f"Total entries in hIPSC_CM: {total_samples}")
+    print(f"Total entries to process: {total_samples}")
 
     # Dynamic quantile determination for global scaling
     mirna_q99 = args.mirna_q99
@@ -721,17 +712,18 @@ def main():
     print("\nProcessing transcripts (with fast O(log N) lookup & incremental saving)...")
     with tqdm(total=total_samples, desc="Progress", initial=len(completed_tx_ids)) as pbar:
         for idx, row in df.iterrows():
-            tx_id = str(row.get("ensembl_transcript_id", ""))
+            tx_id = str(row["ensembl_transcript_id"])
             clean_tx = tx_id.split(".")[0]
 
             # Skip already completed transcripts
             if tx_id in completed_tx_ids or clean_tx in completed_tx_ids:
                 continue
 
-            raw_seq = str(row["sequence"])
+            # Base 6-tracks directly from SixTrackDatasetLoader
+            six_track = row["track"].copy()
+            l = int(row["length"])
+            utr3_start = int(row["utr3_start"])
 
-            # Base 6-tracks
-            six_track, l, utr3_start, upper_indices = parse_saluki_base_tracks(raw_seq)
             if l > args.max_length:
                 six_track = six_track[:args.max_length, :]
                 l = args.max_length
@@ -739,7 +731,7 @@ def main():
             # Channel 6: TargetScan miRNA
             mirna_track = np.zeros((l, 1), dtype=np.float32)
             has_mirna = False
-            if clean_tx in ts_data and upper_indices:
+            if clean_tx in ts_data and utr3_start > 0:
                 for start, end, score in ts_data[clean_tx]:
                     abs_start = utr3_start + (start - 1)
                     abs_end = utr3_start + end
@@ -780,14 +772,17 @@ def main():
             multi_track = np.concatenate([six_track, mirna_track, eclip_track], axis=1)
 
             # Add to current chunk
+            target_val = float(row["target"])
+            target_raw_val = float(row["target_raw"])
+            gene_name = str(row["gene"])
+            gene_id_val = str(row["ensembl_gene_id"])
             current_chunk_items.append({
                 "track": multi_track,
-                "transcript_id": tx_id,
-                "gene_id": str(row.get("ensembl_gene_id", "")),
-                "gene_symbol": str(row.get("hgnc_symbol", "")),
-                "half_life_transformed": float(row.get("half_life_transformed", np.nan)),
-                "half_life": float(row.get("half_life", np.nan)),
-                "rate": float(row.get("rate", np.nan)),
+                "ensembl_transcript_id": tx_id,
+                "ensembl_gene_id": gene_id_val,
+                "gene": gene_name,
+                "target": target_val,
+                "target_raw": target_raw_val,
                 "length": l,
                 "has_mirna": has_mirna,
                 "has_eclip": has_eclip,
@@ -801,6 +796,7 @@ def main():
                     chunk_idx,
                     current_chunk_items,
                     chunks_dir,
+                    dataset=dataset_name,
                     normalization=norm_method,
                     mirna_q99=mirna_q99,
                     eclip_q99=eclip_q99,
@@ -814,6 +810,7 @@ def main():
                 chunk_idx,
                 current_chunk_items,
                 chunks_dir,
+                dataset=dataset_name,
                 normalization=norm_method,
                 mirna_q99=mirna_q99,
                 eclip_q99=eclip_q99,
@@ -823,6 +820,7 @@ def main():
     merge_all_chunks(
         chunks_dir,
         out_file,
+        dataset=dataset_name,
         normalization=norm_method,
         mirna_q99=mirna_q99,
         eclip_q99=eclip_q99,

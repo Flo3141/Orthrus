@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""
+Unified extraction of Orthrus embeddings using precomputed N-tracks archives
+and fine-tuned 4-fold cross-validation model checkpoints.
+
+Exclusively operates on precomputed N-track NPZ archives (from generate_miRNA_rbp_tracks.py,
+generate_2_rbp_tracks.py, generate_m6a_tracks.py, etc.) and strictly runs 4-fold CV
+representation extraction (Out-of-Fold validation + Test ensemble mean).
+"""
+
+import argparse
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+import numpy as np
+import pandas as pd
+import torch
+from tqdm import tqdm
+from transformers import AutoModel
+
+from util import reset_peak_memory_stats, print_memory_profile
+
+
+SPLITS_LOOKUP_PATH = Path(
+    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hipsc_cm_10folds_lookup.csv"
+)
+
+
+def get_representation(model: torch.nn.Module, x_tensor: torch.Tensor, lengths_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Invokes the representation method on the Orthrus backbone or wrapper model.
+    """
+    if hasattr(model, "representation"):
+        return model.representation(x_tensor, lengths_tensor, channel_last=True)
+    elif hasattr(model, "backbone") and hasattr(model.backbone, "representation"):
+        return model.backbone.representation(x_tensor, lengths_tensor, channel_last=True)
+    else:
+        raise AttributeError(f"Loaded model ({type(model).__name__}) has no 'representation' method.")
+
+
+def extract_embeddings_for_tracks(
+    tracks: list,
+    model: torch.nn.Module,
+    device: torch.device,
+    batch_size: int = 16,
+    max_length: int = 12288,
+    desc: str = "Extracting representations",
+) -> np.ndarray:
+    """
+    Extracts 512-dimensional Orthrus pooled embeddings using dynamic-length batching.
+    Tracks are sorted by length to minimize zero-padding overhead.
+    """
+    if len(tracks) == 0:
+        return np.zeros((0, 512), dtype=np.float32)
+
+    sample_data = []
+    truncated_count = 0
+
+    for idx, tr in enumerate(tracks):
+        if tr.shape[0] > max_length:
+            truncated_count += 1
+            tr = tr[:max_length, :]
+
+        sample_data.append({
+            "orig_idx": idx,
+            "track": tr,
+            "length": tr.shape[0],
+        })
+
+    if truncated_count > 0:
+        print(f"Notice: {truncated_count} sequences were truncated to max_length={max_length} nucleotides.")
+
+    # Sort descending by length to detect peak VRAM early and minimize batch padding
+    sorted_samples = sorted(sample_data, key=lambda s: s["length"], reverse=True)
+    embeddings_list = [None] * len(sample_data)
+
+    for i in tqdm(range(0, len(sorted_samples), batch_size), desc=desc):
+        batch = sorted_samples[i : i + batch_size]
+        b_lens = [s["length"] for s in batch]
+        max_b_len = max(b_lens)
+        n_channels = batch[0]["track"].shape[1]
+
+        batch_arr = np.zeros((len(batch), max_b_len, n_channels), dtype=np.float32)
+        for b_idx, s in enumerate(batch):
+            l = s["length"]
+            batch_arr[b_idx, :l, :] = s["track"]
+
+        x_tensor = torch.from_numpy(batch_arr).to(device)
+        lengths_tensor = torch.tensor(b_lens, dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            batch_emb = get_representation(model, x_tensor, lengths_tensor)
+            batch_emb_np = batch_emb.cpu().float().numpy()
+
+        for b_idx, s in enumerate(batch):
+            orig_i = s["orig_idx"]
+            embeddings_list[orig_i] = batch_emb_np[b_idx]
+
+    return np.stack(embeddings_list, axis=0)
+
+
+def load_fold_backbone(fold_dir: Path, device: torch.device) -> torch.nn.Module:
+    """
+    Loads the fine-tuned Orthrus backbone for a specific fold directory.
+    Checks for 'best_finetuned_backbone' subdirectory or directly loads from fold_dir.
+    """
+    ckpt_dir = fold_dir / "best_finetuned_backbone" if (fold_dir / "best_finetuned_backbone").is_dir() else fold_dir
+    print(f"Loading fold backbone from: {ckpt_dir}...")
+    model = AutoModel.from_pretrained(str(ckpt_dir), trust_remote_code=True)
+    model = model.to(device)
+    model.eval()
+    return model
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Unified 4-Fold CV Orthrus Embedding Extraction for Precomputed N-Tracks Archives"
+    )
+    parser.add_argument(
+        "--tracks_file",
+        "--data_path",
+        dest="tracks_file",
+        type=str,
+        required=True,
+        help="Path to precomputed N-tracks NPZ archive (e.g. 6-track, 7-track, 8-track, required)",
+    )
+    parser.add_argument(
+        "--model_checkpoint",
+        type=str,
+        required=True,
+        help="Path to fine-tuned model directory containing 4-fold subdirectories (fold_0, fold_1, fold_2, fold_3, required)",
+    )
+    parser.add_argument(
+        "--output_file",
+        type=str,
+        required=True,
+        help="Destination NPZ archive path for extracted embeddings (required)",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=16,
+        help="Batch size for model inference (default: 16)",
+    )
+    parser.add_argument(
+        "--max_length",
+        type=int,
+        default=12288,
+        help="Maximum sequence length (default: 12288 bp)",
+    )
+    parser.add_argument(
+        "--start_fresh",
+        action="store_true",
+        default=False,
+        help="Ignore existing intermediate fold checkpoint files and restart extraction from scratch",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # 1. Load Precomputed Track Archive
+    tracks_path = Path(args.tracks_file)
+    if not tracks_path.exists():
+        raise FileNotFoundError(f"[Error] Specified tracks archive does not exist: {tracks_path}")
+
+    print("=" * 75)
+    print("      ORTHRUS UNIFIED 4-FOLD CV EMBEDDING EXTRACTION PIPELINE       ")
+    print("=" * 75)
+    print(f"Tracks archive:     {tracks_path}")
+    print(f"Model directory:    {args.model_checkpoint}")
+    print(f"Batch size:         {args.batch_size}")
+    print(f"Max sequence len:   {args.max_length}")
+
+    npz_data = np.load(tracks_path, allow_pickle=True)
+    if "tracks" not in npz_data:
+        raise KeyError(
+            f"[Error] Required field 'tracks' not found in {tracks_path}! "
+            f"Available keys: {list(npz_data.files)}"
+        )
+
+    tracks = list(npz_data["tracks"])
+    n_samples = len(tracks)
+    if n_samples == 0:
+        raise RuntimeError(f"[Error] Tracks archive {tracks_path} contains 0 samples!")
+
+    n_channels = tracks[0].shape[1]
+    targets = npz_data["target"].astype(np.float32) if "target" in npz_data else np.full(n_samples, np.nan, dtype=np.float32)
+    targets_raw = npz_data["target_raw"].astype(np.float32) if "target_raw" in npz_data else np.full(n_samples, np.nan, dtype=np.float32)
+    tx_ids = npz_data["ensembl_transcript_id"].astype(str) if "ensembl_transcript_id" in npz_data else np.array([""] * n_samples)
+    gene_ids = npz_data["ensembl_gene_id"].astype(str) if "ensembl_gene_id" in npz_data else np.array([""] * n_samples)
+    genes = npz_data["gene"].astype(str) if "gene" in npz_data else np.array([""] * n_samples)
+    seq_lens = npz_data["seq_lens"].astype(np.int32) if "seq_lens" in npz_data else np.array([len(t) for t in tracks], dtype=np.int32)
+
+    if "dataset" not in npz_data:
+        raise KeyError(
+            f"[Error] Required field 'dataset' not found in tracks archive {tracks_path}! "
+            f"Available keys: {list(npz_data.files)}"
+        )
+    dataset_raw = npz_data["dataset"]
+    if isinstance(dataset_raw, np.ndarray) and dataset_raw.ndim > 0 and len(dataset_raw) > 0:
+        dataset_name = str(dataset_raw.flat[0]).strip()
+    elif hasattr(dataset_raw, "item"):
+        try:
+            dataset_name = str(dataset_raw.item()).strip()
+        except Exception:
+            dataset_name = str(dataset_raw).strip()
+    else:
+        dataset_name = str(dataset_raw).strip()
+
+    print(f"\n[Tracks Info] Loaded {n_samples:,} transcripts with {n_channels} channels.")
+    print(f"Dataset identity:   {dataset_name}")
+
+    # 2. Verify 4-Fold Model Directory
+    model_dir = Path(str(args.model_checkpoint).strip())
+    if not model_dir.exists():
+        raise FileNotFoundError(f"[Error] Model checkpoint directory not found: {model_dir}")
+
+    fold_subdirs = [model_dir / f"fold_{k}" for k in range(4)]
+    missing_folds = [f"fold_{k}" for k, p in enumerate(fold_subdirs) if not p.is_dir()]
+    if missing_folds:
+        raise FileNotFoundError(
+            f"[Error] 4-Fold Cross-Validation requires fold subdirectories (fold_0..fold_3) in {model_dir}. "
+            f"Missing fold directories: {missing_folds}."
+        )
+
+    # 3. Resolve Destination File Path
+    save_file = Path(args.output_file)
+    save_file.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_file = save_file.with_name(f"{save_file.stem}_checkpoint.npz")
+    print(f"Destination file:   {save_file}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Computing device:   {device}")
+    reset_peak_memory_stats(device)
+
+    # 4. Resolve Standardized 10-Fold Splits Lookup Table
+    lookup_path = SPLITS_LOOKUP_PATH
+    if not lookup_path.exists():
+        raise FileNotFoundError(
+            f"[Error] 4-Fold cross-validation requires a standardized 10-fold split lookup table! "
+            f"Lookup table not found at: {lookup_path}."
+        )
+
+    print(f"\n[Splits Lookup] Loading lookup table: {lookup_path}")
+    lookup_df = pd.read_csv(lookup_path)
+    lookup_tx_col = "ensembl_transcript_id" if "ensembl_transcript_id" in lookup_df.columns else "transcript_id"
+    if lookup_tx_col not in lookup_df.columns or "split" not in lookup_df.columns:
+        raise KeyError(f"[Error] Required columns ('{lookup_tx_col}', 'split') not found in lookup table {lookup_path}!")
+
+    tx_to_split = dict(
+        zip(lookup_df[lookup_tx_col].astype(str).str.strip(), lookup_df["split"].astype(int))
+    )
+    sample_splits = np.array([tx_to_split.get(str(t).strip(), -1) for t in tx_ids])
+
+    # Canonical 4-fold assignments:
+    # Fold 0 (Train [0..5]) -> Val [6, 7]
+    # Fold 1 (Train [2..7]) -> Val [0, 1]
+    # Fold 2 (Train [0,1,4,5,6,7]) -> Val [2, 3]
+    # Fold 3 (Train [0,1,2,3,6,7]) -> Val [4, 5]
+    fold_val_splits = {
+        0: [6, 7],
+        1: [0, 1],
+        2: [2, 3],
+        3: [4, 5],
+    }
+    test_splits = [8, 9]
+
+    all_embeddings = np.zeros((n_samples, 512), dtype=np.float32)
+    fold_assignment = np.empty(n_samples, dtype=object)
+
+    test_idx = np.where(np.isin(sample_splits, test_splits))[0]
+    test_tracks = [tracks[i] for i in test_idx]
+    test_accum = np.zeros((len(test_idx), 512), dtype=np.float32)
+
+    print(f"\n4-Fold CV Setup: Total Samples = {n_samples:,}, Test Samples [8, 9] = {len(test_idx):,}")
+
+    # 5. Execute 4-Fold CV Extraction (with Resumable Checkpoint)
+    completed_folds = set()
+    if not args.start_fresh and checkpoint_file.exists():
+        print(f"[*] Found existing checkpoint: {checkpoint_file}")
+        try:
+            with np.load(checkpoint_file, allow_pickle=True) as ckpt:
+                all_embeddings = ckpt["embeddings"].copy()
+                fold_assignment = ckpt["fold_assignment"].copy()
+                test_accum = ckpt["test_accum"].copy()
+                completed_folds = set(ckpt["completed_folds"].tolist())
+            print(f"[*] Resuming: Folds {sorted(completed_folds)} already completed.")
+        except Exception as e:
+            print(f"[!] Warning: Failed to load checkpoint ({e}). Starting folds from scratch.")
+
+    for k in range(4):
+        if k in completed_folds:
+            print(f"\n--- [Fold {k}] Already completed in checkpoint. Skipping ---")
+            continue
+
+        val_splits = fold_val_splits[k]
+        val_idx = np.where(np.isin(sample_splits, val_splits))[0]
+        val_tracks = [tracks[i] for i in val_idx]
+
+        fold_dir = fold_subdirs[k]
+        print(f"\n--- [Fold {k}] Loading model from: {fold_dir} ---")
+        fold_model = load_fold_backbone(fold_dir, device)
+
+        print(f"[Fold {k}] Extracting Out-of-Fold Val Embeddings (Splits {val_splits}, {len(val_idx):,} samples)...")
+        val_emb = extract_embeddings_for_tracks(
+            tracks=val_tracks,
+            model=fold_model,
+            device=device,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            desc=f"Fold {k} Val",
+        )
+        all_embeddings[val_idx] = val_emb
+        for i in val_idx:
+            fold_assignment[i] = f"fold_{k}"
+
+        print(f"[Fold {k}] Extracting Test Set Embeddings (Splits {test_splits}, {len(test_idx):,} samples)...")
+        fold_test_emb = extract_embeddings_for_tracks(
+            tracks=test_tracks,
+            model=fold_model,
+            device=device,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            desc=f"Fold {k} Test",
+        )
+        test_accum += fold_test_emb
+
+        del fold_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Save checkpoint after each fold
+        completed_folds.add(k)
+        ckpt_dict = {
+            "embeddings": all_embeddings,
+            "fold_assignment": fold_assignment,
+            "test_accum": test_accum,
+            "completed_folds": np.array(list(completed_folds), dtype=np.int32),
+        }
+        tmp_ckpt = checkpoint_file.with_suffix(".tmp.npz")
+        np.savez_compressed(tmp_ckpt, **ckpt_dict)
+        tmp_ckpt.replace(checkpoint_file)
+        print(f"[✓] Checkpoint saved after Fold {k} (completed: {sorted(completed_folds)}).")
+
+    # Clean up temporary checkpoint upon full completion
+    if checkpoint_file.exists():
+        try:
+            checkpoint_file.unlink()
+        except OSError:
+            pass
+
+    # Ensemble Mean for Test Set [8, 9]
+    print("\nComputing Ensemble Mean Embedding for Test Set [8, 9] across all 4 folds...")
+    if len(test_idx) > 0:
+        all_embeddings[test_idx] = test_accum / 4.0
+        for i in test_idx:
+            fold_assignment[i] = "ensemble_mean"
+
+    unmatched_idx = np.where(sample_splits == -1)[0]
+    if len(unmatched_idx) > 0:
+        print(f"[Notice] {len(unmatched_idx):,} samples had no split assignment in lookup table.")
+        for i in unmatched_idx:
+            fold_assignment[i] = "unassigned"
+
+    # 6. Save Standardized Output NPZ Archive
+    print(f"\nSaving final embeddings to: {save_file}")
+    np.savez_compressed(
+        save_file,
+        embeddings=all_embeddings,
+        target=targets,
+        target_raw=targets_raw,
+        targets=targets,
+        targets_raw=targets_raw,
+        ensembl_transcript_id=tx_ids,
+        ensembl_gene_id=gene_ids,
+        tx_ids=tx_ids,
+        gene=genes,
+        genes=genes,
+        seq_lens=seq_lens,
+        dataset=str(dataset_name),
+        fold_assignment=fold_assignment,
+        model_checkpoint=str(model_dir),
+        is_finetuned=True,
+        is_4fold_cv=True,
+    )
+
+    print("=" * 75)
+    print("                    EXTRACTION COMPLETED SUCCESSFULLY                 ")
+    print("=" * 75)
+    print(f"Embedding array shape:   {all_embeddings.shape}")
+    print(f"Saved to:                {save_file}")
+    print(f"Standardized NPZ Keys:   ['embeddings', 'target', 'target_raw', 'targets', 'targets_raw',")
+    print(f"                          'ensembl_transcript_id', 'ensembl_gene_id', 'tx_ids',")
+    print(f"                          'gene', 'genes', 'seq_lens', 'dataset']")
+    print("=" * 75 + "\n")
+
+    print_memory_profile(device=device, title="ORTHRUS EMBEDDINGS SPEICHER-PROFILING")
+
+
+if __name__ == "__main__":
+    main()

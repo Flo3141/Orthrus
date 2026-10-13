@@ -25,8 +25,8 @@ EMBEDDING_OUT="${PROJECT_DIR}/data/hIPSC_CM/orthrus/orthrus_8track_embeddings_hI
 # -----------------------------------------------------------------------------
 if [ ! -f "${SPLITS_LOOKUP}" ]; then
     echo -e "\n[STEP 0/4] Generating standardized 10-fold split lookup table..."
-    python "${SCRIPTS_DIR}/create_hipsc_cm_splits.py" \
-        --input_path "${DATA_NPZ}" \
+    python "${SCRIPTS_DIR}/create_deterministic_splits.py" \
+        --dataset "hipsc_cm" \
         --output_path "${SPLITS_LOOKUP}" \
         --n_splits 10 \
         --random_seed 42
@@ -67,11 +67,10 @@ python "${SCRIPTS_DIR}/finetune_8track.py" \
 # Step 3: Extract 512-D Representations from Fine-Tuned 8-Track Model
 # -----------------------------------------------------------------------------
 echo -e "\n[STEP 3/4] Extracting fine-tuned 8-track representations (4-Fold CV)..."
-python "${SCRIPTS_DIR}/extract_embeddings_hIPSC_CM_8track.py" \
-    --data_path "${DATA_NPZ}" \
+python "${SCRIPTS_DIR}/extract_embeddings.py" \
+    --tracks_file "${DATA_NPZ}" \
     --model_checkpoint "${FINETUNED_DIR}" \
-    --output_dir "${PROJECT_DIR}/data/hIPSC_CM/orthrus" \
-    --output_filename "orthrus_8track_embeddings_hIPSC_CM_minmax.npz" \
+    --output_file "${EMBEDDING_OUT}" \
     --batch_size 16
 
 # -----------------------------------------------------------------------------
