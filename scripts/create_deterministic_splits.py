@@ -48,6 +48,21 @@ def generate_10fold_gene_splits(
         raise KeyError(f"Could not find transcript ID column in {list(df.columns)}")
     df["ensembl_transcript_id"] = df[tx_col].astype(str).str.strip()
 
+    # Strict validation: Every transcript must have a verified Ensembl transcript ID (ENST... / ENSMUST...)
+    invalid_tx = (
+        (df["ensembl_transcript_id"] == "")
+        | (df["ensembl_transcript_id"] == "nan")
+        | (~df["ensembl_transcript_id"].str.startswith(("ENST", "ENSMUST")))
+    )
+    if invalid_tx.any():
+        num_invalid = invalid_tx.sum()
+        invalid_sample = df.loc[invalid_tx, "gene"].head(5).tolist() if "gene" in df.columns else []
+        raise RuntimeError(
+            f"[Error] {num_invalid} transcripts in dataset have invalid or missing Ensembl transcript IDs "
+            f"(sample genes: {invalid_sample})! All transcripts must have verified ENST/ENSMUST IDs. "
+            f"No fallbacks allowed."
+        )
+
     # Standardize gene grouping column (prefer gene symbol, else ensembl_gene_id, else transcript_id)
     gene_series = df["gene"].astype(str).str.strip() if "gene" in df.columns else pd.Series([""] * len(df))
     if "ensembl_gene_id" in df.columns:
