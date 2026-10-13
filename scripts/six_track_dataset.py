@@ -72,13 +72,104 @@ def extract_and_translate_cds(sequence: str, cds_track) -> str:
     return prot[:-1] if prot.endswith("*") else prot
 
 
+def load_hgnc_alias_mapping(gencode_dir: Path) -> dict[str, str]:
+    """
+    Downloads and caches the official HGNC complete set table, returning
+    a mapping from gene symbol/alias/previous symbol (uppercase) to Ensembl Gene ID.
+    Source: https://www.genenames.org/
+    """
+    import urllib.request
+    hgnc_url = "https://storage.googleapis.com/public-download-files/hgnc/tsv/tsv/hgnc_complete_set.txt"
+    hgnc_path = gencode_dir / "hgnc_complete_set.txt"
+    if not (hgnc_path.exists() and hgnc_path.stat().st_size > 0):
+        print(f"[HGNC] Downloading official HGNC complete set from {hgnc_url}...")
+        temp_file = gencode_dir / "hgnc_complete_set.txt.part"
+        req = urllib.request.Request(hgnc_url, headers={"User-Agent": "MScThesis/1.0"})
+        with urllib.request.urlopen(req) as resp, open(temp_file, "wb") as f_out:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+        temp_file.rename(hgnc_path)
+
+    print(f"[HGNC] Loading official HGNC gene alias mappings from '{hgnc_path.name}'...")
+    alias_to_ensg: dict[str, str] = {}
+    with open(hgnc_path, "rt", encoding="utf-8") as f_in:
+        header = f_in.readline().strip().split("\t")
+        sym_idx = header.index("symbol") if "symbol" in header else -1
+        ensg_idx = header.index("ensembl_gene_id") if "ensembl_gene_id" in header else -1
+        alias_idx = header.index("alias_symbol") if "alias_symbol" in header else -1
+        prev_idx = header.index("prev_symbol") if "prev_symbol" in header else -1
+
+        for line in f_in:
+            parts = line.strip().split("\t")
+            ensg = parts[ensg_idx].strip() if ensg_idx != -1 and len(parts) > ensg_idx else ""
+            if not ensg:
+                continue
+            clean_ensg = ensg.split(".")[0].strip().upper()
+            if sym_idx != -1 and len(parts) > sym_idx:
+                sym = parts[sym_idx].strip().upper()
+                if sym:
+                    alias_to_ensg[sym] = clean_ensg
+            if alias_idx != -1 and len(parts) > alias_idx:
+                for a in parts[alias_idx].replace('"', '').split("|"):
+                    a_clean = a.strip().upper()
+                    if a_clean and a_clean not in alias_to_ensg:
+                        alias_to_ensg[a_clean] = clean_ensg
+            if prev_idx != -1 and len(parts) > prev_idx:
+                for p in parts[prev_idx].replace('"', '').split("|"):
+                    p_clean = p.strip().upper()
+                    if p_clean and p_clean not in alias_to_ensg:
+                        alias_to_ensg[p_clean] = clean_ensg
+    return alias_to_ensg
+
+
+def load_mgi_alias_mapping(gencode_dir: Path) -> dict[str, str]:
+    """
+    Downloads and caches official MGI gene model coordinates mapping mouse symbols
+    to Ensembl Gene ID (ENSMUSG...).
+    Source: Mouse Genome Informatics (The Jackson Laboratory)
+    """
+    import urllib.request
+    mgi_url = "https://www.informatics.jax.org/downloads/reports/MGI_Gene_Model_Coord.rpt"
+    mgi_path = gencode_dir / "MGI_Gene_Model_Coord.rpt"
+    if not (mgi_path.exists() and mgi_path.stat().st_size > 0):
+        print(f"[MGI] Downloading official MGI gene model mapping from {mgi_url}...")
+        temp_file = gencode_dir / "MGI_Gene_Model_Coord.rpt.part"
+        req = urllib.request.Request(mgi_url, headers={"User-Agent": "MScThesis/1.0"})
+        with urllib.request.urlopen(req) as resp, open(temp_file, "wb") as f_out:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+        temp_file.rename(mgi_path)
+
+    print(f"[MGI] Loading official MGI mouse gene mappings from '{mgi_path.name}'...")
+    alias_to_ensmusg: dict[str, str] = {}
+    with open(mgi_path, "rt", encoding="utf-8") as f_in:
+        for line in f_in:
+            parts = line.strip().split("\t")
+            if len(parts) > 10:
+                sym = parts[2].strip().upper()
+                ensg = parts[10].strip().split(".")[0].upper()
+                if sym and ensg.startswith("ENSMUSG"):
+                    alias_to_ensmusg[sym] = ensg
+    return alias_to_ensmusg
+
+
 def map_mrna_bench_to_gencode(df_raw: pd.DataFrame, species: str, gencode_dir: Path) -> pd.DataFrame:
     """
     Maps mRNABench genes to official GENCODE Ensembl transcript IDs (ENST.../ENSMUST...)
     using the exact reference releases matching the dataset:
       - Human: GENCODE v29 (Ensembl 94 / GRCh38)
       - Mouse: GENCODE vM21 (Ensembl 96 / GRCm38)
-    Raises RuntimeError if any transcript cannot be mapped (no fallbacks).
+    Resolution Strategy:
+      1. Exact Symbol Match in GENCODE header.
+      2. 100% Exact Protein Sequence Match against all GENCODE translations (resolves clone/HAVANA names like AC118549.1 for ZZZ3).
+      3. Official HGNC / MGI Alias & Ensembl Gene ID lookup.
+    Raises RuntimeError if any transcript cannot be mapped (strictly no silent fallbacks).
     """
     import difflib
     import gzip
@@ -107,6 +198,9 @@ def map_mrna_bench_to_gencode(df_raw: pd.DataFrame, species: str, gencode_dir: P
 
     print(f"[GENCODE] Loading official translations from '{local_file.name}'...")
     gene_dict: dict[str, list[dict]] = {}
+    gene_id_dict: dict[str, list[dict]] = {}
+    seq_dict: dict[str, list[dict]] = {}
+
     with gzip.open(local_file, "rt", encoding="utf-8") as f_in:
         current_entry = None
         seq_chunks = []
@@ -116,41 +210,75 @@ def map_mrna_bench_to_gencode(df_raw: pd.DataFrame, species: str, gencode_dir: P
                 continue
             if line.startswith(">"):
                 if current_entry and seq_chunks:
-                    current_entry["seq"] = "".join(seq_chunks)
+                    seq_str = "".join(seq_chunks)
+                    current_entry["seq"] = seq_str
                     gene_dict.setdefault(current_entry["gene_symbol"], []).append(current_entry)
+                    if current_entry["gene_id_clean"]:
+                        gene_id_dict.setdefault(current_entry["gene_id_clean"], []).append(current_entry)
+                    if seq_str:
+                        seq_dict.setdefault(seq_str, []).append(current_entry)
                 parts = line[1:].split("|")
                 # parts[0]: ENSP..., parts[1]: ENST..., parts[2]: ENSG..., parts[6]: Gene Symbol
+                full_gene_id = parts[2] if len(parts) > 2 else ""
+                clean_gene_id = full_gene_id.split(".")[0].strip().upper()
                 current_entry = {
                     "protein_id": parts[0] if len(parts) > 0 else "",
                     "transcript_id": parts[1] if len(parts) > 1 else "",
-                    "gene_id": parts[2] if len(parts) > 2 else "",
+                    "gene_id": full_gene_id,
+                    "gene_id_clean": clean_gene_id,
                     "gene_symbol": parts[6].strip().upper() if len(parts) > 6 else "",
                 }
                 seq_chunks = []
             else:
                 seq_chunks.append(line)
         if current_entry and seq_chunks:
-            current_entry["seq"] = "".join(seq_chunks)
+            seq_str = "".join(seq_chunks)
+            current_entry["seq"] = seq_str
             gene_dict.setdefault(current_entry["gene_symbol"], []).append(current_entry)
+            if current_entry["gene_id_clean"]:
+                gene_id_dict.setdefault(current_entry["gene_id_clean"], []).append(current_entry)
+            if seq_str:
+                seq_dict.setdefault(seq_str, []).append(current_entry)
 
     df_mapped = df_raw.copy()
     mapped_tx_ids = []
     mapped_gene_ids = []
+    alias_map: Optional[dict[str, str]] = None
 
     print(f"[GENCODE] Mapping {len(df_mapped):,} mRNABench ({species}) genes to Ensembl transcript IDs...")
     for idx, row in df_mapped.iterrows():
         gene = str(row.get("gene", "")).strip()
         gene_upper = gene.upper()
-        entries = gene_dict.get(gene_upper, [])
-        if not entries:
-            raise RuntimeError(
-                f"[Error] Gene '{gene}' from mRNABench ({species}) not found in GENCODE reference ({local_file.name})! "
-                f"No fallbacks allowed. All transcripts must have verified Ensembl transcript IDs."
-            )
-
         seq = str(row.get("sequence", "")).strip()
         cds_raw = row.get("cds", None)
         prot = extract_and_translate_cds(seq, cds_raw)
+
+        # Strategy 1: Exact symbol match in GENCODE
+        entries = gene_dict.get(gene_upper, [])
+
+        # Strategy 2: Exact protein sequence match against all GENCODE translations
+        if not entries and prot:
+            seq_matches = seq_dict.get(prot, [])
+            if seq_matches:
+                entries = seq_matches
+
+        # Strategy 3: Official HGNC / MGI alias and Ensembl Gene ID resolution
+        if not entries:
+            if alias_map is None:
+                if species_key == "human":
+                    alias_map = load_hgnc_alias_mapping(gencode_dir)
+                else:
+                    alias_map = load_mgi_alias_mapping(gencode_dir)
+            clean_gene_id = alias_map.get(gene_upper)
+            if clean_gene_id and clean_gene_id in gene_id_dict:
+                entries = gene_id_dict[clean_gene_id]
+
+        if not entries:
+            raise RuntimeError(
+                f"[Error] Gene '{gene}' from mRNABench ({species}) could not be resolved in GENCODE reference "
+                f"({local_file.name})! Checked: (1) exact symbol, (2) exact protein sequence, (3) HGNC/MGI aliases. "
+                f"No fallbacks allowed. All transcripts must have verified Ensembl transcript IDs."
+            )
 
         canonical = entries[0]
         if prot and prot == canonical["seq"]:
@@ -184,8 +312,9 @@ def map_mrna_bench_to_gencode(df_raw: pd.DataFrame, species: str, gencode_dir: P
 
     df_mapped["transcript_id"] = mapped_tx_ids
     df_mapped["gencode_transcript_id"] = mapped_tx_ids
+    df_mapped["ensembl_transcript_id"] = mapped_tx_ids
     df_mapped["ensembl_gene_id"] = mapped_gene_ids
-    print(f"[GENCODE] Successfully mapped {len(df_mapped):,} transcripts to Ensembl IDs.")
+    print(f"[GENCODE] Successfully mapped all {len(df_mapped):,} transcripts to official Ensembl IDs.")
     return df_mapped
 
 
@@ -372,7 +501,7 @@ class SixTrackDatasetLoader:
 
         df_raw = None
 
-        # Priority 1: Check if pre-mapped GENCODE table already exists
+        # Priority 1: Check if pre-mapped GENCODE table already exists AND is 100% complete
         mapped_candidates = [
             data_dir / dataset_key / "mrna_protein.parquet",
             data_dir / dataset_key / f"{self.species}_mrna_protein.parquet",
@@ -381,27 +510,41 @@ class SixTrackDatasetLoader:
             data_dir / dataset_key / "mrna_protein.csv",
             data_dir / dataset_key / f"{self.species}_mrna_protein.csv",
         ]
+        complete_mapped_df = None
+        unmapped_candidate_df = None
+
         for cand in mapped_candidates:
             if cand.exists():
-                print(f"[SixTrackLoader] Found pre-mapped GENCODE dataset table: {cand.name}")
                 if cand.suffix == ".parquet":
                     df_candidate = pd.read_parquet(cand)
                 else:
                     sep = "\t" if cand.suffix == ".tsv" else ","
                     df_candidate = pd.read_csv(cand, sep=sep)
 
-                has_valid_tx = False
+                valid_col = None
                 for c in ["transcript_id", "gencode_transcript_id", "ensembl_transcript_id"]:
-                    if c in df_candidate.columns and df_candidate[c].astype(str).str.startswith(("ENST", "ENSMUST")).any():
-                        has_valid_tx = True
-                        break
-                if has_valid_tx:
-                    df_raw = df_candidate
-                    break
+                    if c in df_candidate.columns:
+                        vals = df_candidate[c].astype(str).str.strip()
+                        if len(vals) > 0 and (vals.str.startswith(("ENST", "ENSMUST"))).all():
+                            valid_col = c
+                            break
 
-        # Priority 2: If no pre-mapped table found, load raw dataset and map to GENCODE
-        if df_raw is None:
-            if data_dir.is_file():
+                if valid_col:
+                    print(f"[SixTrackLoader] Verified fully-mapped dataset table: {cand.name} ({len(df_candidate):,} transcripts)")
+                    complete_mapped_df = df_candidate
+                    break
+                else:
+                    if unmapped_candidate_df is None:
+                        unmapped_candidate_df = df_candidate
+                    print(f"[SixTrackLoader] Notice: '{cand.name}' exists but contains unverified/missing transcript IDs. Will run verified GENCODE mapping.")
+
+        if complete_mapped_df is not None:
+            df_raw = complete_mapped_df
+        else:
+            # Priority 2: Load raw dataset or unmapped candidate and map to GENCODE
+            if unmapped_candidate_df is not None:
+                df_raw = unmapped_candidate_df
+            elif data_dir.is_file():
                 print(f"[SixTrackLoader] Loading mRNABench from direct file: {data_dir.name}")
                 sep = "\t" if data_dir.suffix in [".tsv", ".txt"] else ","
                 df_raw = pd.read_csv(data_dir, sep=sep)
@@ -429,16 +572,18 @@ class SixTrackDatasetLoader:
                             f"Please install mrna_bench or provide data in {data_dir}."
                         )
 
-            # Check if df_raw already contains valid ENST IDs; if not, map via official GENCODE reference
-            has_tx = False
-            for c in ["transcript_id", "gencode_transcript_id", "ensembl_transcript_id"]:
-                if c in df_raw.columns and df_raw[c].astype(str).str.startswith(("ENST", "ENSMUST")).any():
-                    has_tx = True
-                    break
+            # Map all transcripts to GENCODE
+            gencode_dir = data_dir / "gencode" if data_dir.is_dir() else Path("gencode")
+            df_raw = map_mrna_bench_to_gencode(df_raw, self.species, gencode_dir)
 
-            if not has_tx:
-                gencode_dir = data_dir / "gencode" if data_dir.is_dir() else Path("gencode")
-                df_raw = map_mrna_bench_to_gencode(df_raw, self.species, gencode_dir)
+            # Save the verified mapped table back so all future runs are instant
+            try:
+                target_cache = data_dir / dataset_key / "mrna_protein.parquet"
+                target_cache.parent.mkdir(parents=True, exist_ok=True)
+                df_raw.to_parquet(target_cache, index=False)
+                print(f"[SixTrackLoader] Successfully cached fully-mapped table to: {target_cache}")
+            except Exception as e:
+                print(f"[SixTrackLoader] Note: Could not cache mapped parquet file ({e}).")
 
         total_rows = len(df_raw)
         records = []
