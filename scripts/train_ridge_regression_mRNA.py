@@ -57,12 +57,17 @@ def load_npz(file_path: Path) -> dict:
     if not file_path.exists():
         raise FileNotFoundError(f"Embedding file not found: {file_path}")
     data = np.load(file_path, allow_pickle=True)
+    embeddings = data.get("embeddings_arr", data.get("embeddings"))
+    targets = data.get("targets_arr", data.get("targets", data.get("target_arr", data.get("target"))))
+    genes = data.get("genes_arr", data.get("genes", data.get("gene_arr", data.get("gene"))))
+    chromosomes = data.get("chromosomes_arr", data.get("chromosomes", None))
+    seq_lens = data.get("seq_lens_arr", data.get("seq_lens", None))
     return {
-        "embeddings": data["embeddings"],
-        "targets": data["targets"],
-        "genes": data["genes"],
-        "chromosomes": data["chromosomes"],
-        "seq_lens": data["seq_lens"]
+        "embeddings": embeddings,
+        "targets": targets,
+        "genes": genes,
+        "chromosomes": chromosomes,
+        "seq_lens": seq_lens,
     }
 
 

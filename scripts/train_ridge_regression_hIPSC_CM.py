@@ -111,32 +111,62 @@ def load_hIPSC_CM_npz(file_path: Path, target_col: str) -> dict:
     data = np.load(file_path, allow_pickle=True)
     available_keys = list(data.keys())
 
-    if "embeddings" not in data:
-        raise KeyError(f"'embeddings' not found in NPZ. Available keys: {available_keys}")
+    if "embeddings_arr" in data:
+        embeddings = data["embeddings_arr"]
+    elif "embeddings" in data:
+        embeddings = data["embeddings"]
+    else:
+        raise KeyError(f"'embeddings_arr' or 'embeddings' not found in NPZ. Available keys: {available_keys}")
 
-    if target_col not in data:
+    # Resolve target column (support target_col, target_col_arr, targets_arr, target_arr)
+    target_data = None
+    if target_col in data:
+        target_data = data[target_col]
+    elif f"{target_col}_arr" in data:
+        target_data = data[f"{target_col}_arr"]
+    elif target_col == "target" and "targets_arr" in data:
+        target_data = data["targets_arr"]
+    elif target_col == "targets" and "target_arr" in data:
+        target_data = data["target_arr"]
+    elif target_col == "target_raw" and "targets_raw_arr" in data:
+        target_data = data["targets_raw_arr"]
+    elif target_col == "targets_raw" and "target_raw_arr" in data:
+        target_data = data["target_raw_arr"]
+    else:
         raise KeyError(
             f"Target variable '{target_col}' not found in NPZ archive. "
             f"Available keys: {available_keys}"
         )
 
-    targets = data[target_col].astype(np.float32)
+    targets = target_data.astype(np.float32)
 
-    # Gene column for group split (prefer hgnc_symbol, else ensembl_gene_id, else gene)
+    # Gene column for group split
     if "hgnc_symbol" in data:
         genes = data["hgnc_symbol"].astype(str)
+    elif "hgnc_symbol_arr" in data:
+        genes = data["hgnc_symbol_arr"].astype(str)
+    elif "ensembl_gene_id_arr" in data:
+        genes = data["ensembl_gene_id_arr"].astype(str)
     elif "ensembl_gene_id" in data:
         genes = data["ensembl_gene_id"].astype(str)
+    elif "genes_arr" in data:
+        genes = data["genes_arr"].astype(str)
     elif "genes" in data:
         genes = data["genes"].astype(str)
+    elif "gene" in data:
+        genes = data["gene"].astype(str)
     else:
         genes = np.array([f"gene_{i}" for i in range(len(targets))])
 
     # Transcript IDs
-    if "ensembl_transcript_id" in data:
+    if "ensembl_transcript_id_arr" in data:
+        transcript_ids = data["ensembl_transcript_id_arr"].astype(str)
+    elif "ensembl_transcript_id" in data:
         transcript_ids = data["ensembl_transcript_id"].astype(str)
     elif "transcript_id" in data:
         transcript_ids = data["transcript_id"].astype(str)
+    elif "tx_ids_arr" in data:
+        transcript_ids = data["tx_ids_arr"].astype(str)
     elif "tx_ids" in data:
         transcript_ids = data["tx_ids"].astype(str)
     else:
@@ -161,8 +191,10 @@ def load_hIPSC_CM_npz(file_path: Path, target_col: str) -> dict:
     raw_half_life = None
     if "half_life" in data:
         raw_half_life = data["half_life"].astype(np.float32)
+    elif "half_life_arr" in data:
+        raw_half_life = data["half_life_arr"].astype(np.float32)
 
-    is_4fold_cv = bool(data.get("is_4fold_cv", False)) or ("fold_assignment" in data)
+    is_4fold_cv = bool(data.get("is_4fold_cv", False)) or ("fold_assignment" in data) or ("fold_assignment_arr" in data)
 
     track_type_data = None
     if "track_type" in data:
@@ -172,11 +204,11 @@ def load_hIPSC_CM_npz(file_path: Path, target_col: str) -> dict:
             pass
 
     return {
-        "embeddings": data["embeddings"],
+        "embeddings": embeddings,
         "targets": targets.astype(np.float32),
         "genes": genes,
         "transcript_ids": transcript_ids,
-        "seq_lens": data.get("seq_lens", None),
+        "seq_lens": data.get("seq_lens_arr", data.get("seq_lens", None)),
         "normalization": normalization,
         "is_finetuned": is_finetuned,
         "is_4fold_cv": is_4fold_cv,
