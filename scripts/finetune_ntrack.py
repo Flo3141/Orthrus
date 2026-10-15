@@ -79,51 +79,6 @@ def get_channel_colors(channel_names: list) -> list:
     cmap = plt.get_cmap("tab20")
     return [matplotlib.colors.to_hex(cmap(i % 20)) for i in range(n)]
 
-
-# =============================================================================
-# 1. Dataset, Sequence Parsing & Length-Grouped Dynamic Batching
-# =============================================================================
-
-def seq_to_one_hot(seq: str) -> np.ndarray:
-    """
-    Converts an RNA/DNA sequence into a 4-channel one-hot encoding.
-    Conforms to the Orthrus paper:
-      Channel 0: A (Adenine)
-      Channel 1: C (Cytosine)
-      Channel 2: G (Guanine)
-      Channel 3: T / U (Thymine / Uracil)
-      All other characters (e.g. 'N') -> [0, 0, 0, 0]
-    """
-    seq_bytes = np.frombuffer(seq.upper().encode("ascii"), dtype=np.uint8)
-    oh = np.zeros((len(seq_bytes), 4), dtype=np.float32)
-    oh[seq_bytes == 65, 0] = 1.0  # 'A'
-    oh[seq_bytes == 67, 1] = 1.0  # 'C'
-    oh[seq_bytes == 71, 2] = 1.0  # 'G'
-    oh[(seq_bytes == 84) | (seq_bytes == 85), 3] = 1.0  # 'T' (84) or 'U' (85)
-    return oh
-
-
-def parse_saluki_sequence_to_six_track(raw_seq: str) -> np.ndarray:
-    """
-    Parses comma-separated Saluki tokens into (L, 6) feature matrix:
-      Channels 0-3: A, C, G, U one-hot
-      Channel 4:    CDS marker (1.0 on uppercase letters, 0.0 on lowercase)
-      Channel 5:    Splice marker (1.0 on 'ej' tokens, 0.0 otherwise)
-    """
-    tokens = [tok.strip() for tok in raw_seq.split(",") if tok.strip()]
-    if not tokens:
-        return np.zeros((0, 6), dtype=np.float32)
-
-    clean_seq = "".join(tok[0] for tok in tokens)
-    seq_oh = seq_to_one_hot(clean_seq)
-
-    cds_track = np.array([1.0 if tok[0].isupper() else 0.0 for tok in tokens], dtype=np.float32).reshape(-1, 1)
-    splice_track = np.array([1.0 if "ej" in tok.lower() else 0.0 for tok in tokens], dtype=np.float32).reshape(-1, 1)
-
-    six_track = np.concatenate([seq_oh, cds_track, splice_track], axis=1)
-    return six_track
-
-
 class MultiTrackDataset(Dataset):
     """
     Dataset wrapping variable-length multi-track RNA representations and target values.
@@ -1235,7 +1190,15 @@ def train_model(
 # 6. Main Pipeline
 # =============================================================================
 
-DEFAULT_SPLITS_LOOKUP = Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hipsc_cm_10folds_lookup.csv")
+SPLITS_LOOKUP_HIPSC_CM = Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hipsc_cm_10folds_lookup.csv")
+SPLITS_LOOKUP_RNAHL_HUMAN = Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/rnahl-human_10folds_lookup.csv")
+SPLITS_LOOKUP_RNAHL_MOUSE = Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/rnahl-mouse_10folds_lookup.csv")
+
+SPLITS_LOOKUP_TABLES = {
+    "hipsc_cm": SPLITS_LOOKUP_HIPSC_CM,
+    "mrna_bench_human": SPLITS_LOOKUP_RNAHL_HUMAN,
+    "mrna_bench_mouse": SPLITS_LOOKUP_RNAHL_MOUSE,
+}
 
 
 def main():
@@ -1278,8 +1241,8 @@ def main():
     parser.add_argument(
         "--target_col",
         type=str,
-        default="half_life_transformed",
-        help="Target column in NPZ archive or TSV file (default: half_life_transformed)",
+        default="target",
+        help="Target column in NPZ archive or TSV file (default: target)",
     )
     parser.add_argument(
         "--epochs",
@@ -1372,12 +1335,6 @@ def main():
         default=None,
         help="Optional comma-separated transcript IDs to generate 2D saliency heatmaps for",
     )
-    parser.add_argument(
-        "--splits_lookup",
-        type=str,
-        default=str(DEFAULT_SPLITS_LOOKUP),
-        help=f"Path to standardized 10-fold lookup CSV (default: {DEFAULT_SPLITS_LOOKUP})",
-    )
 
     args = parser.parse_args()
 
@@ -1411,6 +1368,7 @@ def main():
         raise FileNotFoundError(f"[Error] Dataset file not found: {data_file}")
 
     print(f"\nLoading dataset: {data_file}...")
+    dataset_name = None
     if data_file.suffix.lower() == ".npz":
         npz_data = np.load(data_file, allow_pickle=True)
         if "tracks" not in npz_data:
@@ -1421,13 +1379,21 @@ def main():
             raise KeyError(f"[Error] Target column '{args.target_col}' not found in {data_file}! Available: {list(npz_data.files)}")
         targets = npz_data[args.target_col].astype(np.float32)
 
-        if "hgnc_symbol" not in npz_data:
-            raise KeyError(f"[Error] Required field 'hgnc_symbol' not found in dataset {data_file}!")
-        genes = npz_data["hgnc_symbol"].astype(str)
+        if "gene" in npz_data:
+            genes = npz_data["gene"].astype(str)
+        else:
+            raise KeyError(f"[Error] 'gene' not found in dataset {data_file}! Available: {list(npz_data.files)}")
 
         if "ensembl_transcript_id" not in npz_data:
             raise KeyError(f"[Error] Required field 'ensembl_transcript_id' not found in dataset {data_file}!")
         tx_ids = npz_data["ensembl_transcript_id"].astype(str)
+
+        if "dataset" in npz_data:
+            dataset_name = str(npz_data["dataset"])
+        else:
+            raise KeyError(
+                f"[Error] Required field 'dataset' not found in NPZ archive {data_file}! Available: {list(npz_data.files)}"
+            )
 
         # Cleaning mask
         valid_mask = ~np.isnan(targets) & ~np.isinf(targets)
@@ -1435,38 +1401,8 @@ def main():
             valid_mask &= (npz_data["seq_lens"] > 0)
         else:
             valid_mask &= np.array([len(t) > 0 for t in tracks])
-
-    elif data_file.suffix.lower() in [".tsv", ".txt", ".csv"]:
-        sep = "\t" if data_file.suffix.lower() in [".tsv", ".txt"] else ","
-        df = pd.read_csv(data_file, sep=sep)
-        print(f"Total entries loaded from tabular file: {len(df)}")
-
-        if args.target_col not in df.columns:
-            raise KeyError(f"[Error] Target column '{args.target_col}' not found in {list(df.columns)}")
-        targets = df[args.target_col].astype(np.float32).values
-
-        if "hgnc_symbol" in df.columns:
-            genes = df["hgnc_symbol"].astype(str).values
-        else:
-            raise KeyError(f"[Error] 'hgnc_symbol' not found in tabular file. Columns: {list(df.columns)}")
-
-        if "ensembl_transcript_id" in df.columns:
-            tx_ids = df["ensembl_transcript_id"].astype(str).values
-        else:
-            raise KeyError(f"[Error] 'ensembl_transcript_id' not found in tabular file. Columns: {list(df.columns)}")
-
-        if "sequence" not in df.columns:
-            raise KeyError(f"[Error] 'sequence' column not found in tabular file. Columns: {list(df.columns)}")
-
-        print("Parsing Saluki sequence tokens into initial 6 tracks [A, C, G, U, CDS, Splice]...")
-        raw_seqs = df["sequence"].astype(str).values
-        tracks = []
-        for s in tqdm(raw_seqs, desc="Parsing sequences"):
-            tracks.append(parse_saluki_sequence_to_six_track(s))
-
-        valid_mask = ~np.isnan(targets) & ~np.isinf(targets) & np.array([len(t) > 0 for t in tracks])
     else:
-        raise ValueError(f"[Error] Unsupported file extension for dataset: {data_file.suffix}. Expected .npz, .tsv, or .txt.")
+        raise ValueError(f"[Error] Unsupported file extension for dataset: {data_file.suffix}. Expected .npz.")
 
     # Clean invalid samples
     n_invalid = int(np.sum(~valid_mask))
@@ -1490,20 +1426,24 @@ def main():
         tracks = [t[:, :num_channels] for t in tracks]
 
     print(f"Total valid samples loaded: {len(targets)}")
+    print(f"Dataset:                   {dataset_name}")
     print(f"Unique genes:              {len(np.unique(genes))}")
     print(f"Configured tracks (N):     {num_channels}")
     print(f"Channel names:             {channel_names}")
     print(f"Target column:             {args.target_col}")
 
     # 2. Standardized 10-Fold Lookup Table Verification & Splitting
-    lookup_path = Path(args.splits_lookup)
+    if dataset_name in SPLITS_LOOKUP_TABLES.keys():
+        lookup_path = SPLITS_LOOKUP_TABLES[dataset_name]
+    else:
+        raise ValueError(f"[Error] Unrecognized dataset '{dataset_name}'. Unable to determine standardized splits lookup table. Expected dataset matching {list(SPLITS_LOOKUP_TABLES.keys())}.")
     if not lookup_path.exists():
         raise FileNotFoundError(
             f"[Error] Standardized splits lookup table not found at: {lookup_path}! "
             f"A valid lookup table is strictly required."
         )
 
-    print(f"\nUsing Standardized 10-Fold Lookup Table: {lookup_path}")
+    print(f"\nUsing Standardized 10-Fold Lookup Table ({dataset_name}): {lookup_path}")
     lookup_df = pd.read_csv(lookup_path)
 
     if "ensembl_transcript_id" not in lookup_df.columns:
