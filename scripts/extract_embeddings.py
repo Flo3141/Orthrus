@@ -99,14 +99,21 @@ def extract_embeddings_for_tracks(
     return np.stack(embeddings_list, axis=0)
 
 
-def load_fold_backbone(fold_dir: Path, device: torch.device) -> torch.nn.Module:
+def load_fold_backbone(fold_dir: Path | str, device: torch.device) -> torch.nn.Module:
     """
-    Loads the fine-tuned Orthrus backbone for a specific fold directory.
-    Checks for 'best_finetuned_backbone' subdirectory or directly loads from fold_dir.
+    Loads an Orthrus backbone for a specific fold directory or HF model identifier.
+    Checks for 'best_finetuned_backbone' subdirectory if fold_dir is a local directory.
     """
-    ckpt_dir = fold_dir / "best_finetuned_backbone" if (fold_dir / "best_finetuned_backbone").is_dir() else fold_dir
-    print(f"Loading fold backbone from: {ckpt_dir}...")
-    model = AutoModel.from_pretrained(str(ckpt_dir), trust_remote_code=True)
+    fold_dir_str = str(fold_dir).strip()
+    fold_path = Path(fold_dir_str)
+
+    if fold_path.exists() and (fold_path / "best_finetuned_backbone").is_dir():
+        ckpt_target = str(fold_path / "best_finetuned_backbone")
+    else:
+        ckpt_target = fold_dir_str
+
+    print(f"Loading backbone from: {ckpt_target}...")
+    model = AutoModel.from_pretrained(ckpt_target, trust_remote_code=True)
     model = model.to(device)
     model.eval()
     return model
