@@ -24,7 +24,7 @@ echo "   Preparing Compact Test Dataset for Local WSL Testing (All 4 Track Types
 echo "============================================================================="
 
 rm -rf "$OUT_ROOT"
-mkdir -p "$OUT_DATA/hIPSC_CM/m6a"
+mkdir -p "$OUT_DATA/m6a"
 mkdir -p "$OUT_DATA/eclip/curated_candidates"
 mkdir -p "$OUT_DATA/targetscan"
 
@@ -66,17 +66,36 @@ grep -F -f "$OUT_ROOT/sample_transcript_ids.txt" "$DATA_SRC/hIPSC_CM_ej_cds_tran
 echo "      Extracted $(( $(wc -l < "$OUT_DATA/hIPSC_CM/hIPSC_CM_ej_cds_transformed.txt") - 1 )) sequence records."
 
 # -----------------------------------------------------------------------------
+# 2b. Extract mRNABench Records
+# -----------------------------------------------------------------------------
+echo "[2b/7] Extracting mRNABench records (human)..."
+MRNA_BENCH_SRC="$CLUSTER_BASE/data/mrna_bench"
+if [ -d "$MRNA_BENCH_SRC" ]; then
+    mkdir -p "$OUT_DATA/mrna_bench/rnahl-human"
+    if [ -f "$MRNA_BENCH_SRC/rnahl-human_10folds_lookup.csv" ]; then
+        cp "$MRNA_BENCH_SRC/rnahl-human_10folds_lookup.csv" "$OUT_DATA/mrna_bench/"
+    fi
+    for f in "$MRNA_BENCH_SRC/rnahl-human/mrna_protein."*; do
+        if [ -f "$f" ]; then
+            head -n 21 "$f" > "$OUT_DATA/mrna_bench/rnahl-human/$(basename "$f")"
+            echo "      Extracted mRNABench $(basename "$f") sample."
+            break
+        fi
+    done
+fi
+
+# -----------------------------------------------------------------------------
 # 3. Extract Validated m6A Sites (for generate_m6a_tracks.py)
 # -----------------------------------------------------------------------------
 echo "[3/7] Extracting m6A records (validated_m6a_sites.tsv)..."
-M6A_SRC="$DATA_SRC/m6a/validated_m6a_sites.tsv"
+M6A_SRC="$CLUSTER_BASE/data/m6a/validated_m6a_sites.tsv"
 if [ -f "$M6A_SRC" ]; then
-    head -n 1 "$M6A_SRC" > "$OUT_DATA/hIPSC_CM/m6a/validated_m6a_sites.tsv"
-    grep -F -f "$OUT_ROOT/sample_transcript_ids.txt" "$M6A_SRC" >> "$OUT_DATA/hIPSC_CM/m6a/validated_m6a_sites.tsv" || true
-    echo "      Saved m6A slice ($(( $(wc -l < "$OUT_DATA/hIPSC_CM/m6a/validated_m6a_sites.tsv") - 1 )) sites)."
+    head -n 1 "$M6A_SRC" > "$OUT_DATA/m6a/validated_m6a_sites.tsv"
+    grep -F -f "$OUT_ROOT/sample_transcript_ids.txt" "$M6A_SRC" >> "$OUT_DATA/m6a/validated_m6a_sites.tsv" || true
+    echo "      Saved m6A slice ($(( $(wc -l < "$OUT_DATA/m6a/validated_m6a_sites.tsv") - 1 )) sites)."
 else
     echo "      [Notice] $M6A_SRC not found, creating dummy header."
-    echo -e "TxId\tcDNAstart\tcDNAend\tmean_score\tis_drach" > "$OUT_DATA/hIPSC_CM/m6a/validated_m6a_sites.tsv"
+    echo -e "TxId\tcDNAstart\tcDNAend\tmean_score\tis_drach" > "$OUT_DATA/m6a/validated_m6a_sites.tsv"
 fi
 
 # -----------------------------------------------------------------------------

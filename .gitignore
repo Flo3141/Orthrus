@@ -8,4 +8,4 @@ build
 slurm/slurm_out
 __pycache__
 *.pdf
-run_local_test_pipeline.sh
+*.sh
