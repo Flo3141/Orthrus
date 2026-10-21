@@ -225,9 +225,9 @@ def main():
 
     species_to_process = []
     if args.species in ["human", "both"]:
-        species_to_process.append(("human", "rnahl-human"))
+        species_to_process.append(("human", "mrna_bench_human"))
     if args.species in ["mouse", "both"]:
-        species_to_process.append(("mouse", "rnahl-mouse"))
+        species_to_process.append(("mouse", "mrna_bench_mouse"))
 
     for spec_name, dataset_key in species_to_process:
         print(f"\n==================== {spec_name.upper()} DATASET ====================")

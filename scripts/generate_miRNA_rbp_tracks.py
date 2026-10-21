@@ -15,6 +15,7 @@ Features:
 """
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 import gffutils
 import numpy as np
@@ -22,6 +23,9 @@ import pandas as pd
 from tqdm import tqdm
 
 from six_track_dataset import SixTrackDatasetLoader
+from util import save_metadata
+
+DEFAULT_CHANNEL_NAMES = ["A", "C", "G", "U", "CDS", "Splice", "miRNA", "eCLIP"]
 
 
 # =============================================================================
@@ -432,6 +436,8 @@ def save_chunk(
         gene=gene_arr,
         seq_lens=lens_arr,
         dataset=str(dataset),
+        track_name="8track_miRNA_rbp",
+        channel_names=np.array(DEFAULT_CHANNEL_NAMES),
         has_mirna=np.array([item["has_mirna"] for item in chunk_items], dtype=bool),
         has_eclip=np.array([item["has_eclip"] for item in chunk_items], dtype=bool),
         has_gtf=np.array([item["has_gtf"] for item in chunk_items], dtype=bool),
@@ -445,9 +451,12 @@ def merge_all_chunks(
     chunks_dir: Path,
     output_file: Path,
     dataset: str = "unknown",
+    species: str = None,
     normalization: str = "none",
     mirna_q99: float = None,
     eclip_q99: float = None,
+    max_length: int = 12288,
+    quantile: float = 0.99,
 ):
     """Merges all generated chunks into the final master NPZ."""
     chunk_files = sorted(chunks_dir.glob("chunk_*.npz"))
@@ -490,6 +499,8 @@ def merge_all_chunks(
         gene=np.array(genes),
         seq_lens=np.array(lens, dtype=np.int32),
         dataset=str(dataset),
+        track_name="8track_miRNA_rbp",
+        channel_names=np.array(DEFAULT_CHANNEL_NAMES),
         has_mirna=np.array(mirna_flags, dtype=bool),
         has_eclip=np.array(eclip_flags, dtype=bool),
         has_gtf=np.array(gtf_flags, dtype=bool),
@@ -499,6 +510,35 @@ def merge_all_chunks(
     )
 
     n = len(tx_ids)
+
+    # Save standardized .meta.json companion file
+    inferred_species = str(species) if species else ("human" if ("hipsc" in str(dataset).lower() or "human" in str(dataset).lower()) else "mouse")
+    meta_dict = {
+        "track_name": "8track_miRNA_rbp",
+        "dataset": str(dataset),
+        "species": inferred_species,
+        "normalization": str(normalization),
+        "num_channels": 8,
+        "channel_names": list(DEFAULT_CHANNEL_NAMES),
+        "max_length": int(max_length),
+        "total_transcripts": int(n),
+        "unique_genes": int(len(set(genes))),
+        "seq_len_min": int(min(lens)) if lens else 0,
+        "seq_len_max": int(max(lens)) if lens else 0,
+        "seq_len_mean": float(np.mean(lens)) if lens else 0.0,
+        "npz_file": output_file.name,
+        "created_at": datetime.now().isoformat(),
+        "parameters": {
+            "normalization": str(normalization),
+            "quantile": float(quantile),
+            "mirna_q99": float(mirna_q99) if (mirna_q99 is not None and not np.isnan(mirna_q99)) else None,
+            "eclip_q99": float(eclip_q99) if (eclip_q99 is not None and not np.isnan(eclip_q99)) else None,
+            "transcripts_with_mirna": int(sum(mirna_flags)),
+            "transcripts_with_eclip": int(sum(eclip_flags)),
+            "transcripts_in_gtf": int(sum(gtf_flags)),
+        },
+    }
+    save_metadata(output_file, meta_dict)
     print("\n" + "=" * 65)
     print("             COVERAGE & STATISTICS REPORT             ")
     print("=" * 65)
@@ -539,12 +579,6 @@ def main():
         default=None,
         choices=["human", "mouse"],
         help="Species for mRNABench: 'human' or 'mouse' (required if --dataset is 'mrna_bench')",
-    )
-    parser.add_argument(
-        "--output_file",
-        type=str,
-        required=True,
-        help="Output file for the augmented NPZ archive (automatically appended with normalization suffix, required)",
     )
     parser.add_argument(
         "--normalization",
@@ -605,20 +639,25 @@ def main():
         parser.error("--species ('human' or 'mouse') must be specified when --dataset is 'mrna_bench'!")
 
     norm_method = args.normalization.lower()
-    dataset_name = f"{args.dataset}_{args.species}" if args.species else args.dataset
-    out_file = Path(args.output_file)
+    dataset_key = f"{args.dataset}_{args.species}" if args.species else args.dataset
+    dataset_dirs = {
+        "hipsc_cm": Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus"),
+        "mrna_bench_human": Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus"),
+        "mrna_bench_mouse": Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus"),
+    }
+    if dataset_key not in dataset_dirs:
+        raise ValueError(f"[Error] Unknown dataset key '{dataset_key}'! Supported: {list(dataset_dirs.keys())}")
 
-    # Dynamically adjust filename and chunk folder according to normalization
-    if norm_method != "none":
-        stem = out_file.stem
-        # Only append if suffix is not already in the stem
-        if not stem.endswith(f"_{norm_method}"):
-            out_file = out_file.parent / f"{stem}_{norm_method}{out_file.suffix}"
+    data_dir = dataset_dirs[dataset_key]
+    dataset_name = dataset_key
+    norm_suffix = f"_{norm_method}" if norm_method != "none" else ""
+    file_stem = f"hipsc_cm_8track_miRNA_rbp{norm_suffix}" if args.dataset == "hipsc_cm" else f"mrna_bench_{args.species}_8track_miRNA_rbp{norm_suffix}"
+    out_file = data_dir / f"{file_stem}.npz"
 
     out_file.parent.mkdir(parents=True, exist_ok=True)
-
     chunks_dir = out_file.parent / f"{out_file.stem}_chunks"
     chunks_dir.mkdir(parents=True, exist_ok=True)
+
 
     print("=" * 75)
     print("   Generation of Trans-Factor Density Tracks (TargetScan, ENCODE eCLIP)   ")
@@ -821,9 +860,12 @@ def main():
         chunks_dir,
         out_file,
         dataset=dataset_name,
+        species=args.species,
         normalization=norm_method,
         mirna_q99=mirna_q99,
         eclip_q99=eclip_q99,
+        max_length=args.max_length,
+        quantile=args.quantile,
     )
 
 

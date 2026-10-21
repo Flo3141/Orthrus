@@ -5,7 +5,7 @@ Comprehensive Analysis of Trans-Factor Channels (miRNA Ch6 & RBP Ch7) in hIPSC_C
 
 Analyzes:
   Input:  /beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/hIPSC_CM_8track_minmax.npz
-  Output: /beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_8track_minmax_analysis.txt
+  Output: /beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/hIPSC_CM_8track_minmax_analysis.txt
 
 Channels in the 8-track representation:
   - 0..3: One-hot nucleotides (A, C, G, U)
@@ -734,7 +734,7 @@ def parse_args():
     parser.add_argument(
         "--output_txt",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_8track_minmax_analysis.txt",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/hIPSC_CM_8track_minmax_analysis.txt",
         help="Path to output text report file",
     )
     parser.add_argument(

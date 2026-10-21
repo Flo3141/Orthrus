@@ -18,12 +18,14 @@ Features:
 """
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
 from six_track_dataset import SixTrackDatasetLoader
+from util import save_metadata
 
 
 # =============================================================================
@@ -31,13 +33,13 @@ from six_track_dataset import SixTrackDatasetLoader
 # =============================================================================
 DEFAULT_OUTPUT_PATHS = {
     "hipsc_cm": Path(
-        "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hipsc_cm_6tracks.npz"
+        "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/hipsc_cm_6tracks.npz"
     ),
     "mrna_bench_human": Path(
-        "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/rnahl-human_6tracks.npz"
+        "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus/mrna_bench_human_6tracks.npz"
     ),
     "mrna_bench_mouse": Path(
-        "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/rnahl-mouse_6tracks.npz"
+        "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus/mrna_bench_mouse_6tracks.npz"
     ),
 }
 
@@ -75,6 +77,7 @@ def save_chunk(
         gene=gene_arr,
         seq_lens=lens_arr,
         dataset=str(dataset),
+        track_name="6track",
         channel_names=np.array(DEFAULT_CHANNEL_NAMES),
     )
 
@@ -83,6 +86,8 @@ def merge_all_chunks(
     chunks_dir: Path,
     output_file: Path,
     dataset: str = "unknown",
+    species: str = None,
+    max_length: int = 12288,
 ):
     """Merges all generated chunks into the final master NPZ file."""
     chunk_files = sorted(chunks_dir.glob("chunk_*.npz"))
@@ -119,14 +124,37 @@ def merge_all_chunks(
         gene=np.array(genes),
         seq_lens=np.array(lens, dtype=np.int32),
         dataset=str(dataset),
+        track_name="6track",
         channel_names=np.array(DEFAULT_CHANNEL_NAMES),
     )
 
     n = len(tx_ids)
+
+    # Save standardized .meta.json companion file
+    inferred_species = str(species) if species else ("human" if ("hipsc" in str(dataset).lower() or "human" in str(dataset).lower()) else "mouse")
+    meta_dict = {
+        "track_name": "6track",
+        "dataset": str(dataset),
+        "species": inferred_species,
+        "normalization": "none",
+        "num_channels": 6,
+        "channel_names": list(DEFAULT_CHANNEL_NAMES),
+        "max_length": int(max_length),
+        "total_transcripts": int(n),
+        "unique_genes": int(len(set(genes))),
+        "seq_len_min": int(min(lens)) if lens else 0,
+        "seq_len_max": int(max(lens)) if lens else 0,
+        "seq_len_mean": float(np.mean(lens)) if lens else 0.0,
+        "npz_file": output_file.name,
+        "created_at": datetime.now().isoformat(),
+    }
+    save_metadata(output_file, meta_dict)
+
     print("\n" + "=" * 65)
     print("             6-TRACK ARCHIVE GENERATION REPORT             ")
     print("=" * 65)
     print(f"Dataset:                             {dataset}")
+    print(f"Track name:                          6track")
     print(f"Total transcripts:                   {n:,}")
     print(f"Unique genes:                        {len(set(genes)):,}")
     print(f"Sequence length range:               {min(lens)} - {max(lens)} bp (mean: {np.mean(lens):.1f} bp)")
@@ -161,12 +189,6 @@ def parse_args():
         help="Species for mRNABench: 'human' or 'mouse' (required if --dataset is 'mrna_bench')",
     )
     parser.add_argument(
-        "--output_file",
-        type=str,
-        default=None,
-        help="Output path for the generated NPZ archive (default: standard cluster path)",
-    )
-    parser.add_argument(
         "--chunk_size",
         type=int,
         default=1000,
@@ -194,13 +216,11 @@ def main():
         raise ValueError("[Error] --species ('human' or 'mouse') must be specified when --dataset is 'mrna_bench'!")
 
     dataset_key = f"{args.dataset}_{args.species}" if args.species else args.dataset
-    if args.output_file:
-        out_file = Path(args.output_file)
-    else:
-        out_file = DEFAULT_OUTPUT_PATHS.get(
-            dataset_key,
-            Path(f"./data/{dataset_key}_6tracks.npz"),
-        )
+    if dataset_key not in DEFAULT_OUTPUT_PATHS:
+        raise ValueError(f"[Error] Unknown dataset key '{dataset_key}'! Supported datasets: {list(DEFAULT_OUTPUT_PATHS.keys())}")
+
+    out_file = DEFAULT_OUTPUT_PATHS[dataset_key]
+
 
     out_file.parent.mkdir(parents=True, exist_ok=True)
     chunks_dir = out_file.parent / f"{out_file.stem}_chunks"
@@ -302,6 +322,8 @@ def main():
         chunks_dir=chunks_dir,
         output_file=out_file,
         dataset=dataset_key,
+        species=args.species,
+        max_length=args.max_length,
     )
 
 

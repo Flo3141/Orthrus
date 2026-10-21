@@ -75,10 +75,10 @@ def resolve_embedding_file(species: str, embeddings_dir: Path | None, data_dir: 
     """Finds the path to the embedding file based on data_dir or embeddings_dir."""
     candidates = []
     if data_dir is not None:
-        candidates.append(data_dir / f"rnahl-{species}" / "embeddings" / "orthrus_6track_embeddings.npz")
+        candidates.append(data_dir / f"mrna_bench_{species}" / "embeddings" / "orthrus_6track_embeddings.npz")
         candidates.append(data_dir / f"orthrus_6track_embeddings_{species}.npz")
     if embeddings_dir is not None:
-        candidates.append(embeddings_dir / f"rnahl-{species}" / "embeddings" / "orthrus_6track_embeddings.npz")
+        candidates.append(embeddings_dir / f"mrna_bench_{species}" / "embeddings" / "orthrus_6track_embeddings.npz")
         candidates.append(embeddings_dir / f"orthrus_6track_embeddings_{species}.npz")
 
     for c in candidates:
@@ -95,7 +95,7 @@ def main():
         "--data_dir",
         type=str,
         default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench",
-        help="Path to mrna_bench data directory (looks in <data_dir>/rnahl-<species>/embeddings/)"
+        help="Path to mrna_bench data directory (looks in <data_dir>/mrna_bench_<species>/embeddings/)"
     )
     parser.add_argument(
         "--embeddings_dir",

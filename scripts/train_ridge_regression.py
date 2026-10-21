@@ -16,6 +16,7 @@ Features:
 """
 
 import argparse
+from datetime import datetime
 import json
 from pathlib import Path
 import joblib
@@ -25,10 +26,19 @@ from scipy.stats import pearsonr, spearmanr
 from sklearn.linear_model import Ridge, RidgeCV
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
+from typing import Optional, Tuple, Dict, Any, Union
+
+from util import load_metadata, save_metadata, get_meta_filepath
+
 # Headless backend for cluster servers without display
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+
+DEFAULT_BASE_RESULTS_DIR = Path(
+    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/results/Orthrus"
+)
 
 
 # =============================================================================
@@ -97,19 +107,64 @@ def print_metrics(metrics: dict, title: str):
 # =============================================================================
 
 def load_embeddings_npz(file_path: Path) -> dict:
-    """Loads an NPZ file containing Orthrus embeddings and all metadata."""
+    """Loads an NPZ file containing Orthrus embeddings and strictly requires companion metadata."""
     if not file_path.exists():
         raise FileNotFoundError(f"[Error] Embedding file not found: {file_path}")
 
     data = np.load(file_path, allow_pickle=True)
     available_keys = list(data.keys())
 
+    # Find the track .meta.json file (the single source of truth from Track Generation)
+    track_meta_path = None
+    if "source_tracks_meta" in data:
+        cand = file_path.parent / str(data["source_tracks_meta"])
+        if cand.is_file():
+            track_meta_path = cand
+    if track_meta_path is None and "source_tracks_file" in data:
+        cand = get_meta_filepath(file_path.parent / str(data["source_tracks_file"]))
+        if cand.is_file():
+            track_meta_path = cand
+
+    if track_meta_path is None:
+        track_name_raw = str(data.get("track_name", "")).strip()
+        for cand in sorted(file_path.parent.glob("*.meta.json")):
+            if "embeddings" in cand.name or "results" in cand.name or "model" in cand.name:
+                continue
+            if track_name_raw and track_name_raw in cand.name:
+                track_meta_path = cand
+                break
+            elif not track_name_raw:
+                track_meta_path = cand
+                break
+
+    if track_meta_path is None or not track_meta_path.is_file():
+        raise FileNotFoundError(
+            f"[Error] Corresponding track metadata file (.meta.json) from Track Generation not found in: {file_path.parent}!\n"
+            f"Please ensure the track metadata file generated in Step 1 exists alongside the embeddings archive."
+        )
+
+    print(f"[Metadata] Using Track Generation metadata from: {track_meta_path}")
+    meta = load_metadata(track_meta_path, required=True)
+
+    if "dataset" not in meta:
+        raise KeyError(f"[Error] Required key 'dataset' not found in track metadata {track_meta_path}!")
+    dataset_name = str(meta["dataset"]).strip()
+
+    if "track_name" not in meta:
+        raise KeyError(f"[Error] Required key 'track_name' not found in track metadata {track_meta_path}!")
+    track_name = str(meta["track_name"]).strip()
+
+    normalization = str(meta.get("normalization", "none")).strip().lower()
+    if normalization in ["none_not_set", "nan", "none", ""]:
+        normalization = "none"
+
+    is_finetuned = bool(data["is_finetuned"]) if "is_finetuned" in data else ("finetuned" in file_path.stem.lower())
+    variant = str(data.get("variant", "finetuned" if is_finetuned else "pretrained")).strip().lower()
+
     # 1. Embeddings
     if "embeddings_arr" not in data:
         raise KeyError(f"[Error] 'embeddings_arr' not found in {file_path}! Available keys: {available_keys}")
     embeddings = data["embeddings_arr"].astype(np.float32)
-
-    n_samples = len(embeddings)
 
     # 2. Target (Transformed / Model target)
     if "targets_arr" not in data:
@@ -117,11 +172,7 @@ def load_embeddings_npz(file_path: Path) -> dict:
     targets = data["targets_arr"].astype(np.float32)
 
     # 3. Target Raw (Unnormalized / Raw half-life in hours)
-    if "targets_raw_arr" in data:
-        targets_raw = data["targets_raw_arr"].astype(np.float32)
-    else:
-        print("[Note] 'targets_raw_arr' not found in {file_path}!")
-        targets_raw = None
+    targets_raw = data["targets_raw_arr"].astype(np.float32) if "targets_raw_arr" in data else None
 
     # 4. Transcript IDs
     if "ensembl_transcript_id_arr" not in data:
@@ -133,28 +184,6 @@ def load_embeddings_npz(file_path: Path) -> dict:
         raise KeyError(f"[Error] 'genes_arr' not found in {file_path}! Available keys: {available_keys}")
     genes = data["genes_arr"].astype(str)
 
-    # 6. Dataset Identity Metadata
-    dataset_name = "unknown"
-    if "dataset" in data:
-        raw_val = data["dataset"]
-        if isinstance(raw_val, np.ndarray) and raw_val.ndim > 0 and len(raw_val) > 0:
-            dataset_name = str(raw_val.flat[0]).strip()
-        elif hasattr(raw_val, "item"):
-            try:
-                dataset_name = str(raw_val.item()).strip()
-            except Exception:
-                dataset_name = str(raw_val).strip()
-        else:
-            dataset_name = str(raw_val).strip()
-
-    # 7. Additional Metadata
-    normalization = str(data["normalization"]).strip().lower() if "normalization" in data else None
-    if normalization in ["none_not_set", "nan", "none"]:
-        normalization = None
-
-    is_finetuned = bool(data["is_finetuned"]) if "is_finetuned" in data else None
-    is_4fold_cv = bool(data.get("is_4fold_cv", False)) or ("fold_assignment_arr" in data) or ("fold_assignment" in data)
-
     return {
         "embeddings": embeddings,
         "targets": targets,
@@ -162,25 +191,52 @@ def load_embeddings_npz(file_path: Path) -> dict:
         "transcript_ids": tx_ids,
         "genes": genes,
         "dataset": dataset_name,
+        "track_name": track_name,
         "normalization": normalization,
         "is_finetuned": is_finetuned,
-        "is_4fold_cv": is_4fold_cv,
-        "seq_lens": data.get("seq_lens_arr", data.get("seq_lens", None)),
+        "is_4fold_cv": bool(meta.get("is_4fold_cv", True)),
+        "variant": variant,
+        "seq_lens": data.get("seq_lens_arr", None),
         "archive_keys": available_keys,
+        "metadata": meta,
     }
 
 
 # =============================================================================
-# Helper: Resolve Dataset, Split Lookup Table & Output Directory
+# Helper: Split Lookup Table & Output Directory
 # =============================================================================
 
-def resolve_dataset_key(dataset_meta: str, file_path: Path) -> str:
-    """Normalizes dataset identifier string to canonical key ('hipsc_cm', 'mrna_bench_human', 'mrna_bench_mouse')."""
-    d_clean = str(dataset_meta).strip().lower()
-    if d_clean in SPLITS_LOOKUP_TABLES:
-        return d_clean
-    else:
-        raise ValueError(f"[Error] Unknown dataset key: {d_clean}! Known datasets: {list(SPLITS_LOOKUP_TABLES.keys())}.")
+def resolve_output_dir(
+    dataset_key: str,
+    track_type: str,
+    normalization: str,
+    variant: str,
+) -> Path:
+    """
+    Constructs the canonical output folder based strictly on metadata:
+    - 6-track:                  <base_dir>/<dataset_key>/6track/<variant> (variant: finetuned/pretrained)
+    - All other tracks (N-track): <base_dir>/<dataset_key>/<track_type>/<normalization> (e.g. minmax, log, none)
+    """
+    sub_dir = variant if track_type == "6track" else (normalization if normalization and normalization != "none" else "none")
+    base_dir = (
+        DEFAULT_BASE_RESULTS_DIR
+        if DEFAULT_BASE_RESULTS_DIR.parent.parent.exists()
+        else Path(__file__).resolve().parent.parent / "results" / "Orthrus"
+    )
+    return base_dir / dataset_key / track_type / sub_dir
+
+
+def resolve_dataset_key(dataset_name: str) -> str:
+    """Standardizes the dataset identifier from metadata ('hipsc_cm', 'mrna_bench_human', 'mrna_bench_mouse')."""
+    d_clean = str(dataset_name).strip().lower().replace("-", "_")
+    if "hipsc" in d_clean:
+        return "hipsc_cm"
+    elif "mrna_bench_human" in d_clean or "rnahl_human" in d_clean or "human" in d_clean:
+        return "mrna_bench_human"
+    elif "mrna_bench_mouse" in d_clean or "rnahl_mouse" in d_clean or "mouse" in d_clean:
+        return "mrna_bench_mouse"
+    raise KeyError(f"[Error] Unknown dataset '{dataset_name}' in metadata! Known datasets: {list(SPLITS_LOOKUP_TABLES.keys())}.")
+
 
 def resolve_splits_lookup(dataset_key: str) -> Path:
     """Resolves the 10-fold lookup table path automatically from dataset key."""
@@ -214,12 +270,6 @@ def parse_args():
         help="Path to NPZ embeddings archive (required)",
     )
     parser.add_argument(
-        "--output_dir",
-        type=str,
-        default=None,
-        help="Output directory for models, predictions, metrics, and plots (default: auto-structured by dataset)",
-    )
-    parser.add_argument(
         "--random_state",
         type=int,
         default=42,
@@ -237,7 +287,7 @@ def main():
     args = parse_args()
     emb_path = Path(args.embeddings_path)
 
-    # 1. Load Embeddings NPZ
+    # 1. Load Embeddings NPZ and strictly companion metadata
     print("=" * 75)
     print("      ORTHRUS UNIFIED RIDGE REGRESSION EVALUATION PIPELINE       ")
     print("=" * 75)
@@ -245,24 +295,22 @@ def main():
     data = load_embeddings_npz(emb_path)
 
     # 2. Identify Dataset and Auto-resolve Lookup Table
-    dataset_key = resolve_dataset_key(data["dataset"], emb_path)
+    dataset_key = resolve_dataset_key(data["dataset"])
     lookup_path = resolve_splits_lookup(dataset_key)
 
-    # 3. Determine Output Directory
-    if args.output_dir:
-        out_dir = Path(args.output_dir)
-    else:
-        norm_suffix = f"_{data['normalization']}" if data["normalization"] else ""
-        variant = "finetuned" if data["is_finetuned"] else "pretrained"
-        out_dir = Path(f"/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/results/Orthrus/{dataset_key}/{variant}{norm_suffix}")
+    # 3. Determine Track Type, Normalization, Variant & Output Directory strictly from metadata
+    track_type = data["track_name"]
+    normalization = data["normalization"]
+    variant = data["variant"]
+    out_dir = resolve_output_dir(dataset_key, track_type, normalization, variant)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Dataset detected:      {dataset_key} (from NPZ metadata: '{data['dataset']}')")
+    print(f"Dataset detected:      {dataset_key} (from metadata: '{data['dataset']}')")
+    print(f"Track identity:        {track_type}")
+    print(f"Normalization:         {normalization.upper()}")
+    print(f"Model variant:         {variant.upper()}")
     print(f"Splits lookup table:   {lookup_path}")
     print(f"Output directory:      {out_dir}")
-    print(f"Model variant:         {'Fine-Tuned' if data['is_finetuned'] else 'Pretrained Base'}")
-    if data["normalization"]:
-        print(f"Normalization:         {data['normalization'].upper()}")
 
     # 4. Data Extraction & Target Verification
     X = data["embeddings"]
@@ -440,10 +488,13 @@ def main():
     # 11. Save Comprehensive Metrics JSON
     all_metrics = {
         "dataset": dataset_key,
+        "track_type": track_type,
+        "track_name": track_type,
+        "normalization": normalization,
+        "variant": variant,
         "raw_dataset_meta": data["dataset"],
         "is_finetuned": data["is_finetuned"],
         "is_4fold_cv": data["is_4fold_cv"],
-        "normalization": data["normalization"],
         "embeddings_path": str(emb_path),
         "splits_lookup_path": str(lookup_path),
         "best_alpha": best_alpha,

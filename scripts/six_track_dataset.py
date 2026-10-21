@@ -494,7 +494,7 @@ class SixTrackDatasetLoader:
         Loads and parses mRNABench dataset ('rnahl-human' or 'rnahl-mouse').
         All transcripts are strictly mapped to official Ensembl transcript IDs (ENST... / ENSMUST...).
         """
-        dataset_key = f"rnahl-{self.species}"
+        dataset_key = f"mrna_bench_{self.species}"
         data_dir = self.data_path or self.MRNA_BENCH_DEFAULT_DIR
 
         print(f"[SixTrackLoader] Loading mRNABench ({dataset_key}) from: {data_dir}")
@@ -502,14 +502,30 @@ class SixTrackDatasetLoader:
         df_raw = None
 
         # Priority 1: Check if pre-mapped GENCODE table already exists AND is 100% complete
-        mapped_candidates = [
-            data_dir / dataset_key / "mrna_protein.parquet",
-            data_dir / dataset_key / f"{self.species}_mrna_protein.parquet",
-            data_dir / dataset_key / "mrna_protein.tsv",
-            data_dir / dataset_key / f"{self.species}_mrna_protein.tsv",
-            data_dir / dataset_key / "mrna_protein.csv",
-            data_dir / dataset_key / f"{self.species}_mrna_protein.csv",
+        candidate_subdirs = [
+            dataset_key,
+            f"rnahl-{self.species}",
+            f"rnahl_{self.species}",
+            self.species,
         ]
+        mapped_candidates = []
+        for sdir in candidate_subdirs:
+            mapped_candidates.extend([
+                data_dir / sdir / "mrna_protein.parquet",
+                data_dir / sdir / f"{self.species}_mrna_protein.parquet",
+                data_dir / sdir / "mrna_protein.tsv",
+                data_dir / sdir / f"{self.species}_mrna_protein.tsv",
+                data_dir / sdir / "mrna_protein.csv",
+                data_dir / sdir / f"{self.species}_mrna_protein.csv",
+            ])
+        mapped_candidates.extend([
+            data_dir / "mrna_protein.parquet",
+            data_dir / f"{self.species}_mrna_protein.parquet",
+            data_dir / "mrna_protein.tsv",
+            data_dir / f"{self.species}_mrna_protein.tsv",
+            data_dir / "mrna_protein.csv",
+            data_dir / f"{self.species}_mrna_protein.csv",
+        ])
         complete_mapped_df = None
         unmapped_candidate_df = None
 
@@ -552,13 +568,16 @@ class SixTrackDatasetLoader:
                 try:
                     import mrna_bench as mb
                     mb.update_data_path(str(data_dir))
-                    df_raw = mb.load_dataset(dataset_key).data_df
-                except ImportError:
+                    bench_key = f"rnahl-{self.species}"
+                    df_raw = mb.load_dataset(bench_key).data_df
+                except Exception:
                     # Tabular fallback candidates
-                    fallback_files = [
-                        data_dir / f"{dataset_key}.tsv",
-                        data_dir / f"{dataset_key}.csv",
-                    ]
+                    fallback_files = []
+                    for sdir in candidate_subdirs:
+                        fallback_files.extend([
+                            data_dir / f"{sdir}.tsv",
+                            data_dir / f"{sdir}.csv",
+                        ])
                     for c in fallback_files:
                         if c.exists():
                             print(f"[SixTrackLoader] Found tabular table fallback: {c.name}")

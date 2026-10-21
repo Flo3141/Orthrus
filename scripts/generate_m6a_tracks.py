@@ -33,6 +33,7 @@ Features:
 """
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -41,13 +42,16 @@ import pandas as pd
 from tqdm import tqdm
 
 from six_track_dataset import SixTrackDatasetLoader
+from util import save_metadata
+
+DEFAULT_CHANNEL_NAMES = ["A", "C", "G", "U", "CDS", "Splice", "m6A"]
 
 
 # =============================================================================
 # Fixed Reference File Paths (Cluster Constants)
 # =============================================================================
 VALIDATED_M6A_PATH = Path(
-    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/m6a/validated_m6a_sites.tsv"
+    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/m6a/validated_m6a_sites.tsv"
 )
 
 
@@ -282,6 +286,8 @@ def save_chunk(
         gene=gene_arr,
         seq_lens=lens_arr,
         dataset=str(dataset),
+        track_name="7track_m6a",
+        channel_names=np.array(DEFAULT_CHANNEL_NAMES),
         has_m6a=np.array([item["has_m6a"] for item in chunk_items], dtype=bool),
         num_m6a_sites=np.array([item["num_m6a_sites"] for item in chunk_items], dtype=np.int32),
         mean_m6a_score=np.array([item["mean_m6a_score"] for item in chunk_items], dtype=np.float32),
@@ -295,9 +301,12 @@ def merge_all_chunks(
     chunks_dir: Path,
     output_file: Path,
     dataset: str = "unknown",
+    species: Optional[str] = None,
     normalization: str = "none",
     score_column: str = "mean_score",
     m6a_q99: Optional[float] = None,
+    max_length: int = 12288,
+    filter_drach: bool = False,
 ):
     """Merges all generated chunk archives into the final master NPZ."""
     chunk_files = sorted(chunks_dir.glob("chunk_*.npz"))
@@ -339,6 +348,8 @@ def merge_all_chunks(
         gene=np.array(genes),
         seq_lens=np.array(lens, dtype=np.int32),
         dataset=str(dataset),
+        track_name="7track_m6a",
+        channel_names=np.array(DEFAULT_CHANNEL_NAMES),
         has_m6a=np.array(has_m6a_flags, dtype=bool),
         num_m6a_sites=np.array(site_counts, dtype=np.int32),
         mean_m6a_score=np.array(mean_scores, dtype=np.float32),
@@ -350,6 +361,34 @@ def merge_all_chunks(
     n_total = len(tx_ids)
     n_with_m6a = int(sum(has_m6a_flags))
     total_sites = int(sum(site_counts))
+
+    # Save standardized .meta.json companion file
+    inferred_species = str(species) if species else ("human" if ("hipsc" in str(dataset).lower() or "human" in str(dataset).lower()) else "mouse")
+    meta_dict = {
+        "track_name": "7track_m6a",
+        "dataset": str(dataset),
+        "species": inferred_species,
+        "normalization": str(normalization),
+        "num_channels": 7,
+        "channel_names": list(DEFAULT_CHANNEL_NAMES),
+        "max_length": int(max_length),
+        "total_transcripts": int(n_total),
+        "unique_genes": int(len(set(genes))),
+        "seq_len_min": int(min(lens)) if lens else 0,
+        "seq_len_max": int(max(lens)) if lens else 0,
+        "seq_len_mean": float(np.mean(lens)) if lens else 0.0,
+        "npz_file": output_file.name,
+        "created_at": datetime.now().isoformat(),
+        "parameters": {
+            "score_column": str(score_column),
+            "normalization": str(normalization),
+            "m6a_q99": float(m6a_q99) if (m6a_q99 is not None and not np.isnan(m6a_q99)) else None,
+            "filter_drach": bool(filter_drach),
+            "transcripts_with_m6a": int(n_with_m6a),
+            "total_m6a_sites": int(total_sites),
+        },
+    }
+    save_metadata(output_file, meta_dict)
 
     print("\n" + "=" * 70)
     print("             m6A 7-TRACK DATASET GENERATION REPORT            ")
@@ -393,12 +432,7 @@ def parse_args():
         choices=["human", "mouse"],
         help="Species for mRNABench: 'human' or 'mouse' (required if --dataset is 'mrna_bench')",
     )
-    parser.add_argument(
-        "--output_file",
-        type=str,
-        required=True,
-        help="Destination NPZ archive path (automatically suffixed with normalization method, required)",
-    )
+
     parser.add_argument(
         "--score_col",
         type=str,
@@ -457,18 +491,26 @@ def main():
         raise ValueError("--species ('human' or 'mouse') must be specified when --dataset is 'mrna_bench'!")
 
     norm_method = args.normalization.lower()
-    dataset_name = f"{args.dataset}_{args.species}" if args.species else args.dataset
-    out_file = Path(args.output_file)
 
-    # Append normalization suffix if not already present
-    if norm_method != "none":
-        stem = out_file.stem
-        if not stem.endswith(f"_{norm_method}"):
-            out_file = out_file.parent / f"{stem}_{norm_method}{out_file.suffix}"
+    dataset_key = f"{args.dataset}_{args.species}" if args.species else args.dataset
+    dataset_dirs = {
+        "hipsc_cm": Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus"),
+        "mrna_bench_human": Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus"),
+        "mrna_bench_mouse": Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus"),
+    }
+    if dataset_key not in dataset_dirs:
+        raise ValueError(f"[Error] Unknown dataset key '{dataset_key}'! Supported: {list(dataset_dirs.keys())}")
+
+    data_dir = dataset_dirs[dataset_key]
+    dataset_name = dataset_key
+    norm_suffix = f"_{norm_method}" if norm_method != "none" else ""
+    file_stem = f"hipsc_cm_7track_m6a{norm_suffix}" if args.dataset == "hipsc_cm" else f"mrna_bench_{args.species}_7track_m6a{norm_suffix}"
+    out_file = data_dir / f"{file_stem}.npz"
 
     out_file.parent.mkdir(parents=True, exist_ok=True)
     chunks_dir = out_file.parent / f"{out_file.stem}_chunks"
     chunks_dir.mkdir(parents=True, exist_ok=True)
+
 
     print("=" * 75)
     print("   ORTHRUS 7-TRACK m6A DATASET GENERATOR (cDNA Mapping)   ")
@@ -648,9 +690,12 @@ def main():
         chunks_dir=chunks_dir,
         output_file=out_file,
         dataset=dataset_name,
+        species=args.species,
         normalization=norm_method,
         score_column=args.score_col,
         m6a_q99=m6a_q99,
+        max_length=args.max_length,
+        filter_drach=args.filter_drach,
     )
 
 

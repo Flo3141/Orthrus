@@ -5,7 +5,7 @@ Helps choose optimal cluster GPU nodes (e.g. 16GB vs 24GB vs 40GB vs 80GB).
 
 import sys
 import os
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 
 try:
     import torch
@@ -80,20 +80,26 @@ def get_memory_profile(device: Optional[Any] = None) -> Dict[str, Any]:
     if torch is not None and torch.cuda.is_available():
         try:
             if device is None:
-                device = torch.cuda.current_device()
+                dev_idx = torch.cuda.current_device()
             elif isinstance(device, str):
-                device = torch.device(device).index or 0
+                dev_idx = torch.device(device).index or 0
+            elif isinstance(device, torch.device):
+                dev_idx = device.index or 0
+            elif isinstance(device, int):
+                dev_idx = device
+            else:
+                dev_idx = 0
 
             profile["cuda_available"] = True
-            profile["device_index"] = device
-            props = torch.cuda.get_device_properties(device)
+            profile["device_index"] = int(dev_idx)
+            props = torch.cuda.get_device_properties(dev_idx)
             profile["device_name"] = props.name
             profile["total_vram_gb"] = props.total_memory / (1024 ** 3)
 
-            profile["peak_vram_allocated_gb"] = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-            profile["peak_vram_reserved_gb"] = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
-            profile["current_vram_allocated_gb"] = torch.cuda.memory_allocated(device) / (1024 ** 3)
-            profile["current_vram_reserved_gb"] = torch.cuda.memory_reserved(device) / (1024 ** 3)
+            profile["peak_vram_allocated_gb"] = torch.cuda.max_memory_allocated(dev_idx) / (1024 ** 3)
+            profile["peak_vram_reserved_gb"] = torch.cuda.max_memory_reserved(dev_idx) / (1024 ** 3)
+            profile["current_vram_allocated_gb"] = torch.cuda.memory_allocated(dev_idx) / (1024 ** 3)
+            profile["current_vram_reserved_gb"] = torch.cuda.memory_reserved(dev_idx) / (1024 ** 3)
 
             # Node recommendation based on peak reserved memory (with ~15% safety margin)
             peak_res = profile["peak_vram_reserved_gb"]
@@ -157,3 +163,92 @@ def print_memory_profile(device: Optional[Any] = None, title: str = "SPEICHER-PR
     print("=" * 65 + "\n")
 
     return prof
+
+
+# =============================================================================
+# Track & Dataset Metadata Helpers (.meta.json & NPZ synchronization)
+# =============================================================================
+
+import json
+from pathlib import Path
+
+
+class _NumpyMetadataEncoder(json.JSONEncoder):
+    """Encodes NumPy primitives and arrays to standard Python types for JSON."""
+    def default(self, obj):
+        import numpy as np
+        if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
+            return float(obj) if not np.isnan(obj) else None
+        elif isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, Path):
+            return str(obj)
+        return super().default(obj)
+
+
+def get_meta_filepath(file_path: Union[str, Path]) -> Path:
+    """
+    Returns the canonical .meta.json file path for a given dataset or model file.
+    For example: 'data/hipsc_cm_6tracks.npz' -> 'data/hipsc_cm_6tracks.meta.json'
+    """
+    p = Path(file_path)
+    if p.name.endswith(".meta.json"):
+        return p
+    if p.suffix.lower() == ".json":
+        return p
+    return p.parent / f"{p.stem}.meta.json"
+
+
+def save_metadata(output_path: Union[str, Path], meta_dict: Dict[str, Any]) -> Path:
+    """
+    Saves a metadata dictionary as formatted JSON alongside the given file.
+    Automatically converts NumPy scalars and arrays to JSON-serializable types.
+    """
+    meta_file = get_meta_filepath(output_path)
+    meta_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(meta_file, "w", encoding="utf-8") as f:
+        json.dump(meta_dict, f, indent=2, cls=_NumpyMetadataEncoder, ensure_ascii=False)
+
+    print(f"[Metadata] Saved metadata file: {meta_file}")
+    return meta_file
+
+
+def load_metadata(file_path: Union[str, Path], required: bool = True) -> Dict[str, Any]:
+    """
+    Strictly loads companion metadata (.meta.json / model_meta.json / results.meta.json).
+    If required=True and no metadata file is found, raises FileNotFoundError.
+    """
+    p = Path(file_path)
+
+    # Check for companion JSON file
+    candidates = [
+        get_meta_filepath(p),
+        p.parent / f"{p.stem}.json",
+        p.with_suffix(".json"),
+        p / "model_meta.json" if p.is_dir() else None,
+        p / "results.meta.json" if p.is_dir() else None,
+        p / "meta.json" if p.is_dir() else None,
+    ]
+
+    for cand in candidates:
+        if cand is not None and cand.is_file():
+            try:
+                with open(cand, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                return meta
+            except Exception as e:
+                raise ValueError(f"[Metadata Error] Failed to parse JSON from '{cand}': {e}") from e
+
+    if required:
+        raise FileNotFoundError(
+            f"[Metadata Error] Required companion metadata file (.meta.json) not found for: '{p}'! "
+            f"Please ensure the companion metadata file exists."
+        )
+
+    return {}
+

@@ -40,9 +40,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, Sampler
 from tqdm import tqdm
+from datetime import datetime
 from transformers import AutoModel
+from typing import Optional, List, Dict, Any, Union
 
-from util import reset_peak_memory_stats, print_memory_profile
+from util import reset_peak_memory_stats, print_memory_profile, load_metadata, save_metadata
 
 # Headless backend for cluster servers without display
 import matplotlib
@@ -867,6 +869,7 @@ def train_model(
     compute_xai: bool = True,
     xai_num_heatmaps: int = 5,
     xai_tx_ids: str = None,
+    source_checkpoint: Optional[str] = None,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
     num_channels = len(channel_names)
@@ -1082,13 +1085,28 @@ def train_model(
             best_backbone_dir.mkdir(parents=True, exist_ok=True)
             model.backbone.save_pretrained(best_backbone_dir)
 
-            # Copy orthrus_hf.py if available anywhere in related directories
+            # Ensure config.json has updated n_tracks
+            cfg_file = best_backbone_dir / "config.json"
+            if cfg_file.exists():
+                try:
+                    with open(cfg_file, "r") as f_cfg:
+                        c_dict = json.load(f_cfg)
+                    c_dict["n_tracks"] = num_channels
+                    with open(cfg_file, "w") as f_cfg:
+                        json.dump(c_dict, f_cfg, indent=2)
+                except Exception:
+                    pass
+
+            # Copy remote code files (*.py) from source checkpoint and related directories
             import shutil
+            if source_checkpoint and Path(source_checkpoint).is_dir():
+                for py_file in Path(source_checkpoint).glob("*.py"):
+                    shutil.copy2(py_file, best_backbone_dir / py_file.name)
             for candidate_dir in [output_dir, output_dir.parent, Path(output_dir.parent).parent]:
-                hf_script = candidate_dir / "orthrus_hf.py"
-                if hf_script.exists():
-                    shutil.copy2(hf_script, best_backbone_dir / "orthrus_hf.py")
-                    break
+                for py_file in candidate_dir.glob("*.py"):
+                    dst_file = best_backbone_dir / py_file.name
+                    if not dst_file.exists():
+                        shutil.copy2(py_file, dst_file)
 
         # 2. Save Automatic Resume Checkpoint (latest_checkpoint.pt)
         torch.save({
@@ -1217,19 +1235,6 @@ def main():
         required=True,
         help="Path to Orthrus model checkpoint directory or HuggingFace repo (e.g. from convert_6track_to_ntrack.py)",
     )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        required=True,
-        help="Directory to save fine-tuned checkpoints and logs (fold_X subdirectories will be created inside)",
-    )
-    parser.add_argument(
-        "--channel_names",
-        nargs="+",
-        required=True,
-        help="List of channel names in order (e.g. --channel_names A C G U CDS Splice miRNA eCLIP). Determines N tracks.",
-    )
-
     # Optional configuration parameters
     parser.add_argument(
         "--fold",
@@ -1338,16 +1343,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Parse and normalize channel names
-    channel_names = []
-    for item in args.channel_names:
-        channel_names.extend([x.strip() for x in item.split(",") if x.strip()])
-    num_channels = len(channel_names)
-    if num_channels == 0:
-        raise ValueError("[Error] At least one channel name must be provided via --channel_names.")
-
-    channel_colors = get_channel_colors(channel_names)
-
     # Set seeds
     random.seed(args.random_seed)
     np.random.seed(args.random_seed)
@@ -1355,20 +1350,49 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.random_seed)
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     reset_peak_memory_stats(device)
 
-    # 1. Load dataset (.npz or .tsv/.txt)
+    # 1. Load dataset (.npz) and strictly require companion metadata
     data_file = Path(args.data_path)
     if not data_file.exists():
         raise FileNotFoundError(f"[Error] Dataset file not found: {data_file}")
 
     print(f"\nLoading dataset: {data_file}...")
-    dataset_name = None
+    meta = load_metadata(data_file, required=True)
+
+    # Strictly extract fields from meta.json - no fallbacks!
+    if "dataset" not in meta:
+        raise KeyError(f"[Error] Required metadata key 'dataset' not found in companion metadata for {data_file}!")
+    dataset_name = str(meta["dataset"]).strip()
+
+    if "track_name" not in meta:
+        raise KeyError(f"[Error] Required metadata key 'track_name' not found in companion metadata for {data_file}!")
+    track_name = str(meta["track_name"]).strip()
+
+    if "channel_names" not in meta:
+        raise KeyError(f"[Error] Required metadata key 'channel_names' not found in companion metadata for {data_file}!")
+    channel_names = [str(x) for x in meta["channel_names"]]
+    num_channels = len(channel_names)
+    if num_channels == 0:
+        raise ValueError(f"[Error] 'channel_names' in metadata for {data_file} is empty!")
+
+    normalization = str(meta.get("normalization", "none")).strip().lower()
+
+    # Automatically determine output directory based on metadata
+    base_checkpoints_dir = (
+        Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus")
+        if Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code").exists()
+        else Path(__file__).resolve().parent.parent / "checkpoints" / "orthrus"
+    )
+    if normalization and normalization != "none":
+        output_dir = base_checkpoints_dir / dataset_name / track_name / normalization
+    else:
+        output_dir = base_checkpoints_dir / dataset_name / track_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[Output Directory] Auto-resolved checkpoint output directory: {output_dir}")
+
     if data_file.suffix.lower() == ".npz":
         npz_data = np.load(data_file, allow_pickle=True)
         if "tracks" not in npz_data:
@@ -1379,21 +1403,13 @@ def main():
             raise KeyError(f"[Error] Target column '{args.target_col}' not found in {data_file}! Available: {list(npz_data.files)}")
         targets = npz_data[args.target_col].astype(np.float32)
 
-        if "gene" in npz_data:
-            genes = npz_data["gene"].astype(str)
-        else:
+        if "gene" not in npz_data:
             raise KeyError(f"[Error] 'gene' not found in dataset {data_file}! Available: {list(npz_data.files)}")
+        genes = npz_data["gene"].astype(str)
 
         if "ensembl_transcript_id" not in npz_data:
             raise KeyError(f"[Error] Required field 'ensembl_transcript_id' not found in dataset {data_file}!")
         tx_ids = npz_data["ensembl_transcript_id"].astype(str)
-
-        if "dataset" in npz_data:
-            dataset_name = str(npz_data["dataset"])
-        else:
-            raise KeyError(
-                f"[Error] Required field 'dataset' not found in NPZ archive {data_file}! Available: {list(npz_data.files)}"
-            )
 
         # Cleaning mask
         valid_mask = ~np.isnan(targets) & ~np.isinf(targets)
@@ -1413,20 +1429,23 @@ def main():
         genes = genes[valid_mask]
         tx_ids = tx_ids[valid_mask]
 
+    channel_colors = get_channel_colors(channel_names)
+
     # Check and align channel dimensions
     data_channels = tracks[0].shape[1]
     if data_channels < num_channels:
         raise ValueError(
-            f"[Error] Dataset has only {data_channels} channels, but {num_channels} channels were requested via --channel_names ({channel_names})!"
+            f"[Error] Dataset has only {data_channels} channels, but {num_channels} channels were specified in metadata ({channel_names})!"
         )
     elif data_channels > num_channels:
         print(
-            f"[Info] Dataset has {data_channels} channels. Slicing the first {num_channels} channels matching --channel_names ({channel_names})."
+            f"[Info] Dataset has {data_channels} channels. Slicing the first {num_channels} channels matching {channel_names}."
         )
         tracks = [t[:, :num_channels] for t in tracks]
 
     print(f"Total valid samples loaded: {len(targets)}")
     print(f"Dataset:                   {dataset_name}")
+    print(f"Track identity:            {track_name} (Normalization: {normalization.upper()})")
     print(f"Unique genes:              {len(np.unique(genes))}")
     print(f"Configured tracks (N):     {num_channels}")
     print(f"Channel names:             {channel_names}")
@@ -1535,13 +1554,15 @@ def main():
         backbone = AutoModel.from_pretrained(args.model_checkpoint, trust_remote_code=True)
         d_model = getattr(backbone.config, "ssm_model_dim", 512)
 
-        # Sanity check on model's expected n_tracks if available in config
-        model_n_tracks = getattr(backbone.config, "n_tracks", None)
-        if model_n_tracks is not None and model_n_tracks != num_channels:
-            print(
-                f"[Notice] Model config specifies n_tracks={model_n_tracks}, but {num_channels} channels "
-                f"were provided via --channel_names. Please ensure the model checkpoint matches the data channels."
+        # Check input embedding dimension (must match dataset channels)
+        emb_layer = getattr(backbone, "embedding", None)
+        if emb_layer is not None and hasattr(emb_layer, "in_features") and emb_layer.in_features != num_channels:
+            raise ValueError(
+                f"[Error] Checkpoint input embedding dimension ({emb_layer.in_features}) does not match dataset tracks ({num_channels})!\n"
+                f"Please convert your base model using 'convert_6track_to_ntrack.py --n_target_tracks {num_channels}' first."
             )
+        if hasattr(backbone, "config") and getattr(backbone.config, "n_tracks", None) != num_channels:
+            backbone.config.n_tracks = num_channels
 
         model = OrthrusRegressionModel(backbone=backbone, d_model=d_model, hidden_dim=256, dropout=0.1)
         model.to(device)
@@ -1567,6 +1588,7 @@ def main():
             compute_xai=args.compute_xai,
             xai_num_heatmaps=args.xai_num_heatmaps,
             xai_tx_ids=args.xai_tx_ids,
+            source_checkpoint=args.model_checkpoint,
         )
         all_fold_summaries[fold_id] = fold_summary
 

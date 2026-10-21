@@ -9,8 +9,9 @@ representation extraction (Out-of-Fold validation + Test ensemble mean).
 """
 
 import argparse
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 
 import numpy as np
 import pandas as pd
@@ -18,12 +19,24 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModel
 
-from util import reset_peak_memory_stats, print_memory_profile
+from util import reset_peak_memory_stats, print_memory_profile, load_metadata, save_metadata, get_meta_filepath
 
 
-SPLITS_LOOKUP_PATH = Path(
+SPLITS_LOOKUP_HIPSC_CM = Path(
     "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hipsc_cm_10folds_lookup.csv"
 )
+SPLITS_LOOKUP_RNAHL_HUMAN = Path(
+    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/rnahl-human_10folds_lookup.csv"
+)
+SPLITS_LOOKUP_RNAHL_MOUSE = Path(
+    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/rnahl-mouse_10folds_lookup.csv"
+)
+
+SPLITS_LOOKUP_TABLES = {
+    "hipsc_cm": SPLITS_LOOKUP_HIPSC_CM,
+    "mrna_bench_human": SPLITS_LOOKUP_RNAHL_HUMAN,
+    "mrna_bench_mouse": SPLITS_LOOKUP_RNAHL_MOUSE,
+}
 
 
 def get_representation(model: torch.nn.Module, x_tensor: torch.Tensor, lengths_tensor: torch.Tensor) -> torch.Tensor:
@@ -99,10 +112,10 @@ def extract_embeddings_for_tracks(
     return np.stack(embeddings_list, axis=0)
 
 
-def load_fold_backbone(fold_dir: Path | str, device: torch.device) -> torch.nn.Module:
+def load_fold_backbone(fold_dir: Union[str, Path], device: torch.device, num_channels: Optional[int] = None) -> torch.nn.Module:
     """
-    Loads an Orthrus backbone for a specific fold directory or HF model identifier.
-    Checks for 'best_finetuned_backbone' subdirectory if fold_dir is a local directory.
+    Loads fine-tuned Orthrus backbone checkpoint or base pretrained model.
+    Adapts embedding layer dynamically if num_channels does not match base model in_features.
     """
     fold_dir_str = str(fold_dir).strip()
     fold_path = Path(fold_dir_str)
@@ -114,6 +127,15 @@ def load_fold_backbone(fold_dir: Path | str, device: torch.device) -> torch.nn.M
 
     print(f"Loading backbone from: {ckpt_target}...")
     model = AutoModel.from_pretrained(ckpt_target, trust_remote_code=True)
+
+    if num_channels is not None:
+        emb_layer = getattr(model, "embedding", None)
+        if emb_layer is not None and hasattr(emb_layer, "in_features") and emb_layer.in_features != num_channels:
+            raise ValueError(
+                f"[Error] Checkpoint channel dimension ({emb_layer.in_features}) does not match dataset tracks ({num_channels})!\n"
+                f"Please ensure the model was fine-tuned or converted using convert_6track_to_ntrack.py."
+            )
+
     model = model.to(device)
     model.eval()
     return model
@@ -136,12 +158,6 @@ def parse_args():
         type=str,
         required=True,
         help="Path to fine-tuned model directory (with fold_0..fold_3) or pretrained base model checkpoint (e.g. 'quietflamingo/orthrus-large-6-track', required)",
-    )
-    parser.add_argument(
-        "--output_file",
-        type=str,
-        required=True,
-        help="Destination NPZ archive path for extracted embeddings (required)",
     )
     parser.add_argument(
         "--batch_size",
@@ -200,24 +216,22 @@ def main():
     genes = npz_data["gene"].astype(str) if "gene" in npz_data else np.array([""] * n_samples)
     seq_lens = npz_data["seq_lens"].astype(np.int32) if "seq_lens" in npz_data else np.array([len(t) for t in tracks], dtype=np.int32)
 
-    if "dataset" not in npz_data:
-        raise KeyError(
-            f"[Error] Required field 'dataset' not found in tracks archive {tracks_path}! "
-            f"Available keys: {list(npz_data.files)}"
-        )
-    dataset_raw = npz_data["dataset"]
-    if isinstance(dataset_raw, np.ndarray) and dataset_raw.ndim > 0 and len(dataset_raw) > 0:
-        dataset_name = str(dataset_raw.flat[0]).strip()
-    elif hasattr(dataset_raw, "item"):
-        try:
-            dataset_name = str(dataset_raw.item()).strip()
-        except Exception:
-            dataset_name = str(dataset_raw).strip()
-    else:
-        dataset_name = str(dataset_raw).strip()
+    # Load companion metadata strictly (no fallbacks)
+    tracks_meta = load_metadata(tracks_path, required=True)
+
+    if "dataset" not in tracks_meta:
+        raise KeyError(f"[Error] Required metadata key 'dataset' not found in companion metadata for {tracks_path}!")
+    dataset_name = str(tracks_meta["dataset"]).strip()
+
+    if "track_name" not in tracks_meta:
+        raise KeyError(f"[Error] Required metadata key 'track_name' not found in companion metadata for {tracks_path}!")
+    track_name = str(tracks_meta["track_name"]).strip()
+
+    normalization = str(tracks_meta.get("normalization", "none")).strip().lower()
 
     print(f"\n[Tracks Info] Loaded {n_samples:,} transcripts with {n_channels} channels.")
     print(f"Dataset identity:   {dataset_name}")
+    print(f"Track identity:     {track_name} (Normalization: {normalization.upper()})")
 
     # 2. Resolve Model Checkpoint & Architecture Mode
     model_checkpoint_str = str(args.model_checkpoint).strip()
@@ -235,18 +249,34 @@ def main():
         if not model_path.exists():
             raise FileNotFoundError(f"[Error] Model checkpoint path not found: {model_path}")
 
+        # Check for model metadata
+        try:
+            model_meta = load_metadata(model_path, required=False)
+        except Exception:
+            model_meta = {}
+
+        if model_meta.get("is_finetuned") is not None:
+            is_finetuned = bool(model_meta["is_finetuned"])
+        elif "finetuned" in model_path.name.lower() or "finetuned" in str(model_path).lower():
+            is_finetuned = True
+        else:
+            is_finetuned = False
+
         fold_subdirs = [model_path / f"fold_{k}" for k in range(4)]
         if all(p.is_dir() for p in fold_subdirs):
-            is_base_model = False
+            is_4fold_dir = True
             model_identifier = str(model_path)
             print(f"\n[Model Detection] 4-Fold fine-tuned model directory: {model_path}")
         else:
-            is_base_model = True
+            is_4fold_dir = False
             model_identifier = str(model_path)
             print(f"\n[Model Detection] Single checkpoint directory (shared across all folds): {model_path}")
 
-    # 3. Resolve Destination File Path
-    save_file = Path(args.output_file)
+    # 3. Resolve Destination File Path strictly from metadata
+    var_str = "finetuned" if is_finetuned else "pretrained"
+    norm_str = f"_{normalization}" if normalization and normalization != "none" else ""
+    save_file = tracks_path.parent / f"{dataset_name}_{track_name}_{var_str}{norm_str}_embeddings.npz"
+
     save_file.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_file = save_file.with_name(f"{save_file.stem}_checkpoint.npz")
     print(f"Destination file:   {save_file}")
@@ -256,7 +286,12 @@ def main():
     reset_peak_memory_stats(device)
 
     # 4. Resolve Standardized 10-Fold Splits Lookup Table
-    lookup_path = SPLITS_LOOKUP_PATH
+    d_clean = str(dataset_name).strip().lower().replace("-", "_")
+    if d_clean in SPLITS_LOOKUP_TABLES:
+        lookup_path = SPLITS_LOOKUP_TABLES[d_clean]
+    else:
+        raise FileNotFoundError(f"[Error] No lookup table found for dataset: {dataset_name} (cleaned: {d_clean})")
+
     if not lookup_path.exists():
         raise FileNotFoundError(
             f"[Error] 4-Fold cross-validation requires a standardized 10-fold split lookup table! "
@@ -297,10 +332,10 @@ def main():
     print(f"\n4-Fold CV Setup: Total Samples = {n_samples:,}, Test Samples [8, 9] = {len(test_idx):,}")
 
     # 5. Execute Embedding Extraction
-    if is_base_model:
-        print(f"\n[Single Base Model Mode] Extracting embeddings using model: {model_identifier}")
+    if not is_4fold_dir:
+        print(f"\n[Single Model Mode] Extracting embeddings using model: {model_identifier}")
         print("Model has not seen CV split data; extracting all samples in a single unified pass.")
-        model = load_fold_backbone(model_identifier, device)
+        model = load_fold_backbone(model_identifier, device, num_channels=tracks[0].shape[1])
         all_embeddings = extract_embeddings_for_tracks(
             tracks=tracks,
             model=model,
@@ -355,7 +390,7 @@ def main():
 
             fold_dir = fold_subdirs[k]
             print(f"\n--- [Fold {k}] Loading model from: {fold_dir} ---")
-            fold_model = load_fold_backbone(fold_dir, device)
+            fold_model = load_fold_backbone(fold_dir, device, num_channels=tracks[0].shape[1])
 
             print(f"[Fold {k}] Extracting Out-of-Fold Val Embeddings (Splits {val_splits}, {len(val_idx):,} samples)...")
             val_emb = extract_embeddings_for_tracks(
@@ -431,20 +466,27 @@ def main():
         seq_lens_arr=seq_lens,
         fold_assignment_arr=fold_assignment,
         dataset=str(dataset_name),
+        track_name=str(track_name),
+        normalization=str(normalization),
+        variant=str(var_str),
         model_checkpoint=str(model_identifier),
-        is_finetuned=not is_base_model,
-        is_4fold_cv=True,
+        is_finetuned=is_finetuned,
+        is_4fold_cv=is_4fold_dir,
+        source_tracks_file=str(tracks_path.name),
+        source_tracks_meta=str(get_meta_filepath(tracks_path).name),
     )
 
     print("=" * 75)
     print("                    EXTRACTION COMPLETED SUCCESSFULLY                 ")
     print("=" * 75)
     print(f"Embedding array shape:   {all_embeddings.shape}")
+    print(f"Track identity:          {track_name} (Normalization: {normalization.upper()})")
     print(f"Saved to:                {save_file}")
     print(f"Standardized NPZ Keys:   ['embeddings_arr', 'targets_arr', 'targets_raw_arr',")
     print(f"                          'ensembl_transcript_id_arr', 'ensembl_gene_id_arr',")
     print(f"                          'genes_arr', 'seq_lens_arr', 'fold_assignment_arr',")
-    print(f"                          'dataset', 'model_checkpoint', 'is_finetuned', 'is_4fold_cv']")
+    print(f"                          'dataset', 'track_name', 'normalization',")
+    print(f"                          'model_checkpoint', 'is_finetuned', 'is_4fold_cv']")
     print("=" * 75 + "\n")
 
     print_memory_profile(device=device, title="ORTHRUS EMBEDDINGS SPEICHER-PROFILING")

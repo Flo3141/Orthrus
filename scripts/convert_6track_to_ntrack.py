@@ -126,10 +126,10 @@ def convert_6track_to_ntrack(
     print(f"\n[4/5] Saving converted model to: {output_dir}")
     model_target.save_pretrained(output_dir)
 
-    # Copy orthrus_hf.py code for standalone trust_remote_code loading
+    # Copy remote code file for standalone trust_remote_code loading
     src_code_file = Path(inspect.getfile(ModelClass))
-    dst_code_file = output_dir / "orthrus_hf.py"
     if src_code_file.exists():
+        dst_code_file = output_dir / src_code_file.name
         print(f"      Copying remote code file '{src_code_file.name}' to '{dst_code_file.name}'...")
         shutil.copy2(src_code_file, dst_code_file)
 
@@ -139,10 +139,13 @@ def convert_6track_to_ntrack(
         with open(config_file, "r") as f:
             cfg = json.load(f)
         cfg["n_tracks"] = target_tracks
-        cfg["auto_map"] = {
-            "AutoConfig": "orthrus_hf.OrthrusConfig",
-            "AutoModel": "orthrus_hf.OrthrusPretrainedModel"
-        }
+        if hasattr(config_base, "auto_map") and config_base.auto_map:
+            cfg["auto_map"] = config_base.auto_map
+        elif "auto_map" not in cfg:
+            cfg["auto_map"] = {
+                "AutoConfig": f"{src_code_file.stem}.{ConfigClass.__name__}",
+                "AutoModel": f"{src_code_file.stem}.{ModelClass.__name__}"
+            }
         with open(config_file, "w") as f:
             json.dump(cfg, f, indent=2)
 
@@ -158,11 +161,14 @@ def convert_6track_to_ntrack(
 
     with torch.no_grad():
         rep = model_target.representation(dummy_x, dummy_lens, channel_last=True)
-        unpooled = model_target(dummy_x, channel_last=True)
+        try:
+            unpooled = model_target(dummy_x, channel_last=True)
+            print(f"      Unpooled output shape:     {tuple(unpooled.shape)} (expected: (2, {dummy_seq_len}, {d_model}))")
+        except (TypeError, NotImplementedError):
+            pass
 
     print(f"      Input shape:               {tuple(dummy_x.shape)} (B, L, C={target_tracks})")
     print(f"      Representation shape:      {tuple(rep.shape)} (expected: (2, {d_model}))")
-    print(f"      Unpooled output shape:     {tuple(unpooled.shape)} (expected: (2, {dummy_seq_len}, {d_model}))")
 
     assert rep.shape == (2, d_model), f"Shape mismatch: {rep.shape} vs (2, {d_model})"
     print_memory_profile(device=dev, title=f"ORTHRUS 6-TO-{target_tracks} TRACK CONVERSION SPEICHER-PROFILING")
