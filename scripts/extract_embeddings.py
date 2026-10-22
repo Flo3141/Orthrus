@@ -255,13 +255,6 @@ def main():
         except Exception:
             model_meta = {}
 
-        if model_meta.get("is_finetuned") is not None:
-            is_finetuned = bool(model_meta["is_finetuned"])
-        elif "finetuned" in model_path.name.lower() or "finetuned" in str(model_path).lower():
-            is_finetuned = True
-        else:
-            is_finetuned = False
-
         fold_subdirs = [model_path / f"fold_{k}" for k in range(4)]
         if all(p.is_dir() for p in fold_subdirs):
             is_4fold_dir = True
@@ -273,7 +266,8 @@ def main():
             print(f"\n[Model Detection] Single checkpoint directory (shared across all folds): {model_path}")
 
     # 3. Resolve Destination File Path strictly from metadata
-    var_str = "finetuned" if is_finetuned else "pretrained"
+    # The model was finetuned before, if it has 4 Folds, else it was the abse model from huggingface
+    var_str = "finetuned" if is_4fold_dir else "pretrained"
     norm_str = f"_{normalization}" if normalization and normalization != "none" else ""
     save_file = tracks_path.parent / f"{dataset_name}_{track_name}_{var_str}{norm_str}_embeddings.npz"
 
