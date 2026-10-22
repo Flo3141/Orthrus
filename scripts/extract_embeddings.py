@@ -241,6 +241,7 @@ def main():
 
     if is_hf_model:
         is_base_model = True
+        is_4fold_dir = False
         model_identifier = model_checkpoint_str
         fold_subdirs = []
         print(f"\n[Model Detection] Pretrained base model: {model_checkpoint_str}")
