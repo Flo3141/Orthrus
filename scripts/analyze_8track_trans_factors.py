@@ -728,13 +728,13 @@ def parse_args():
     parser.add_argument(
         "--input_npz",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/hIPSC_CM_8track_minmax.npz",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/8track_miRNA_rbp/hipsc_cm_8track_miRNA_rbp_minmax.npz",
         help="Path to input 8-track NPZ file",
     )
     parser.add_argument(
         "--output_txt",
         type=str,
-        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/hIPSC_CM_8track_minmax_analysis.txt",
+        default="/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/8track_miRNA_rbp/hipsc_cm_8track_miRNA_rbp_minmax_analysis.txt",
         help="Path to output text report file",
     )
     parser.add_argument(

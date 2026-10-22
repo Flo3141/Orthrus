@@ -33,13 +33,13 @@ from util import save_metadata
 # =============================================================================
 DEFAULT_OUTPUT_PATHS = {
     "hipsc_cm": Path(
-        "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/hipsc_cm_6tracks.npz"
+        "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/6track/hipsc_cm_6tracks.npz"
     ),
     "mrna_bench_human": Path(
-        "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus/mrna_bench_human_6tracks.npz"
+        "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus/6track/mrna_bench_human_6tracks.npz"
     ),
     "mrna_bench_mouse": Path(
-        "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus/mrna_bench_mouse_6tracks.npz"
+        "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus/6track/mrna_bench_mouse_6tracks.npz"
     ),
 }
 
