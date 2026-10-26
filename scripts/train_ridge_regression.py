@@ -172,7 +172,11 @@ def load_embeddings_npz(file_path: Path) -> dict:
     targets = data["targets_arr"].astype(np.float32)
 
     # 3. Target Raw (Unnormalized / Raw half-life in hours)
-    targets_raw = data["targets_raw_arr"].astype(np.float32) if "targets_raw_arr" in data else None
+    targets_raw = None
+    if "targets_raw_arr" in data:
+        cand_raw = data["targets_raw_arr"].astype(np.float32)
+        if not np.all(np.isnan(cand_raw)):
+            targets_raw = cand_raw
 
     # 4. Transcript IDs
     if "ensembl_transcript_id_arr" not in data:
@@ -454,9 +458,16 @@ def main():
 
     # 8. Optional Raw Target Evaluation (target_raw)
     test_raw_metrics = {}
-    if y_test_raw_true is not None:
-        print("\n[Target Raw] Computing direct correlation metrics against target_raw...")
-        test_raw_metrics = calculate_metrics(y_test_raw_true, y_test_pred, prefix="test_raw")
+    has_valid_raw = y_test_raw_true is not None and not np.all(np.isnan(y_test_raw_true))
+    if has_valid_raw:
+        valid_raw_mask = ~np.isnan(y_test_raw_true) & ~np.isinf(y_test_raw_true)
+        if np.any(valid_raw_mask):
+            print("\n[Target Raw] Computing direct correlation metrics against target_raw...")
+            test_raw_metrics = calculate_metrics(
+                y_test_raw_true[valid_raw_mask],
+                y_test_pred[valid_raw_mask],
+                prefix="test_raw"
+            )
 
     # Print Summary Diagnostics
     print_metrics(train_metrics, "Training / CV Pool (Splits 0-7) Metrics")
@@ -477,7 +488,7 @@ def main():
         "predicted_target": y_test_pred,
         "residual": y_test - y_test_pred,
     }
-    if y_test_raw_true is not None:
+    if has_valid_raw:
         pred_dict["true_target_raw"] = y_test_raw_true
 
     pred_df = pd.DataFrame(pred_dict)
@@ -519,7 +530,8 @@ def main():
     # 12. Optional Scatter Plot
     if args.plot:
         try:
-            if y_test_raw_true is not None:
+            has_raw_plot = y_test_raw_true is not None and not np.all(np.isnan(y_test_raw_true))
+            if has_raw_plot:
                 # Dual subplot: Left = Transformed Target, Right = Raw Target
                 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
@@ -544,8 +556,13 @@ def main():
                 ax1.legend()
                 ax1.grid(True, linestyle="--", alpha=0.5)
 
-                # Subplot 2: Raw Target vs. Prediction
-                ax2.scatter(y_test_raw_true, y_test_pred, alpha=0.35, s=18, color="#2ca02c", edgecolors="none")
+                # Subplot 2: Raw Target vs. Prediction (filtered for non-finite values)
+                valid_raw_mask = ~np.isnan(y_test_raw_true) & ~np.isinf(y_test_raw_true)
+                ax2.scatter(
+                    y_test_raw_true[valid_raw_mask],
+                    y_test_pred[valid_raw_mask],
+                    alpha=0.35, s=18, color="#2ca02c", edgecolors="none"
+                )
                 p_r_raw = test_raw_metrics.get("test_raw_pearson_r", np.nan)
                 s_rho_raw = test_raw_metrics.get("test_raw_spearman_rho", np.nan)
                 ax2.set_title(
