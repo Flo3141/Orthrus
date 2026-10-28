@@ -436,7 +436,7 @@ def parse_args():
     parser.add_argument(
         "--score_col",
         type=str,
-        default="mean_score",
+        default="a_pct_modified",
         choices=["mean_score", "effect_size", "a_pct_modified", "max_score", "binary"],
         help="Metric to map to channel 6: 'mean_score' (modification %% in Ctrl), 'effect_size' (drop upon M3inh), 'a_pct_modified', 'binary'",
     )
