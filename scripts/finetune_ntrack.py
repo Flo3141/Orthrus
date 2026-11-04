@@ -4,9 +4,9 @@ End-to-End Supervised Fine-Tuning of Arbitrary N-Track Orthrus Models (6-track, 
 on Experimental & Trans-Factor Augmented Datasets.
 
 Features:
-- User-specified channel names via CLI (--channel_names), automatically determining N.
-- Operates exclusively on precomputed .npz track archives (with companion .meta.json); always trains on the 'target' field.
-- Automatically verifies and slices channel dimensions if input data has more channels than requested.
+- Operates exclusively on precomputed .npz track archives; always trains on the 'target' field.
+- Channel names (and thus N), dataset and track identity come from the companion .meta.json.
+- Slices the channel dimension if the archive holds more channels than the metadata lists.
 - Homology-grouped Train / Validation / Test splitting (standardized 10-fold lookup table from create_deterministic_splits.py).
 - Dynamic length padding with megabatch length bucketing (low padding overhead, new batch composition every epoch).
 - Sequences longer than --max_length are truncated keeping their 3' end (3' UTR preserved).
@@ -16,37 +16,51 @@ Features:
     - Regression projection head: lr_head (e.g. 3e-4)
 - Mixed-precision training (bf16/fp32) with Cosine Annealing + Linear Warmup + Huber/SmoothL1/MSE loss.
 - AdamW without weight decay (as in the original Orthrus fine-tuning configs).
-- Comprehensive Safeguards against NaN/Inf loss and gradient explosions.
-- Full xAI (Explainable AI) pipeline adapted dynamically for arbitrary N channels:
-    - Input * Gradient saliency attributions (%)
-    - Systematic single-channel ablation (Drop in Pearson r)
-    - Input embedding weight L2 norms
-    - 2D Sequence Saliency Heatmaps (N channels x position) for candidate transcripts
+- Skips batches with NaN/Inf loss and aborts on NaN/Inf gradient norms or predictions.
 - Incremental CSV training logs and publication-quality loss curve plots.
 - Saves best checkpoint and exports fine-tuned backbone in Hugging Face format.
+- Records the resolved arguments of each fold in fold_k/run_config.json.
+
+The channel attribution analysis of the trained checkpoints lives in xai_analysis.py.
+
+Arguments can come from a YAML file whose keys are the argument names; the command line overrides it:
+  python finetune_ntrack.py --config run.yaml --epochs 5
+
+  # run.yaml
+  data_path: /path/to/hipsc_cm_8track_2rbp_minmax.npz
+  model_checkpoint: /path/to/orthrus-large-8-track
+  run_name: lr_test
+  lr_backbone: 1.0e-5
+  resume: false
+
+--run_name stores the checkpoints in a subdirectory of the default output directory, so that runs with different
+hyperparameters do not overwrite each other. Pass that subdirectory to extract_embeddings.py as --model_checkpoint.
 """
 
 import argparse
 import csv
+from dataclasses import dataclass
+from datetime import datetime
 import json
 import math
-import os
 from pathlib import Path
 import random
+import re
+import shutil
 import sys
+from typing import Callable, Optional
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, Sampler
 from tqdm import tqdm
-from datetime import datetime
 from transformers import AutoModel
-from typing import Optional, List, Dict, Any, Union
+import yaml
 
 from util import (
-    reset_peak_memory_stats, print_memory_profile, load_metadata, save_metadata,
+    reset_peak_memory_stats, print_memory_profile, load_metadata, normalize_run_config,
     resolve_dataset_key, truncate_to_max_length, require_truncation_mode,
-    CV_FOLDS, TEST_SPLITS, CHECKPOINTS_DIR, assign_splits, require_meta, regression_metrics,
+    CV_FOLDS, TEST_SPLITS, CHECKPOINTS_DIR, RUN_CONFIG_FILENAME, assign_splits, require_meta, regression_metrics,
 )
 
 # Headless backend for cluster servers without display
@@ -54,35 +68,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
-# Standard color palette for input channels
-STANDARD_PALETTE = [
-    "#4e79a7",  # A (Blue)
-    "#f28e2c",  # C (Orange)
-    "#59a14f",  # G (Green)
-    "#e15759",  # U (Red)
-    "#b07aa1",  # CDS (Purple)
-    "#76b7b2",  # Splice (Cyan)
-    "#2ca02c",  # Channel 6 (Green / m6A / RBP Stabilizer)
-    "#d62728",  # Channel 7 (Crimson / RBP Destabilizer)
-    "#edc949",  # Channel 8 (Gold)
-    "#af7aa1",  # Channel 9 (Plum)
-    "#ff9da7",  # Channel 10 (Pink)
-    "#9c755f",  # Channel 11 (Brown)
-    "#bab0ac",  # Channel 12 (Gray)
-]
-
-
-def get_channel_colors(channel_names: list) -> list:
-    """
-    Returns a distinct list of hex colors for the given channel names.
-    Uses STANDARD_PALETTE for up to 13 channels, falling back to tab20 colormap for larger N.
-    """
-    n = len(channel_names)
-    if n <= len(STANDARD_PALETTE):
-        return STANDARD_PALETTE[:n]
-    cmap = plt.get_cmap("tab20")
-    return [matplotlib.colors.to_hex(cmap(i % 20)) for i in range(n)]
 
 class MultiTrackDataset(Dataset):
     """
@@ -211,36 +196,71 @@ class OrthrusRegressionModel(nn.Module):
         return out
 
 
+def build_regression_model(checkpoint: str, num_channels: int, device: torch.device) -> OrthrusRegressionModel:
+    """Loads an Orthrus backbone (directory or Hugging Face repo), verifies its channel count and adds the regression head."""
+    backbone = AutoModel.from_pretrained(checkpoint, trust_remote_code=True)
+    d_model = getattr(backbone.config, "ssm_model_dim", 512)
+
+    # Check input embedding dimension (must match dataset channels)
+    emb_layer = getattr(backbone, "embedding", None)
+    if emb_layer is not None and hasattr(emb_layer, "in_features") and emb_layer.in_features != num_channels:
+        raise ValueError(
+            f"[Error] Checkpoint input embedding dimension ({emb_layer.in_features}) does not match dataset tracks ({num_channels})!\n"
+            f"Please convert your base model using 'convert_6track_to_ntrack.py --n_target_tracks {num_channels}' first."
+        )
+    if hasattr(backbone, "config") and getattr(backbone.config, "n_tracks", None) != num_channels:
+        backbone.config.n_tracks = num_channels
+
+    model = OrthrusRegressionModel(backbone=backbone, d_model=d_model, hidden_dim=256, dropout=0.1)
+    return model.to(device)
+
+
 # =============================================================================
 # 3. Training & Evaluation Loops, Plots & CSV Logging
 # =============================================================================
+
+def get_amp_dtype(device: torch.device) -> torch.dtype:
+    """bf16 on CUDA where supported (strictly required for Mamba SSM), otherwise full precision."""
+    if device.type == "cuda" and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float32
+
+
+def amp_autocast(device: torch.device, amp_dtype: torch.dtype) -> torch.amp.autocast:
+    """Autocast context for the given precision; disabled on CPU and for fp32."""
+    return torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda" and amp_dtype != torch.float32))
+
+
+def predict(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    x_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+) -> tuple:
+    """Returns (y_true, y_pred) in loader order. x_transform can modify each input batch first (e.g. channel ablation)."""
+    model.eval()
+    all_targets = []
+    all_preds = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            x = batch["x"].to(device)
+            if x_transform is not None:
+                x = x_transform(x)
+            with amp_autocast(device, amp_dtype):
+                preds = model(x, batch["lengths"].to(device))
+            all_preds.append(preds.cpu().float().numpy())
+            all_targets.append(batch["targets"].numpy())
+
+    return np.concatenate(all_targets), np.concatenate(all_preds)
+
 
 def evaluate(model: nn.Module, dataloader: DataLoader, device: torch.device, loss_fn: nn.Module, amp_dtype: torch.dtype = torch.bfloat16) -> dict:
     """
     Evaluates the model over the dataset and computes Pearson r, Spearman rho, MSE, RMSE, R2, and Loss.
     """
-    model.eval()
-    total_loss = 0.0
-    all_preds = []
-    all_targets = []
-
-    with torch.no_grad():
-        for batch in dataloader:
-            x = batch["x"].to(device)
-            lengths = batch["lengths"].to(device)
-            targets = batch["targets"].to(device)
-
-            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda" and amp_dtype != torch.float32)):
-                preds = model(x, lengths)
-                loss = loss_fn(preds, targets)
-
-            if not (torch.isnan(loss) or torch.isinf(loss)):
-                total_loss += loss.item() * len(targets)
-            all_preds.extend(preds.detach().cpu().float().numpy())
-            all_targets.extend(targets.detach().cpu().float().numpy())
-
-    y_true = np.array(all_targets)
-    y_pred = np.array(all_preds)
+    y_true, y_pred = predict(model, dataloader, device, amp_dtype)
 
     # Fail-Fast: Detect numerical instability immediately instead of silently masking NaNs
     if np.isnan(y_pred).any() or np.isinf(y_pred).any():
@@ -262,8 +282,8 @@ def evaluate(model: nn.Module, dataloader: DataLoader, device: torch.device, los
             f"Please clean or filter the dataset."
         )
 
-    avg_loss = total_loss / max(1, len(y_true))
-    return {"loss": float(avg_loss), **regression_metrics(y_true, y_pred)}
+    loss = loss_fn(torch.from_numpy(y_pred), torch.from_numpy(y_true)).item()
+    return {"loss": float(loss), **regression_metrics(y_true, y_pred)}
 
 
 LOSS_DISPLAY_NAMES = {"huber": "Huber", "mse": "MSE", "smooth_l1": "Smooth L1"}
@@ -351,493 +371,64 @@ def save_csv_log(history: list, csv_path: Path):
 
 
 # =============================================================================
-# 4. Explainable AI (xAI): Channel Saliency, Ablation & 2D Sequence Heatmaps
+# 4. Optimizer Setup & Checkpoints
 # =============================================================================
 
-def compute_embedding_norms(model: nn.Module, num_channels: int) -> list:
+def build_param_groups(model: nn.Module, lr_backbone: float, lr_embedding: float, lr_head: float) -> list:
     """
-    Computes L2 norm of the learned input embedding weights for each channel 0..num_channels-1.
-    Shows the direct parametric weight assigned to each track.
+    Differential learning rates for backbone, input embedding and regression head.
+
+    No weight decay, as in the original Orthrus fine-tuning configs ('no_wd' in orthrus/finetune_config/optimizer.yaml).
+    Must be set explicitly: AdamW defaults to weight_decay=0.01.
+    The group order is part of the optimizer state in existing checkpoints and must stay fixed.
     """
+    backbone_params = []
+    embedding_params = []
     for name, param in model.backbone.named_parameters():
-        if "embedding" in name and "weight" in name:
-            w = param.detach()
-            norms = []
-            for c in range(num_channels):
-                if w.ndim == 2:
-                    col = w[:, c]
-                elif w.ndim == 3:
-                    col = w[:, c, :]
-                else:
-                    col = w[c]
-                norms.append(float(torch.norm(col.float(), p=2).item()))
-            return norms
-    return [0.0] * num_channels
+        if param.requires_grad:
+            (embedding_params if "embedding" in name else backbone_params).append(param)
+    head_params = [p for p in model.head.parameters() if p.requires_grad]
+
+    return [
+        {"params": params, "lr": lr, "weight_decay": 0.0}
+        for params, lr in ((backbone_params, lr_backbone), (embedding_params, lr_embedding), (head_params, lr_head))
+    ]
 
 
-def compute_channel_importance_gradients(
-    model: nn.Module,
-    dataloader: DataLoader,
-    device: torch.device,
-    channel_names: list,
-    max_samples: int = 500,
-    amp_dtype: torch.dtype = torch.bfloat16,
-) -> dict:
-    """
-    Computes global channel attribution across test samples using Input * Gradient (Feature Saliency).
-    Returns mean absolute attribution per channel and percentage contribution.
-    """
-    model.eval()
-    num_channels = len(channel_names)
-    total_attribution = torch.zeros(num_channels, device=device, dtype=torch.float64)
-    total_valid_nt = 0
-    samples_processed = 0
-
-    pbar = tqdm(dataloader, desc="[xAI] Computing Input*Gradient Channel Saliency")
-    for batch in pbar:
-        if samples_processed >= max_samples:
-            break
-
-        x = batch["x"].to(device).clone().detach().requires_grad_(True)
-        lengths = batch["lengths"].to(device)
-        b_size = x.shape[0]
-
-        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda" and amp_dtype != torch.float32)):
-            preds = model(x, lengths)
-            loss = preds.sum()
-
-        model.zero_grad()
-        loss.backward()
-
-        if x.grad is not None:
-            sal = torch.abs(x.detach() * x.grad.detach())
-            for i in range(b_size):
-                l_i = lengths[i].item()
-                total_attribution += sal[i, :l_i, :num_channels].sum(dim=0).to(torch.float64)
-                total_valid_nt += l_i
-                samples_processed += 1
-                if samples_processed >= max_samples:
-                    break
-
-    mean_attribution = (total_attribution / max(1, total_valid_nt)).cpu().numpy()
-    sum_attr = float(mean_attribution.sum())
-    pct_attribution = (mean_attribution / sum_attr * 100.0) if sum_attr > 0 else np.zeros(num_channels)
-
-    results = {}
-    for idx, name in enumerate(channel_names):
-        results[name] = {
-            "channel_index": idx,
-            "mean_attribution": float(mean_attribution[idx]),
-            "pct_attribution": float(pct_attribution[idx]),
-        }
-    return results
+def save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimizer, scheduler, **extra) -> None:
+    """Saves model, optimizer and scheduler state together with any additional fields."""
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        **extra,
+    }, path)
 
 
-def compute_channel_ablation(
-    model: nn.Module,
-    dataloader: DataLoader,
-    device: torch.device,
-    loss_fn: nn.Module,
-    baseline_metrics: dict,
-    channel_names: list,
-    amp_dtype: torch.dtype = torch.bfloat16,
-) -> dict:
-    """
-    Evaluates model performance drop when each channel is systematically ablated (zeroed out).
-    Delta r = baseline_r - ablated_r. A higher drop indicates greater reliance on that channel.
-    """
-    model.eval()
-    baseline_r = baseline_metrics["pearson_r"]
-    baseline_rho = baseline_metrics["spearman_rho"]
-    baseline_mse = baseline_metrics["mse"]
-
-    ablation_results = {}
-
-    for c_idx, c_name in enumerate(tqdm(channel_names, desc="[xAI] Computing Channel Ablation Impact")):
-        total_loss = 0.0
-        all_preds = []
-        all_targets = []
-
-        with torch.no_grad():
-            for batch in dataloader:
-                x = batch["x"].to(device).clone()
-                lengths = batch["lengths"].to(device)
-                targets = batch["targets"].to(device)
-
-                # Systematically zero out channel c_idx
-                x[:, :, c_idx] = 0.0
-
-                with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda" and amp_dtype != torch.float32)):
-                    preds = model(x, lengths)
-                    loss = loss_fn(preds, targets)
-
-                if not (torch.isnan(loss) or torch.isinf(loss)):
-                    total_loss += loss.item() * len(targets)
-                all_preds.extend(preds.detach().cpu().float().numpy())
-                all_targets.extend(targets.detach().cpu().float().numpy())
-
-        ablated = regression_metrics(np.array(all_targets), np.array(all_preds))
-        p_corr, s_corr, mse = ablated["pearson_r"], ablated["spearman_rho"], ablated["mse"]
-
-        drop_r = float(baseline_r - p_corr)
-        drop_rho = float(baseline_rho - s_corr)
-        delta_mse = float(mse - baseline_mse)
-
-        ablation_results[c_name] = {
-            "channel_index": c_idx,
-            "ablated_pearson_r": float(p_corr),
-            "drop_pearson_r": drop_r,
-            "ablated_spearman_rho": float(s_corr),
-            "drop_spearman_rho": drop_rho,
-            "ablated_mse": mse,
-            "delta_mse": delta_mse,
-        }
-
-    return ablation_results
-
-
-def plot_channel_importance_summary(
-    grad_results: dict,
-    ablation_results: dict,
-    embedding_norms: list,
-    channel_names: list,
-    channel_colors: list,
-    output_png: Path,
-):
-    """
-    Plots a 3-panel publication-grade summary of channel importance:
-    1. Input * Gradient Attribution (% of total)
-    2. Channel Ablation Drop in Pearson r (Delta r)
-    3. Embedding Weight L2 Norms
-    """
-    fig, axes = plt.subplots(1, 3, figsize=(max(16, len(channel_names) * 2), 5.5))
-
-    names = channel_names
-    colors = channel_colors
-
-    # 1. Gradient Attribution
-    grad_pcts = [grad_results[n]["pct_attribution"] for n in names]
-    axes[0].bar(range(len(names)), grad_pcts, color=colors, edgecolor="black", linewidth=0.8)
-    axes[0].set_title("Feature Saliency (Input * Grad)", fontsize=13, fontweight="bold")
-    axes[0].set_ylabel("Attribution Share (%)", fontsize=11, fontweight="bold")
-    axes[0].set_xticks(range(len(names)))
-    axes[0].set_xticklabels(names, rotation=35, ha="right", fontsize=10)
-    axes[0].grid(axis="y", alpha=0.3)
-    for i, h in enumerate(grad_pcts):
-        axes[0].annotate(f"{h:.1f}%",
-                         xy=(i, h),
-                         xytext=(0, 3), textcoords="offset points",
-                         ha="center", va="bottom", fontsize=9, fontweight="bold")
-
-    # 2. Channel Ablation Delta r
-    ablation_drops = [ablation_results[n]["drop_pearson_r"] for n in names]
-    axes[1].bar(range(len(names)), ablation_drops, color=colors, edgecolor="black", linewidth=0.8)
-    axes[1].set_title("Channel Ablation Impact", fontsize=13, fontweight="bold")
-    axes[1].set_ylabel("Drop in Pearson r (Delta r)", fontsize=11, fontweight="bold")
-    axes[1].set_xticks(range(len(names)))
-    axes[1].set_xticklabels(names, rotation=35, ha="right", fontsize=10)
-    axes[1].grid(axis="y", alpha=0.3)
-    axes[1].axhline(0, color="gray", linestyle="--", linewidth=0.8)
-    for i, h in enumerate(ablation_drops):
-        va = "bottom" if h >= 0 else "top"
-        axes[1].annotate(f"{h:.3f}",
-                         xy=(i, h),
-                         xytext=(0, 3 if h >= 0 else -10), textcoords="offset points",
-                         ha="center", va=va, fontsize=9, fontweight="bold")
-
-    # 3. Embedding L2 Norms
-    axes[2].bar(range(len(names)), embedding_norms, color=colors, edgecolor="black", linewidth=0.8)
-    axes[2].set_title("Embedding Weight Norms", fontsize=13, fontweight="bold")
-    axes[2].set_ylabel("L2 Norm (||W[:, c]||)", fontsize=11, fontweight="bold")
-    axes[2].set_xticks(range(len(names)))
-    axes[2].set_xticklabels(names, rotation=35, ha="right", fontsize=10)
-    axes[2].grid(axis="y", alpha=0.3)
-    for i, h in enumerate(embedding_norms):
-        axes[2].annotate(f"{h:.2f}",
-                         xy=(i, h),
-                         xytext=(0, 3), textcoords="offset points",
-                         ha="center", va="bottom", fontsize=9, fontweight="bold")
-
-    plt.tight_layout()
-    fig.savefig(output_png, dpi=200)
-    pdf_path = output_png.with_suffix(".pdf")
-    fig.savefig(pdf_path)
-    plt.close(fig)
-    print(f"[xAI] Saved channel importance summary to: {output_png} and {pdf_path}")
-
-
-def generate_saliency_heatmaps(
-    model: nn.Module,
-    dataset: MultiTrackDataset,
-    device: torch.device,
-    output_dir: Path,
-    channel_names: list,
-    channel_colors: list,
-    num_heatmaps: int = 5,
-    specific_tx_ids: str = None,
-):
-    """
-    Generates 2D Sequence Saliency Heatmaps (N Channels x Position) for selected transcripts.
-    Prioritizes transcripts with active augmented signals (channels >= 6 or >= 4) to demonstrate functional focus.
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    samples = dataset.samples
-    num_channels = len(channel_names)
-
-    # Select candidates
-    selected_indices = []
-    if specific_tx_ids:
-        target_ids = {t.strip() for t in specific_tx_ids.split(",") if t.strip()}
-        for idx, s in enumerate(samples):
-            if s["tx_id"] in target_ids or s["tx_id"].split(".")[0] in target_ids:
-                selected_indices.append(idx)
-
-    if not selected_indices:
-        # Categorize candidates based on signal presence in extra channels (index >= 6 if present, else >= 4)
-        active_candidates = []
-        other_candidates = []
-
-        for idx, s in enumerate(samples):
-            track = s["track"]
-            has_augmented = False
-            if num_channels > 6:
-                has_augmented = bool(torch.any(track[:, 6:num_channels] > 0).item())
-            elif num_channels > 4:
-                has_augmented = bool(torch.any(track[:, 4:num_channels] > 0).item())
-
-            if has_augmented:
-                active_candidates.append(idx)
-            else:
-                other_candidates.append(idx)
-
-        # Pick diverse set
-        for pool in [active_candidates, other_candidates]:
-            for idx in pool:
-                if len(selected_indices) >= num_heatmaps:
-                    break
-                if idx not in selected_indices:
-                    selected_indices.append(idx)
-            if len(selected_indices) >= num_heatmaps:
-                break
-
-    print(f"\n[xAI] Generating 2D Saliency Heatmaps for {len(selected_indices)} transcripts...")
-    heatmap_records = []
-
-    for idx in selected_indices:
-        sample = samples[idx]
-        tx_id = sample["tx_id"]
-        gene = sample["gene"]
-        seq_len = sample["length"]
-        target = sample["target"]
-
-        x = sample["track"].unsqueeze(0).to(device).clone().detach().requires_grad_(True)
-        length = torch.tensor([seq_len], dtype=torch.long, device=device)
-
-        model.eval()
-        model.zero_grad()
-        pred = model(x, length)
-        pred_val = float(pred.item())
-        pred.backward()
-
-        if x.grad is None:
-            continue
-
-        # Attribution: signed (x * grad)
-        grad = x.grad.detach()
-        signed_attr = (x.detach() * grad)[0, :seq_len, :num_channels].cpu().numpy()  # (L, N)
-        x_raw = x.detach()[0, :seq_len, :num_channels].cpu().numpy()  # (L, N)
-
-        attr_t = signed_attr.T  # (N, L)
-
-        # Calculate symmetric color limits based on 99th percentile of attribution
-        vlim = float(np.percentile(np.abs(attr_t), 99.0))
-        if vlim <= 1e-6:
-            vlim = float(np.max(np.abs(attr_t)))
-        if vlim <= 1e-6:
-            vlim = 1.0
-
-        # Plot 3-panel figure: 2D Heatmap, Input Annotations, 1D Importance Profile
-        fig, axes = plt.subplots(3, 1, figsize=(16, 9), gridspec_kw={"height_ratios": [3.2, 1.2, 1.4]}, sharex=True)
-
-        # 1. 2D Saliency Heatmap
-        im = axes[0].imshow(
-            attr_t,
-            aspect="auto",
-            cmap="coolwarm",
-            vmin=-vlim,
-            vmax=vlim,
-            interpolation="nearest",
-        )
-        axes[0].set_yticks(range(num_channels))
-        axes[0].set_yticklabels(channel_names, fontsize=10, fontweight="bold")
-        axes[0].set_title(
-            f"Transcript: {tx_id} ({gene}) | Length: {seq_len} nt | True HL: {target:.2f} | Pred HL: {pred_val:.2f}",
-            fontsize=13, fontweight="bold", pad=10
-        )
-        cbar = fig.colorbar(im, ax=axes[0], orientation="vertical", pad=0.015, fraction=0.02)
-        cbar.set_label("Attribution (x * Grad)\nBlue: Destabilizing | Red: Stabilizing", fontsize=9, fontweight="bold")
-
-        # 2. Input Track Annotations (Channels 4 to N-1)
-        positions = np.arange(seq_len)
-        has_annotation_plot = False
-        for c in range(4, num_channels):
-            if np.any(x_raw[:, c] > 0):
-                c_name = channel_names[c]
-                c_col = channel_colors[c]
-                axes[1].fill_between(positions, 0, x_raw[:, c], color=c_col, alpha=0.5, label=f"{c_name} (Ch {c})")
-                has_annotation_plot = True
-
-        if not has_annotation_plot:
-            axes[1].text(0.5, 0.5, "No non-sequence tracks (CDS/Splice/etc.) present for this sequence",
-                         horizontalalignment="center", verticalalignment="center", transform=axes[1].transAxes, fontsize=10)
-
-        axes[1].set_ylabel("Input Signals", fontsize=10, fontweight="bold")
-        axes[1].set_ylim(-0.05, 1.1)
-        if has_annotation_plot:
-            axes[1].legend(loc="upper right", fontsize=8.5, framealpha=0.85)
-        axes[1].grid(True, alpha=0.3)
-
-        # 3. 1D Integrated Position Importance Profile
-        # Sum of absolute attributions across all N channels
-        pos_importance = np.sum(np.abs(signed_attr), axis=1)
-        axes[2].fill_between(positions, 0, pos_importance, color="#4a148c", alpha=0.45)
-        axes[2].plot(positions, pos_importance, color="#4a148c", lw=1.2, label="Positional Impact (Sum |Attr|)")
-        # Also net attribution (dashed line)
-        net_attr = np.sum(signed_attr, axis=1)
-        axes[2].plot(positions, net_attr, color="#ff7f0e", lw=1.0, linestyle="--", label="Net Direction (Sum Attr)")
-        axes[2].axhline(0, color="gray", linestyle=":", lw=0.8)
-        axes[2].set_ylabel("1D Saliency", fontsize=10, fontweight="bold")
-        axes[2].set_xlabel("Nucleotide Position along mRNA (5' -> 3')", fontsize=11, fontweight="bold")
-        axes[2].legend(loc="upper right", fontsize=8.5, framealpha=0.85)
-        axes[2].grid(True, alpha=0.3)
-
-        clean_tx = tx_id.replace(".", "_")
-        clean_gene = gene.replace(" ", "_") if gene else "unknown"
-        png_path = output_dir / f"heatmap_{clean_tx}_{clean_gene}.png"
-        pdf_path = output_dir / f"heatmap_{clean_tx}_{clean_gene}.pdf"
-
-        plt.tight_layout()
-        fig.savefig(png_path, dpi=200)
-        fig.savefig(pdf_path)
-        plt.close(fig)
-
-        heatmap_records.append({
-            "transcript_id": tx_id,
-            "gene": gene,
-            "length": seq_len,
-            "target": target,
-            "prediction": pred_val,
-            "png_file": str(png_path.name),
-            "pdf_file": str(pdf_path.name),
-        })
-
-    print(f"[xAI] Saved {len(heatmap_records)} 2D Saliency Heatmaps to: {output_dir}")
-    return heatmap_records
-
-
-def run_xai_analysis(
-    model: nn.Module,
-    test_loader: DataLoader,
-    device: torch.device,
-    loss_fn: nn.Module,
-    test_metrics: dict,
-    output_dir: Path,
-    channel_names: list,
-    channel_colors: list,
-    num_heatmaps: int = 5,
-    specific_tx_ids: str = None,
-    amp_dtype: torch.dtype = torch.bfloat16,
-) -> dict:
-    """
-    Master xAI evaluation orchestrator for arbitrary N channels:
-    - 1. Embedding Weight L2-Norms
-    - 2. Input * Gradient Channel Saliency Attribution (%)
-    - 3. Systematic Channel Ablation (Drop in Pearson r / Delta r)
-    - 4. Summary Bar Charts (PNG & PDF)
-    - 5. 2D Sequence Saliency Heatmaps (N Channels x Position)
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    num_channels = len(channel_names)
-
-    # 1. Embedding norms
-    norms = compute_embedding_norms(model, num_channels=num_channels)
-
-    # 2. Input * Gradient attribution
-    grad_results = compute_channel_importance_gradients(
-        model=model,
-        dataloader=test_loader,
-        device=device,
-        channel_names=channel_names,
-        max_samples=500,
-        amp_dtype=amp_dtype,
-    )
-
-    # 3. Channel ablation
-    ablation_results = compute_channel_ablation(
-        model=model,
-        dataloader=test_loader,
-        device=device,
-        loss_fn=loss_fn,
-        baseline_metrics=test_metrics,
-        channel_names=channel_names,
-        amp_dtype=amp_dtype,
-    )
-
-    # Print summary table
-    print("\n" + "=" * 80)
-    print(f"{'Channel':<18} {'Input*Grad (%)':<16} {'Ablation Drop (Delta r)':<25} {'Embedding Norm':<15}")
-    print("=" * 80)
-    for idx, name in enumerate(channel_names):
-        g_pct = grad_results[name]["pct_attribution"]
-        drop_r = ablation_results[name]["drop_pearson_r"]
-        e_norm = norms[idx]
-        print(f"{name:<18} {g_pct:>10.2f}% {drop_r:>20.4f} {e_norm:>16.4f}")
-    print("=" * 80)
-
-    # 4. Summary plots
-    summary_plot = output_dir / "xai_channel_summary.png"
-    plot_channel_importance_summary(
-        grad_results=grad_results,
-        ablation_results=ablation_results,
-        embedding_norms=norms,
-        channel_names=channel_names,
-        channel_colors=channel_colors,
-        output_png=summary_plot,
-    )
-
-    # 5. 2D Sequence Heatmaps
-    heatmaps_dir = output_dir / "xai_heatmaps"
-    heatmap_records = generate_saliency_heatmaps(
-        model=model,
-        dataset=test_loader.dataset,
-        device=device,
-        output_dir=heatmaps_dir,
-        channel_names=channel_names,
-        channel_colors=channel_colors,
-        num_heatmaps=num_heatmaps,
-        specific_tx_ids=specific_tx_ids,
-    )
-
-    summary = {
-        "channel_names": channel_names,
-        "embedding_norms": {name: norms[i] for i, name in enumerate(channel_names)},
-        "gradient_attribution": grad_results,
-        "channel_ablation": ablation_results,
-        "heatmaps": heatmap_records,
+def get_random_states() -> dict:
+    return {
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "numpy": np.random.get_state(),
+        "python": random.getstate(),
     }
 
-    summary_file = output_dir / "xai_channel_summary.json"
-    with open(summary_file, "w") as f:
-        json.dump(summary, f, indent=2)
-    print(f"[xAI] Saved comprehensive xAI summary report to: {summary_file}")
 
-    return summary
+def restore_random_states(states: dict) -> None:
+    try:
+        if states.get("torch") is not None:
+            torch_state = states["torch"].cpu() if isinstance(states["torch"], torch.Tensor) else states["torch"]
+            torch.set_rng_state(torch_state)
+        if states.get("cuda") is not None and torch.cuda.is_available():
+            cuda_states = [s.cpu() if isinstance(s, torch.Tensor) else s for s in states["cuda"]]
+            torch.cuda.set_rng_state_all(cuda_states)
+        if states.get("numpy") is not None:
+            np.random.set_state(states["numpy"])
+        if states.get("python") is not None:
+            random.setstate(states["python"])
+    except Exception as e:
+        print(f"[Warning] Could not fully restore random states ({e}), proceeding with current RNG state.")
 
-
-# =============================================================================
-# 5. Core Training Loop
-# =============================================================================
 
 def verify_remote_code_export(backbone_dir: Path):
     """Fails if a module referenced in config.json 'auto_map' is missing as .py file in the exported backbone."""
@@ -860,6 +451,37 @@ def verify_remote_code_export(backbone_dir: Path):
         )
 
 
+def export_backbone(model: nn.Module, backbone_dir: Path, num_channels: int, source_checkpoint: Optional[str]) -> None:
+    """Exports the fine-tuned backbone in Hugging Face format and verifies that it stays loadable."""
+    backbone_dir.mkdir(parents=True, exist_ok=True)
+    model.backbone.save_pretrained(backbone_dir)
+
+    # Ensure config.json has updated n_tracks
+    cfg_file = backbone_dir / "config.json"
+    if cfg_file.exists():
+        try:
+            with open(cfg_file, "r") as f_cfg:
+                c_dict = json.load(f_cfg)
+            c_dict["n_tracks"] = num_channels
+            with open(cfg_file, "w") as f_cfg:
+                json.dump(c_dict, f_cfg, indent=2)
+        except Exception:
+            pass
+
+    # save_pretrained() already exports the remote code (auto_map) of trust_remote_code models.
+    # Fallback: copy missing *.py files from the source checkpoint only (never from output directories).
+    if source_checkpoint and Path(source_checkpoint).is_dir():
+        for py_file in Path(source_checkpoint).glob("*.py"):
+            dst_file = backbone_dir / py_file.name
+            if not dst_file.exists():
+                shutil.copy2(py_file, dst_file)
+    verify_remote_code_export(backbone_dir)
+
+
+# =============================================================================
+# 5. Core Training Loop
+# =============================================================================
+
 def train_model(
     model: nn.Module,
     train_loader: DataLoader,
@@ -873,13 +495,9 @@ def train_model(
     warmup_epochs: int,
     output_dir: Path,
     channel_names: list,
-    channel_colors: list,
     resume: bool = False,
     loss_fn_name: str = "huber",
     max_grad_norm: float = 1.0,
-    compute_xai: bool = True,
-    xai_num_heatmaps: int = 5,
-    xai_tx_ids: str = None,
     source_checkpoint: Optional[str] = None,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -894,38 +512,13 @@ def train_model(
         loss_fn = nn.MSELoss()
 
     # Precision
-    if device.type == "cuda" and torch.cuda.is_bf16_supported():
-        amp_dtype = torch.bfloat16
-        use_scaler = False
+    amp_dtype = get_amp_dtype(device)
+    if amp_dtype == torch.bfloat16:
         print("[Precision] Using Native BFloat16 (bf16) mixed precision (strictly required for Mamba SSM).")
     else:
-        amp_dtype = torch.float32
-        use_scaler = False
         print("[Precision] Using Full Precision (fp32) (CUDA bf16 not available).")
 
-    # Differential learning rate parameter groups
-    backbone_params = []
-    embedding_params = []
-
-    for name, param in model.backbone.named_parameters():
-        if not param.requires_grad:
-            continue
-        if "embedding" in name:
-            embedding_params.append(param)
-        else:
-            backbone_params.append(param)
-
-    head_params = [p for p in model.head.parameters() if p.requires_grad]
-
-    # No weight decay, as in the original Orthrus fine-tuning configs ('no_wd' in orthrus/finetune_config/optimizer.yaml).
-    # Must be set explicitly: AdamW defaults to weight_decay=0.01.
-    param_groups = [
-        {"params": backbone_params, "lr": lr_backbone, "weight_decay": 0.0},
-        {"params": embedding_params, "lr": lr_embedding if lr_embedding is not None else lr_backbone, "weight_decay": 0.0},
-        {"params": head_params, "lr": lr_head, "weight_decay": 0.0},
-    ]
-
-    optimizer = torch.optim.AdamW(param_groups)
+    optimizer = torch.optim.AdamW(build_param_groups(model, lr_backbone, lr_embedding, lr_head))
 
     total_steps = epochs * len(train_loader)
     warmup_steps = warmup_epochs * len(train_loader)
@@ -938,7 +531,6 @@ def train_model(
         return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and use_scaler))
 
     best_val_r = -1.0
     best_epoch = -1
@@ -954,7 +546,7 @@ def train_model(
     # Check for resume
     if resume and latest_ckpt_path.exists():
         print(f"\n[Resume] Found existing checkpoint: {latest_ckpt_path}")
-        print("Loading model, optimizer, scheduler, and scaler state...")
+        print("Loading model, optimizer, and scheduler state...")
         ckpt = torch.load(latest_ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -962,28 +554,13 @@ def train_model(
         for group in optimizer.param_groups:
             group["weight_decay"] = 0.0
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        if use_scaler and "scaler_state_dict" in ckpt:
-            scaler.load_state_dict(ckpt["scaler_state_dict"])
         best_val_r = ckpt.get("best_val_r", -1.0)
         best_epoch = ckpt.get("best_epoch", -1)
         history = ckpt.get("history", [])
         start_epoch = ckpt["epoch"] + 1
 
         if "random_states" in ckpt:
-            try:
-                rs = ckpt["random_states"]
-                if rs.get("torch") is not None:
-                    torch_state = rs["torch"].cpu() if isinstance(rs["torch"], torch.Tensor) else rs["torch"]
-                    torch.set_rng_state(torch_state)
-                if rs.get("cuda") is not None and torch.cuda.is_available():
-                    cuda_states = [s.cpu() if isinstance(s, torch.Tensor) else s for s in rs["cuda"]]
-                    torch.cuda.set_rng_state_all(cuda_states)
-                if rs.get("numpy") is not None:
-                    np.random.set_state(rs["numpy"])
-                if rs.get("python") is not None:
-                    random.setstate(rs["python"])
-            except Exception as e:
-                print(f"[Warning] Could not fully restore random states ({e}), proceeding with current RNG state.")
+            restore_random_states(ckpt["random_states"])
 
         print(f"[Resume] Successfully resumed from Epoch {ckpt['epoch']}. Next training epoch: {start_epoch}/{epochs}")
         if start_epoch > epochs:
@@ -995,8 +572,7 @@ def train_model(
     print(f"Warmup Epochs:     {warmup_epochs} ({warmup_steps} steps)")
     print(f"Loss Function:     {loss_fn_name.upper()}")
     print(f"LR Backbone:       {lr_backbone:.2e}")
-    effective_lr_emb = lr_embedding if lr_embedding is not None else lr_backbone
-    print(f"LR Embedding:      {effective_lr_emb:.2e}")
+    print(f"LR Embedding:      {lr_embedding:.2e}")
     print(f"LR Head:           {lr_head:.2e}\n")
 
     for epoch in range(start_epoch, epochs + 1):
@@ -1011,7 +587,7 @@ def train_model(
             targets = batch["targets"].to(device)
 
             optimizer.zero_grad()
-            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda" and amp_dtype != torch.float32)):
+            with amp_autocast(device, amp_dtype):
                 preds = model(x, lengths)
                 loss = loss_fn(preds, targets)
 
@@ -1021,33 +597,17 @@ def train_model(
                 optimizer.zero_grad()
                 continue
 
-            if use_scaler:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
 
-                # Fail-Fast: Abort training if gradient norm explodes or collapses to NaN/Inf
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    raise FloatingPointError(
-                        f"[Fatal Error] NaN/Inf gradient norm encountered at Epoch {epoch}, Batch {batch_idx}! "
-                        f"Gradients have exploded or collapsed. Training aborted."
-                    )
+            # Fail-Fast: Abort training if gradient norm explodes or collapses to NaN/Inf
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                raise FloatingPointError(
+                    f"[Fatal Error] NaN/Inf gradient norm encountered at Epoch {epoch}, Batch {batch_idx}! "
+                    f"Gradients have exploded or collapsed. Training aborted."
+                )
 
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-
-                # Fail-Fast: Abort training if gradient norm explodes or collapses to NaN/Inf
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    raise FloatingPointError(
-                        f"[Fatal Error] NaN/Inf gradient norm encountered at Epoch {epoch}, Batch {batch_idx}! "
-                        f"Gradients have exploded or collapsed. Training aborted."
-                    )
-
-                optimizer.step()
-
+            optimizer.step()
             scheduler.step()
 
             b_len = len(targets)
@@ -1084,63 +644,15 @@ def train_model(
             best_epoch = epoch
             print(f"  >>> New Best Validation Pearson r: {best_val_r:.4f} (Epoch {best_epoch})! Saving checkpoint...")
 
-            # 1. Save Full PyTorch Checkpoint
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "best_val_r": best_val_r,
-                "best_epoch": best_epoch,
-                "val_metrics": val_metrics,
-                "channel_names": channel_names,
-            }, best_ckpt_path)
+        ckpt_fields = {"epoch": epoch, "best_val_r": best_val_r, "best_epoch": best_epoch, "channel_names": channel_names}
 
-            # Export best fine-tuned backbone in Hugging Face format
-            best_backbone_dir.mkdir(parents=True, exist_ok=True)
-            model.backbone.save_pretrained(best_backbone_dir)
-
-            # Ensure config.json has updated n_tracks
-            cfg_file = best_backbone_dir / "config.json"
-            if cfg_file.exists():
-                try:
-                    with open(cfg_file, "r") as f_cfg:
-                        c_dict = json.load(f_cfg)
-                    c_dict["n_tracks"] = num_channels
-                    with open(cfg_file, "w") as f_cfg:
-                        json.dump(c_dict, f_cfg, indent=2)
-                except Exception:
-                    pass
-
-            # save_pretrained() already exports the remote code (auto_map) of trust_remote_code models.
-            # Fallback: copy missing *.py files from the source checkpoint only (never from output directories).
-            import shutil
-            if source_checkpoint and Path(source_checkpoint).is_dir():
-                for py_file in Path(source_checkpoint).glob("*.py"):
-                    dst_file = best_backbone_dir / py_file.name
-                    if not dst_file.exists():
-                        shutil.copy2(py_file, dst_file)
-            verify_remote_code_export(best_backbone_dir)
+        # 1. Save best model as full PyTorch checkpoint and as Hugging Face backbone
+        if is_best:
+            save_checkpoint(best_ckpt_path, model, optimizer, scheduler, val_metrics=val_metrics, **ckpt_fields)
+            export_backbone(model, best_backbone_dir, num_channels, source_checkpoint)
 
         # 2. Save Automatic Resume Checkpoint (latest_checkpoint.pt)
-        torch.save({
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
-            "best_val_r": best_val_r,
-            "best_epoch": best_epoch,
-            "history": history,
-            "channel_names": channel_names,
-            "random_states": {
-                "torch": torch.get_rng_state(),
-                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-                "numpy": np.random.get_state(),
-                "python": random.getstate(),
-            }
-        }, latest_ckpt_path)
+        save_checkpoint(latest_ckpt_path, model, optimizer, scheduler, history=history, random_states=get_random_states(), **ckpt_fields)
 
         # 3. Update Plots and CSV logs incrementally
         try:
@@ -1155,7 +667,6 @@ def train_model(
 
     # Evaluate best model on test set
     test_metrics = None
-    xai_summary = None
     if test_loader is not None and best_ckpt_path.exists():
         print("\nLoading best model checkpoint for Test Set Evaluation...")
         ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=False)
@@ -1172,30 +683,6 @@ def train_model(
                 print(f"  {k:20s}: {v:.4f}")
         print("=" * 60)
 
-        # 4. Run xAI Analysis Pipeline if enabled
-        if compute_xai:
-            print("\n" + "=" * 60)
-            print("                 xAI ANALYSIS PIPELINE                 ")
-            print("=" * 60)
-            try:
-                xai_summary = run_xai_analysis(
-                    model=model,
-                    test_loader=test_loader,
-                    device=device,
-                    loss_fn=loss_fn,
-                    test_metrics=test_metrics,
-                    output_dir=output_dir,
-                    channel_names=channel_names,
-                    channel_colors=channel_colors,
-                    num_heatmaps=xai_num_heatmaps,
-                    specific_tx_ids=xai_tx_ids,
-                    amp_dtype=amp_dtype,
-                )
-            except Exception as e:
-                print(f"[Warning] xAI analysis encountered an error: {e}")
-                import traceback
-                traceback.print_exc()
-
         # Save training summary
         summary_file = output_dir / "training_summary.json"
         summary_data = {
@@ -1204,7 +691,6 @@ def train_model(
             "best_epoch": best_epoch,
             "best_val_pearson_r": best_val_r,
             "test_metrics": test_metrics,
-            "xai_summary": xai_summary,
             "history": history,
         }
         with open(summary_file, "w") as f:
@@ -1215,16 +701,184 @@ def train_model(
         "best_epoch": best_epoch,
         "best_val_pearson_r": best_val_r,
         "test_metrics": test_metrics,
-        "xai_summary": xai_summary if (test_loader is not None and best_ckpt_path.exists() and compute_xai) else None,
     }
 
 
 # =============================================================================
-# 6. Main Pipeline
+# 6. Data Loading & Run Directories (shared with xai_analysis.py)
 # =============================================================================
 
-def main():
-    parser = argparse.ArgumentParser(description="Supervised Fine-Tuning of Arbitrary N-Track Orthrus Model")
+@dataclass
+class TrackData:
+    """Cleaned track archive with its metadata; all arrays hold the same transcripts in the same order."""
+    dataset_name: str
+    track_name: str
+    normalization: str
+    channel_names: list
+    tracks: list
+    targets: np.ndarray
+    genes: np.ndarray
+    tx_ids: np.ndarray
+    sample_splits: np.ndarray
+
+
+def load_track_data(data_file: Path) -> TrackData:
+    """Loads an .npz track archive and its required metadata, removes invalid samples and assigns the splits."""
+    if not data_file.exists():
+        raise FileNotFoundError(f"[Error] Dataset file not found: {data_file}")
+    if data_file.suffix.lower() != ".npz":
+        raise ValueError(f"[Error] Unsupported file extension for dataset: {data_file.suffix}. Expected .npz.")
+
+    print(f"\nLoading dataset: {data_file}...")
+    meta = load_metadata(data_file, required=True)
+
+    # Strictly extract fields from meta.json - no fallbacks!
+    require_meta(meta, data_file, "dataset", "track_name", "channel_names")
+    dataset_name = resolve_dataset_key(meta["dataset"])
+    track_name = str(meta["track_name"]).strip()
+    channel_names = [str(x) for x in meta["channel_names"]]
+    num_channels = len(channel_names)
+    if num_channels == 0:
+        raise ValueError(f"[Error] 'channel_names' in metadata for {data_file} is empty!")
+
+    normalization = str(meta.get("normalization", "none")).strip().lower()
+    require_truncation_mode(meta, data_file)
+
+    npz_data = np.load(data_file, allow_pickle=True)
+    if "tracks" not in npz_data:
+        raise KeyError(f"[Error] Key 'tracks' not found in NPZ archive {data_file}! Available: {list(npz_data.files)}")
+    tracks = list(npz_data["tracks"])
+
+    # Always train on 'target' (identical to extract_embeddings.py / train_ridge_regression.py)
+    if "target" not in npz_data:
+        raise KeyError(f"[Error] Required field 'target' not found in {data_file}! Available: {list(npz_data.files)}")
+    targets = npz_data["target"].astype(np.float32)
+
+    if "gene" not in npz_data:
+        raise KeyError(f"[Error] 'gene' not found in dataset {data_file}! Available: {list(npz_data.files)}")
+    genes = npz_data["gene"].astype(str)
+
+    if "ensembl_transcript_id" not in npz_data:
+        raise KeyError(f"[Error] Required field 'ensembl_transcript_id' not found in dataset {data_file}!")
+    tx_ids = npz_data["ensembl_transcript_id"].astype(str)
+
+    # Cleaning mask
+    valid_mask = ~np.isnan(targets) & ~np.isinf(targets)
+    if "seq_lens" in npz_data:
+        valid_mask &= (npz_data["seq_lens"] > 0)
+    else:
+        valid_mask &= np.array([len(t) > 0 for t in tracks])
+
+    # Clean invalid samples
+    n_invalid = int(np.sum(~valid_mask))
+    if n_invalid > 0:
+        print(f"[Data Cleaning] Filtered out {n_invalid} samples with NaN/Inf targets or empty sequence length.")
+        tracks = [t for i, t in enumerate(tracks) if valid_mask[i]]
+        targets = targets[valid_mask]
+        genes = genes[valid_mask]
+        tx_ids = tx_ids[valid_mask]
+
+    # Check and align channel dimensions
+    data_channels = tracks[0].shape[1]
+    if data_channels < num_channels:
+        raise ValueError(
+            f"[Error] Dataset has only {data_channels} channels, but {num_channels} channels were specified in metadata ({channel_names})!"
+        )
+    elif data_channels > num_channels:
+        print(
+            f"[Info] Dataset has {data_channels} channels. Slicing the first {num_channels} channels matching {channel_names}."
+        )
+        tracks = [t[:, :num_channels] for t in tracks]
+
+    print(f"Total valid samples loaded: {len(targets)}")
+    print(f"Dataset:                   {dataset_name}")
+    print(f"Track identity:            {track_name} (Normalization: {normalization.upper()})")
+    print(f"Unique genes:              {len(np.unique(genes))}")
+    print(f"Configured tracks (N):     {num_channels}")
+    print(f"Channel names:             {channel_names}")
+
+    # Standardized 10-Fold Lookup Table Verification & Splitting
+    sample_splits = assign_splits(dataset_name, tx_ids)
+    if np.any(sample_splits == -1):
+        print("[Warning] Filtering out transcripts without split assignment.")
+        matched_mask = (sample_splits != -1)
+        tracks = [t for i, t in enumerate(tracks) if matched_mask[i]]
+        targets = targets[matched_mask]
+        genes = genes[matched_mask]
+        tx_ids = tx_ids[matched_mask]
+        sample_splits = sample_splits[matched_mask]
+
+    return TrackData(dataset_name, track_name, normalization, channel_names, tracks, targets, genes, tx_ids, sample_splits)
+
+
+def make_loader(data: TrackData, indices: np.ndarray, batch_size: int, max_length: int, shuffle: bool, device: torch.device) -> DataLoader:
+    """Length-bucketed DataLoader over the given samples (see BucketBatchSampler)."""
+    dataset = MultiTrackDataset([data.tracks[i] for i in indices], data.targets[indices], data.genes[indices], data.tx_ids[indices], max_length)
+    return DataLoader(
+        dataset,
+        batch_sampler=BucketBatchSampler(dataset, batch_size=batch_size, shuffle=shuffle),
+        collate_fn=pad_collate_fn,
+        num_workers=2,
+        pin_memory=(device.type == "cuda"),
+    )
+
+
+def run_name_arg(value: str) -> str:
+    """argparse type for --run_name: a single directory name that cannot be mistaken for a fold directory."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value) or value.startswith("fold_"):
+        raise argparse.ArgumentTypeError(
+            f"invalid run name '{value}': allowed are letters, digits, '.', '_' and '-', and it must not start with 'fold_'"
+        )
+    return value
+
+
+def resolve_run_dir(data: TrackData, run_name: Optional[str] = None) -> Path:
+    """Checkpoint directory of a run, derived from the track metadata: <dataset>/<track>[/<normalization>][/<run_name>]."""
+    run_dir = CHECKPOINTS_DIR / data.dataset_name / data.track_name
+    if data.normalization and data.normalization != "none":
+        run_dir = run_dir / data.normalization
+    return run_dir / run_name if run_name else run_dir
+
+
+# =============================================================================
+# 7. Main Pipeline
+# =============================================================================
+
+def config_to_argv(config_path: str) -> list:
+    """Converts a YAML config (keys = argument names) to command line arguments, so that it passes the same parser checks."""
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+    if not isinstance(config, dict):
+        raise ValueError(f"[Error] Config file {config_path} must contain a mapping of argument names to values.")
+
+    argv = []
+    for key, value in config.items():
+        if isinstance(value, bool):
+            argv.append(f"--{key}" if value else f"--no-{key}")
+        elif isinstance(value, (str, int, float)):
+            argv.extend([f"--{key}", str(value)])
+        else:
+            raise ValueError(f"[Error] Config file {config_path}: '{key}' must be a single value, got {value!r}.")
+    return argv
+
+
+def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
+    argv = sys.argv[1:] if argv is None else argv
+
+    config_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    config_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="YAML file with argument names as keys; arguments on the command line take precedence",
+    )
+    config_path = config_parser.parse_known_args(argv)[0].config
+
+    parser = argparse.ArgumentParser(
+        description="Supervised Fine-Tuning of Arbitrary N-Track Orthrus Model",
+        parents=[config_parser],
+        allow_abbrev=False,
+    )
 
     # Required parameters (No defaults)
     parser.add_argument(
@@ -1240,6 +894,12 @@ def main():
         help="Path to Orthrus model checkpoint directory or HuggingFace repo (e.g. from convert_6track_to_ntrack.py)",
     )
     # Optional configuration parameters
+    parser.add_argument(
+        "--run_name",
+        type=run_name_arg,
+        default=None,
+        help="Store the checkpoints in a subdirectory of this name, so that runs do not overwrite each other (default: none)",
+    )
     parser.add_argument(
         "--fold",
         type=str,
@@ -1315,26 +975,14 @@ def main():
         default=1.0,
         help="Maximum gradient norm for gradient clipping (default: 1.0)",
     )
-    parser.add_argument(
-        "--compute_xai",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Run xAI analyses (Input*Grad, Channel Ablation, Embedding Norms, 2D Heatmaps) after training (default: True)",
-    )
-    parser.add_argument(
-        "--xai_num_heatmaps",
-        type=int,
-        default=5,
-        help="Number of representative transcripts to generate 2D saliency heatmaps for (default: 5)",
-    )
-    parser.add_argument(
-        "--xai_tx_ids",
-        type=str,
-        default=None,
-        help="Optional comma-separated transcript IDs to generate 2D saliency heatmaps for",
-    )
 
-    args = parser.parse_args()
+    # The command line comes last, so that its values override the config file
+    config_argv = config_to_argv(config_path) if config_path else []
+    return parser.parse_args(config_argv + argv)
+
+
+def main():
+    args = parse_args()
 
     # Set seeds
     random.seed(args.random_seed)
@@ -1347,102 +995,17 @@ def main():
     print(f"Using device: {device}")
     reset_peak_memory_stats(device)
 
-    # 1. Load dataset (.npz) and strictly require companion metadata
-    data_file = Path(args.data_path)
-    if not data_file.exists():
-        raise FileNotFoundError(f"[Error] Dataset file not found: {data_file}")
-
-    print(f"\nLoading dataset: {data_file}...")
-    meta = load_metadata(data_file, required=True)
-
-    # Strictly extract fields from meta.json - no fallbacks!
-    require_meta(meta, data_file, "dataset", "track_name", "channel_names")
-    dataset_name = resolve_dataset_key(meta["dataset"])
-    track_name = str(meta["track_name"]).strip()
-    channel_names = [str(x) for x in meta["channel_names"]]
+    # 1. Load dataset (.npz) with its required metadata and assign the splits
+    data = load_track_data(Path(args.data_path))
+    channel_names = data.channel_names
     num_channels = len(channel_names)
-    if num_channels == 0:
-        raise ValueError(f"[Error] 'channel_names' in metadata for {data_file} is empty!")
-
-    normalization = str(meta.get("normalization", "none")).strip().lower()
-    require_truncation_mode(meta, data_file)
+    genes = data.genes
+    sample_splits = data.sample_splits
 
     # Automatically determine output directory based on metadata
-    if normalization and normalization != "none":
-        output_dir = CHECKPOINTS_DIR / dataset_name / track_name / normalization
-    else:
-        output_dir = CHECKPOINTS_DIR / dataset_name / track_name
+    output_dir = resolve_run_dir(data, args.run_name)
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"[Output Directory] Auto-resolved checkpoint output directory: {output_dir}")
-
-    if data_file.suffix.lower() == ".npz":
-        npz_data = np.load(data_file, allow_pickle=True)
-        if "tracks" not in npz_data:
-            raise KeyError(f"[Error] Key 'tracks' not found in NPZ archive {data_file}! Available: {list(npz_data.files)}")
-        tracks = list(npz_data["tracks"])
-
-        # Always train on 'target' (identical to extract_embeddings.py / train_ridge_regression.py)
-        if "target" not in npz_data:
-            raise KeyError(f"[Error] Required field 'target' not found in {data_file}! Available: {list(npz_data.files)}")
-        targets = npz_data["target"].astype(np.float32)
-
-        if "gene" not in npz_data:
-            raise KeyError(f"[Error] 'gene' not found in dataset {data_file}! Available: {list(npz_data.files)}")
-        genes = npz_data["gene"].astype(str)
-
-        if "ensembl_transcript_id" not in npz_data:
-            raise KeyError(f"[Error] Required field 'ensembl_transcript_id' not found in dataset {data_file}!")
-        tx_ids = npz_data["ensembl_transcript_id"].astype(str)
-
-        # Cleaning mask
-        valid_mask = ~np.isnan(targets) & ~np.isinf(targets)
-        if "seq_lens" in npz_data:
-            valid_mask &= (npz_data["seq_lens"] > 0)
-        else:
-            valid_mask &= np.array([len(t) > 0 for t in tracks])
-    else:
-        raise ValueError(f"[Error] Unsupported file extension for dataset: {data_file.suffix}. Expected .npz.")
-
-    # Clean invalid samples
-    n_invalid = int(np.sum(~valid_mask))
-    if n_invalid > 0:
-        print(f"[Data Cleaning] Filtered out {n_invalid} samples with NaN/Inf targets or empty sequence length.")
-        tracks = [t for i, t in enumerate(tracks) if valid_mask[i]]
-        targets = targets[valid_mask]
-        genes = genes[valid_mask]
-        tx_ids = tx_ids[valid_mask]
-
-    channel_colors = get_channel_colors(channel_names)
-
-    # Check and align channel dimensions
-    data_channels = tracks[0].shape[1]
-    if data_channels < num_channels:
-        raise ValueError(
-            f"[Error] Dataset has only {data_channels} channels, but {num_channels} channels were specified in metadata ({channel_names})!"
-        )
-    elif data_channels > num_channels:
-        print(
-            f"[Info] Dataset has {data_channels} channels. Slicing the first {num_channels} channels matching {channel_names}."
-        )
-        tracks = [t[:, :num_channels] for t in tracks]
-
-    print(f"Total valid samples loaded: {len(targets)}")
-    print(f"Dataset:                   {dataset_name}")
-    print(f"Track identity:            {track_name} (Normalization: {normalization.upper()})")
-    print(f"Unique genes:              {len(np.unique(genes))}")
-    print(f"Configured tracks (N):     {num_channels}")
-    print(f"Channel names:             {channel_names}")
-
-    # 2. Standardized 10-Fold Lookup Table Verification & Splitting
-    sample_splits = assign_splits(dataset_name, tx_ids)
-    if np.any(sample_splits == -1):
-        print("[Warning] Filtering out transcripts without split assignment.")
-        matched_mask = (sample_splits != -1)
-        tracks = [t for i, t in enumerate(tracks) if matched_mask[i]]
-        targets = targets[matched_mask]
-        genes = genes[matched_mask]
-        tx_ids = tx_ids[matched_mask]
-        sample_splits = sample_splits[matched_mask]
 
     folds_to_run = list(CV_FOLDS) if args.fold == "all" else [int(args.fold)]
     all_fold_summaries = {}
@@ -1466,53 +1029,21 @@ def main():
         print("\n" + "=" * 70)
         print(f"       STARTING {num_channels}-TRACK FINE-TUNING: FOLD {fold_id}")
         print("=" * 70)
-        print(f"  Train (Splits {fold_def['train']}): {len(train_idx)} samples ({len(np.unique(genes[train_idx]))} genes, {len(train_idx)/len(targets)*100:.1f}%)")
-        print(f"  Val   (Splits {fold_def['val']}):   {len(val_idx)} samples ({len(np.unique(genes[val_idx]))} genes, {len(val_idx)/len(targets)*100:.1f}%)")
-        print(f"  Test  (Splits {TEST_SPLITS}):  {len(test_idx)} samples ({len(np.unique(genes[test_idx]))} genes, {len(test_idx)/len(targets)*100:.1f}%)")
+        print(f"  Train (Splits {fold_def['train']}): {len(train_idx)} samples ({len(np.unique(genes[train_idx]))} genes, {len(train_idx)/len(genes)*100:.1f}%)")
+        print(f"  Val   (Splits {fold_def['val']}):   {len(val_idx)} samples ({len(np.unique(genes[val_idx]))} genes, {len(val_idx)/len(genes)*100:.1f}%)")
+        print(f"  Test  (Splits {TEST_SPLITS}):  {len(test_idx)} samples ({len(np.unique(genes[test_idx]))} genes, {len(test_idx)/len(genes)*100:.1f}%)")
         print(f"  Output Directory: {fold_output_dir}")
 
-        train_ds = MultiTrackDataset([tracks[i] for i in train_idx], targets[train_idx], genes[train_idx], tx_ids[train_idx], args.max_length)
-        val_ds = MultiTrackDataset([tracks[i] for i in val_idx], targets[val_idx], genes[val_idx], tx_ids[val_idx], args.max_length)
-        test_ds = MultiTrackDataset([tracks[i] for i in test_idx], targets[test_idx], genes[test_idx], tx_ids[test_idx], args.max_length)
-
-        train_loader = DataLoader(
-            train_ds,
-            batch_sampler=BucketBatchSampler(train_ds, batch_size=args.batch_size, shuffle=True),
-            collate_fn=pad_collate_fn,
-            num_workers=2,
-            pin_memory=(device.type == "cuda"),
-        )
-        val_loader = DataLoader(
-            val_ds,
-            batch_sampler=BucketBatchSampler(val_ds, batch_size=args.batch_size, shuffle=False),
-            collate_fn=pad_collate_fn,
-            num_workers=2,
-            pin_memory=(device.type == "cuda"),
-        )
-        test_loader = DataLoader(
-            test_ds,
-            batch_sampler=BucketBatchSampler(test_ds, batch_size=args.batch_size, shuffle=False),
-            collate_fn=pad_collate_fn,
-            num_workers=2,
-            pin_memory=(device.type == "cuda"),
-        )
+        train_loader = make_loader(data, train_idx, args.batch_size, args.max_length, shuffle=True, device=device)
+        val_loader = make_loader(data, val_idx, args.batch_size, args.max_length, shuffle=False, device=device)
+        test_loader = make_loader(data, test_idx, args.batch_size, args.max_length, shuffle=False, device=device)
 
         print(f"\nLoading {num_channels}-track Orthrus checkpoint from: {args.model_checkpoint}...")
-        backbone = AutoModel.from_pretrained(args.model_checkpoint, trust_remote_code=True)
-        d_model = getattr(backbone.config, "ssm_model_dim", 512)
+        model = build_regression_model(args.model_checkpoint, num_channels, device)
 
-        # Check input embedding dimension (must match dataset channels)
-        emb_layer = getattr(backbone, "embedding", None)
-        if emb_layer is not None and hasattr(emb_layer, "in_features") and emb_layer.in_features != num_channels:
-            raise ValueError(
-                f"[Error] Checkpoint input embedding dimension ({emb_layer.in_features}) does not match dataset tracks ({num_channels})!\n"
-                f"Please convert your base model using 'convert_6track_to_ntrack.py --n_target_tracks {num_channels}' first."
-            )
-        if hasattr(backbone, "config") and getattr(backbone.config, "n_tracks", None) != num_channels:
-            backbone.config.n_tracks = num_channels
-
-        model = OrthrusRegressionModel(backbone=backbone, d_model=d_model, hidden_dim=256, dropout=0.1)
-        model.to(device)
+        # Reproducibility: resolved arguments of this run (a resumed run records its latest invocation)
+        with open(fold_output_dir / RUN_CONFIG_FILENAME, "w", encoding="utf-8") as f:
+            json.dump(normalize_run_config({**vars(args), "fold": fold_id, "started_at": datetime.now().isoformat(timespec="seconds")}), f, indent=2)
 
         fold_summary = train_model(
             model=model,
@@ -1527,18 +1058,14 @@ def main():
             warmup_epochs=args.warmup_epochs,
             output_dir=fold_output_dir,
             channel_names=channel_names,
-            channel_colors=channel_colors,
             resume=args.resume,
             loss_fn_name=args.loss_fn,
             max_grad_norm=args.max_grad_norm,
-            compute_xai=args.compute_xai,
-            xai_num_heatmaps=args.xai_num_heatmaps,
-            xai_tx_ids=args.xai_tx_ids,
             source_checkpoint=args.model_checkpoint,
         )
         all_fold_summaries[fold_id] = fold_summary
 
-        del model, backbone
+        del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
