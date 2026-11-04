@@ -3,40 +3,26 @@
 Unified extraction of Orthrus embeddings using precomputed N-tracks archives
 and fine-tuned 4-fold cross-validation model checkpoints.
 
-Exclusively operates on precomputed N-track NPZ archives (from generate_miRNA_rbp_tracks.py,
-generate_2_rbp_tracks.py, generate_m6a_tracks.py, etc.) and strictly runs 4-fold CV
-representation extraction (Out-of-Fold validation + Test ensemble mean).
+Exclusively operates on precomputed N-track NPZ archives (from generate_tracks.py). A directory with
+fold_0..fold_3 yields out-of-fold validation embeddings plus a test ensemble mean. A single checkpoint
+(pretrained or one fold) runs through the same code as the only model, shared by all folds.
 """
 
 import argparse
-from datetime import datetime
+import json
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, Union
 
 import numpy as np
-import pandas as pd
 import torch
 from tqdm import tqdm
 from transformers import AutoModel
 
-from util import reset_peak_memory_stats, print_memory_profile, load_metadata, save_metadata, get_meta_filepath
-
-
-SPLITS_LOOKUP_HIPSC_CM = Path(
-    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hipsc_cm_10folds_lookup.csv"
+from util import (
+    reset_peak_memory_stats, print_memory_profile, load_metadata, get_meta_filepath,
+    normalize_run_config, diff_run_config, resolve_dataset_key, CV_FOLDS, TEST_SPLITS, assign_splits, require_meta,
+    TRUNCATION_MODE, truncate_to_max_length, require_truncation_mode,
 )
-SPLITS_LOOKUP_RNAHL_HUMAN = Path(
-    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/rnahl-human_10folds_lookup.csv"
-)
-SPLITS_LOOKUP_RNAHL_MOUSE = Path(
-    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/rnahl-mouse_10folds_lookup.csv"
-)
-
-SPLITS_LOOKUP_TABLES = {
-    "hipsc_cm": SPLITS_LOOKUP_HIPSC_CM,
-    "mrna_bench_human": SPLITS_LOOKUP_RNAHL_HUMAN,
-    "mrna_bench_mouse": SPLITS_LOOKUP_RNAHL_MOUSE,
-}
 
 
 def get_representation(model: torch.nn.Module, x_tensor: torch.Tensor, lengths_tensor: torch.Tensor) -> torch.Tensor:
@@ -60,11 +46,12 @@ def extract_embeddings_for_tracks(
     desc: str = "Extracting representations",
 ) -> np.ndarray:
     """
-    Extracts 512-dimensional Orthrus pooled embeddings using dynamic-length batching.
+    Extracts Orthrus pooled embeddings using dynamic-length batching.
     Tracks are sorted by length to minimize zero-padding overhead.
+    Tracks longer than max_length keep their 3' end (identical to finetune_ntrack.py).
     """
     if len(tracks) == 0:
-        return np.zeros((0, 512), dtype=np.float32)
+        return np.zeros((0, model.config.ssm_model_dim), dtype=np.float32)
 
     sample_data = []
     truncated_count = 0
@@ -72,7 +59,7 @@ def extract_embeddings_for_tracks(
     for idx, tr in enumerate(tracks):
         if tr.shape[0] > max_length:
             truncated_count += 1
-            tr = tr[:max_length, :]
+            tr = truncate_to_max_length(tr, max_length)
 
         sample_data.append({
             "orig_idx": idx,
@@ -112,18 +99,19 @@ def extract_embeddings_for_tracks(
     return np.stack(embeddings_list, axis=0)
 
 
+def resolve_checkpoint(model_source: Union[str, Path]) -> str:
+    """Returns the directory holding the model weights, or the input unchanged (e.g. a Hugging Face model ID)."""
+    source = str(model_source).strip()
+    finetuned_dir = Path(source) / "best_finetuned_backbone"
+    return str(finetuned_dir) if finetuned_dir.is_dir() else source
+
+
 def load_fold_backbone(fold_dir: Union[str, Path], device: torch.device, num_channels: Optional[int] = None) -> torch.nn.Module:
     """
     Loads fine-tuned Orthrus backbone checkpoint or base pretrained model.
     Adapts embedding layer dynamically if num_channels does not match base model in_features.
     """
-    fold_dir_str = str(fold_dir).strip()
-    fold_path = Path(fold_dir_str)
-
-    if fold_path.exists() and (fold_path / "best_finetuned_backbone").is_dir():
-        ckpt_target = str(fold_path / "best_finetuned_backbone")
-    else:
-        ckpt_target = fold_dir_str
+    ckpt_target = resolve_checkpoint(fold_dir)
 
     print(f"Loading backbone from: {ckpt_target}...")
     model = AutoModel.from_pretrained(ckpt_target, trust_remote_code=True)
@@ -139,6 +127,30 @@ def load_fold_backbone(fold_dir: Union[str, Path], device: torch.device, num_cha
     model = model.to(device)
     model.eval()
     return model
+
+
+def file_fingerprint(path: Path) -> list:
+    """[size, mtime_ns] of a file; changes whenever the file is rewritten."""
+    st = path.stat()
+    return [st.st_size, st.st_mtime_ns]
+
+
+def checkpoint_fingerprint(model_source: Union[str, Path]) -> dict:
+    """Fingerprints all weight files of a local checkpoint to detect retrained models in the same directory."""
+    ckpt_dir = Path(resolve_checkpoint(model_source))
+    if not ckpt_dir.is_dir():  # Hugging Face model ID: no local weight files
+        return {}
+    weight_files = sorted(p for p in ckpt_dir.iterdir() if p.suffix in (".safetensors", ".bin", ".pt"))
+    return {p.name: file_fingerprint(p) for p in weight_files}
+
+
+def build_fold_assignment(sample_splits: np.ndarray) -> np.ndarray:
+    """Labels each sample by the source of its embedding: its validation fold, the test ensemble or unassigned."""
+    assignment = np.full(len(sample_splits), "unassigned", dtype=object)
+    for k, fold in CV_FOLDS.items():
+        assignment[np.isin(sample_splits, fold["val"])] = f"fold_{k}"
+    assignment[np.isin(sample_splits, TEST_SPLITS)] = "ensemble_mean"
+    return assignment
 
 
 def parse_args():
@@ -169,7 +181,7 @@ def parse_args():
         "--max_length",
         type=int,
         default=12288,
-        help="Maximum sequence length (default: 12288 bp)",
+        help="Maximum sequence length; longer transcripts keep their 3' end (default: 12288)",
     )
     parser.add_argument(
         "--start_fresh",
@@ -209,7 +221,10 @@ def main():
         raise RuntimeError(f"[Error] Tracks archive {tracks_path} contains 0 samples!")
 
     n_channels = tracks[0].shape[1]
-    targets = npz_data["target"].astype(np.float32) if "target" in npz_data else np.full(n_samples, np.nan, dtype=np.float32)
+    # Finetuning and Ridge always use the 'target' field (no alternative target columns)
+    if "target" not in npz_data:
+        raise KeyError(f"[Error] Required field 'target' not found in {tracks_path}! Available keys: {list(npz_data.files)}")
+    targets = npz_data["target"].astype(np.float32)
     targets_raw = npz_data["target_raw"].astype(np.float32) if "target_raw" in npz_data else np.full(n_samples, np.nan, dtype=np.float32)
     tx_ids = npz_data["ensembl_transcript_id"].astype(str) if "ensembl_transcript_id" in npz_data else np.array([""] * n_samples)
     gene_ids = npz_data["ensembl_gene_id"].astype(str) if "ensembl_gene_id" in npz_data else np.array([""] * n_samples)
@@ -219,15 +234,12 @@ def main():
     # Load companion metadata strictly (no fallbacks)
     tracks_meta = load_metadata(tracks_path, required=True)
 
-    if "dataset" not in tracks_meta:
-        raise KeyError(f"[Error] Required metadata key 'dataset' not found in companion metadata for {tracks_path}!")
-    dataset_name = str(tracks_meta["dataset"]).strip()
-
-    if "track_name" not in tracks_meta:
-        raise KeyError(f"[Error] Required metadata key 'track_name' not found in companion metadata for {tracks_path}!")
+    require_meta(tracks_meta, tracks_path, "dataset", "track_name")
+    dataset_name = resolve_dataset_key(tracks_meta["dataset"])
     track_name = str(tracks_meta["track_name"]).strip()
 
     normalization = str(tracks_meta.get("normalization", "none")).strip().lower()
+    require_truncation_mode(tracks_meta, tracks_path)
 
     print(f"\n[Tracks Info] Loaded {n_samples:,} transcripts with {n_channels} channels.")
     print(f"Dataset identity:   {dataset_name}")
@@ -240,23 +252,15 @@ def main():
     )
 
     if is_hf_model:
-        is_base_model = True
         is_4fold_dir = False
         model_identifier = model_checkpoint_str
-        fold_subdirs = []
         print(f"\n[Model Detection] Pretrained base model: {model_checkpoint_str}")
     else:
         model_path = Path(model_checkpoint_str)
         if not model_path.exists():
             raise FileNotFoundError(f"[Error] Model checkpoint path not found: {model_path}")
 
-        # Check for model metadata
-        try:
-            model_meta = load_metadata(model_path, required=False)
-        except Exception:
-            model_meta = {}
-
-        fold_subdirs = [model_path / f"fold_{k}" for k in range(4)]
+        fold_subdirs = [model_path / f"fold_{k}" for k in CV_FOLDS]
         if all(p.is_dir() for p in fold_subdirs):
             is_4fold_dir = True
             model_identifier = str(model_path)
@@ -265,6 +269,12 @@ def main():
             is_4fold_dir = False
             model_identifier = str(model_path)
             print(f"\n[Model Detection] Single checkpoint directory (shared across all folds): {model_path}")
+
+    # Each model with the folds whose validation splits it embeds: one model per fold, or one shared by all folds
+    if is_4fold_dir:
+        model_jobs = [(fold_subdirs[k], [k]) for k in CV_FOLDS]
+    else:
+        model_jobs = [(model_identifier, list(CV_FOLDS))]
 
     # 3. Resolve Destination File Path strictly from metadata
     # The model was finetuned before if it has 4 Folds or is a fine-tuned fold checkpoint; else it was a base pretrained model
@@ -282,172 +292,128 @@ def main():
     reset_peak_memory_stats(device)
 
     # 4. Resolve Standardized 10-Fold Splits Lookup Table
-    d_clean = str(dataset_name).strip().lower().replace("-", "_")
-    if d_clean in SPLITS_LOOKUP_TABLES:
-        lookup_path = SPLITS_LOOKUP_TABLES[d_clean]
-    else:
-        raise FileNotFoundError(f"[Error] No lookup table found for dataset: {dataset_name} (cleaned: {d_clean})")
+    sample_splits = assign_splits(dataset_name, tx_ids)
 
-    if not lookup_path.exists():
-        raise FileNotFoundError(
-            f"[Error] 4-Fold cross-validation requires a standardized 10-fold split lookup table! "
-            f"Lookup table not found at: {lookup_path}."
-        )
+    fold_assignment = build_fold_assignment(sample_splits)
 
-    print(f"\n[Splits Lookup] Loading lookup table: {lookup_path}")
-    lookup_df = pd.read_csv(lookup_path)
-    lookup_tx_col = "ensembl_transcript_id" if "ensembl_transcript_id" in lookup_df.columns else "transcript_id"
-    if lookup_tx_col not in lookup_df.columns or "split" not in lookup_df.columns:
-        raise KeyError(f"[Error] Required columns ('{lookup_tx_col}', 'split') not found in lookup table {lookup_path}!")
-
-    tx_to_split = dict(
-        zip(lookup_df[lookup_tx_col].astype(str).str.strip(), lookup_df["split"].astype(int))
-    )
-    sample_splits = np.array([tx_to_split.get(str(t).strip(), -1) for t in tx_ids])
-
-    # Canonical 4-fold assignments:
-    # Fold 0 (Train [0..5]) -> Val [6, 7]
-    # Fold 1 (Train [2..7]) -> Val [0, 1]
-    # Fold 2 (Train [0,1,4,5,6,7]) -> Val [2, 3]
-    # Fold 3 (Train [0,1,2,3,6,7]) -> Val [4, 5]
-    fold_val_splits = {
-        0: [6, 7],
-        1: [0, 1],
-        2: [2, 3],
-        3: [4, 5],
-    }
-    test_splits = [8, 9]
-
-    all_embeddings = np.zeros((n_samples, 512), dtype=np.float32)
-    fold_assignment = np.empty(n_samples, dtype=object)
-
-    test_idx = np.where(np.isin(sample_splits, test_splits))[0]
+    test_idx = np.where(np.isin(sample_splits, TEST_SPLITS))[0]
     test_tracks = [tracks[i] for i in test_idx]
-    test_accum = np.zeros((len(test_idx), 512), dtype=np.float32)
 
-    print(f"\n4-Fold CV Setup: Total Samples = {n_samples:,}, Test Samples [8, 9] = {len(test_idx):,}")
+    # Restored from the checkpoint, or allocated once the first model provides the embedding dimension
+    all_embeddings = None
+    test_accum = None
 
-    # 5. Execute Embedding Extraction
-    if not is_4fold_dir:
-        print(f"\n[Single Model Mode] Extracting embeddings using model: {model_identifier}")
-        print("Model has not seen CV split data; extracting all samples in a single unified pass.")
-        model = load_fold_backbone(model_identifier, device, num_channels=tracks[0].shape[1])
-        all_embeddings = extract_embeddings_for_tracks(
-            tracks=tracks,
+    print(f"\nCV Setup: Total Samples = {n_samples:,}, Test Samples {TEST_SPLITS} = {len(test_idx):,}, Models = {len(model_jobs)}")
+    n_unmatched = int(np.sum(sample_splits == -1))
+    if n_unmatched > 0:
+        print(f"[Notice] {n_unmatched:,} samples had no split assignment in lookup table; their embeddings stay zero.")
+
+    # 5. Execute Embedding Extraction (with Resumable Checkpoint)
+    # The run configuration (input tracks + model weights) is stored in the checkpoint, so that a
+    # resume never mixes embeddings of different track archives or retrained fold models.
+    run_config = normalize_run_config({
+        "tracks_file": tracks_path.resolve(),
+        "tracks_file_fingerprint": file_fingerprint(tracks_path),
+        "model_checkpoint": model_identifier,
+        "fold_checkpoints": {f"fold_{k}": checkpoint_fingerprint(model_source) for model_source, folds in model_jobs for k in folds},
+        "max_length": args.max_length,
+        "truncation": TRUNCATION_MODE,
+    })
+
+    completed_folds = set()
+    if not args.start_fresh and checkpoint_file.exists():
+        print(f"[*] Found existing checkpoint: {checkpoint_file}")
+        ckpt_data = None
+        try:
+            with np.load(checkpoint_file, allow_pickle=True) as ckpt:
+                ckpt_data = {k: ckpt[k].copy() for k in ckpt.files}
+        except Exception as e:
+            print(f"[!] Warning: Failed to load checkpoint ({e}). Starting folds from scratch.")
+
+        if ckpt_data is not None:
+            if "run_config" not in ckpt_data:
+                raise RuntimeError(
+                    f"[Error] Checkpoint '{checkpoint_file}' has no run configuration and cannot be verified. "
+                    f"Please rerun with --start_fresh."
+                )
+            diffs = diff_run_config(json.loads(str(ckpt_data["run_config"])), run_config)
+            if diffs:
+                diff_str = "\n".join(f"  - {k}: existing={v[0]!r} | current={v[1]!r}" for k, v in diffs.items())
+                raise RuntimeError(
+                    f"[Error] Checkpoint '{checkpoint_file}' was created with a different configuration:\n{diff_str}\n"
+                    f"Resuming would mix both runs. Please rerun with --start_fresh."
+                )
+            all_embeddings = ckpt_data["embeddings"]
+            test_accum = ckpt_data["test_accum"]
+            completed_folds = set(ckpt_data["completed_folds"].tolist())
+            print(f"[*] Resuming: Run configuration matches, folds {sorted(completed_folds)} already completed.")
+
+    for model_source, folds in model_jobs:
+        label = f"Fold {'+'.join(str(k) for k in folds)}"
+        if completed_folds.issuperset(folds):
+            print(f"\n--- [{label}] Already completed in checkpoint. Skipping ---")
+            continue
+
+        val_splits = [s for k in folds for s in CV_FOLDS[k]["val"]]
+        val_idx = np.where(np.isin(sample_splits, val_splits))[0]
+        val_tracks = [tracks[i] for i in val_idx]
+
+        print(f"\n--- [{label}] Loading model from: {model_source} ---")
+        model = load_fold_backbone(model_source, device, num_channels=n_channels)
+
+        if all_embeddings is None:
+            embedding_dim = model.config.ssm_model_dim
+            all_embeddings = np.zeros((n_samples, embedding_dim), dtype=np.float32)
+            test_accum = np.zeros((len(test_idx), embedding_dim), dtype=np.float32)
+
+        print(f"[{label}] Extracting Val Embeddings (Splits {val_splits}, {len(val_idx):,} samples)...")
+        all_embeddings[val_idx] = extract_embeddings_for_tracks(
+            tracks=val_tracks,
             model=model,
             device=device,
             batch_size=args.batch_size,
             max_length=args.max_length,
-            desc="Orthrus Base Model Extraction",
+            desc=f"{label} Val",
         )
+
+        print(f"[{label}] Extracting Test Set Embeddings (Splits {TEST_SPLITS}, {len(test_idx):,} samples)...")
+        test_accum += extract_embeddings_for_tracks(
+            tracks=test_tracks,
+            model=model,
+            device=device,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            desc=f"{label} Test",
+        )
+
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Set fold assignments based on standard splits
-        for k in range(4):
-            val_splits = fold_val_splits[k]
-            val_idx = np.where(np.isin(sample_splits, val_splits))[0]
-            for i in val_idx:
-                fold_assignment[i] = f"fold_{k}"
-
-        if len(test_idx) > 0:
-            for i in test_idx:
-                fold_assignment[i] = "ensemble_mean"
-
-        unmatched_idx = np.where(sample_splits == -1)[0]
-        if len(unmatched_idx) > 0:
-            for i in unmatched_idx:
-                fold_assignment[i] = "unassigned"
-
-    else:
-        # 4-Fold CV Extraction (with Resumable Checkpoint)
-        completed_folds = set()
-        if not args.start_fresh and checkpoint_file.exists():
-            print(f"[*] Found existing checkpoint: {checkpoint_file}")
-            try:
-                with np.load(checkpoint_file, allow_pickle=True) as ckpt:
-                    all_embeddings = ckpt["embeddings"].copy()
-                    fold_assignment = ckpt["fold_assignment"].copy()
-                    test_accum = ckpt["test_accum"].copy()
-                    completed_folds = set(ckpt["completed_folds"].tolist())
-                print(f"[*] Resuming: Folds {sorted(completed_folds)} already completed.")
-            except Exception as e:
-                print(f"[!] Warning: Failed to load checkpoint ({e}). Starting folds from scratch.")
-
-        for k in range(4):
-            if k in completed_folds:
-                print(f"\n--- [Fold {k}] Already completed in checkpoint. Skipping ---")
-                continue
-
-            val_splits = fold_val_splits[k]
-            val_idx = np.where(np.isin(sample_splits, val_splits))[0]
-            val_tracks = [tracks[i] for i in val_idx]
-
-            fold_dir = fold_subdirs[k]
-            print(f"\n--- [Fold {k}] Loading model from: {fold_dir} ---")
-            fold_model = load_fold_backbone(fold_dir, device, num_channels=tracks[0].shape[1])
-
-            print(f"[Fold {k}] Extracting Out-of-Fold Val Embeddings (Splits {val_splits}, {len(val_idx):,} samples)...")
-            val_emb = extract_embeddings_for_tracks(
-                tracks=val_tracks,
-                model=fold_model,
-                device=device,
-                batch_size=args.batch_size,
-                max_length=args.max_length,
-                desc=f"Fold {k} Val",
-            )
-            all_embeddings[val_idx] = val_emb
-            for i in val_idx:
-                fold_assignment[i] = f"fold_{k}"
-
-            print(f"[Fold {k}] Extracting Test Set Embeddings (Splits {test_splits}, {len(test_idx):,} samples)...")
-            fold_test_emb = extract_embeddings_for_tracks(
-                tracks=test_tracks,
-                model=fold_model,
-                device=device,
-                batch_size=args.batch_size,
-                max_length=args.max_length,
-                desc=f"Fold {k} Test",
-            )
-            test_accum += fold_test_emb
-
-            del fold_model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            # Save checkpoint after each fold
-            completed_folds.add(k)
+        # Save checkpoint while further folds are pending
+        completed_folds.update(folds)
+        if len(completed_folds) < len(CV_FOLDS):
             ckpt_dict = {
                 "embeddings": all_embeddings,
-                "fold_assignment": fold_assignment,
                 "test_accum": test_accum,
                 "completed_folds": np.array(list(completed_folds), dtype=np.int32),
+                "run_config": json.dumps(run_config, sort_keys=True),
             }
             tmp_ckpt = checkpoint_file.with_suffix(".tmp.npz")
             np.savez_compressed(tmp_ckpt, **ckpt_dict)
             tmp_ckpt.replace(checkpoint_file)
-            print(f"[✓] Checkpoint saved after Fold {k} (completed: {sorted(completed_folds)}).")
+            print(f"[✓] Checkpoint saved after {label} (completed: {sorted(completed_folds)}).")
 
-        # Clean up temporary checkpoint upon full completion
-        if checkpoint_file.exists():
-            try:
-                checkpoint_file.unlink()
-            except OSError:
-                pass
+    # Clean up temporary checkpoint upon full completion
+    if checkpoint_file.exists():
+        try:
+            checkpoint_file.unlink()
+        except OSError:
+            pass
 
-        # Ensemble Mean for Test Set [8, 9]
-        print("\nComputing Ensemble Mean Embedding for Test Set [8, 9] across all 4 folds...")
-        if len(test_idx) > 0:
-            all_embeddings[test_idx] = test_accum / 4.0
-            for i in test_idx:
-                fold_assignment[i] = "ensemble_mean"
-
-        unmatched_idx = np.where(sample_splits == -1)[0]
-        if len(unmatched_idx) > 0:
-            print(f"[Notice] {len(unmatched_idx):,} samples had no split assignment in lookup table.")
-            for i in unmatched_idx:
-                fold_assignment[i] = "unassigned"
+    # Test Set: mean over all models (with a single model, its embeddings unchanged)
+    print(f"\nComputing Test Set {TEST_SPLITS} Embeddings as mean over {len(model_jobs)} model(s)...")
+    all_embeddings[test_idx] = test_accum / len(model_jobs)
 
     # 6. Save Standardized Output NPZ Archive
     print(f"\nSaving final embeddings to: {save_file}")
@@ -461,15 +427,10 @@ def main():
         genes_arr=genes,
         seq_lens_arr=seq_lens,
         fold_assignment_arr=fold_assignment,
-        dataset=str(dataset_name),
-        track_name=str(track_name),
-        normalization=str(normalization),
+        # Only metadata not contained in the track .meta.json (single source for dataset, track, normalization)
+        source_tracks_meta=str(get_meta_filepath(tracks_path).name),
         variant=str(var_str),
         model_checkpoint=str(model_identifier),
-        is_finetuned=is_finetuned,
-        is_4fold_cv=is_4fold_dir,
-        source_tracks_file=str(tracks_path.name),
-        source_tracks_meta=str(get_meta_filepath(tracks_path).name),
     )
 
     print("=" * 75)
@@ -478,11 +439,6 @@ def main():
     print(f"Embedding array shape:   {all_embeddings.shape}")
     print(f"Track identity:          {track_name} (Normalization: {normalization.upper()})")
     print(f"Saved to:                {save_file}")
-    print(f"Standardized NPZ Keys:   ['embeddings_arr', 'targets_arr', 'targets_raw_arr',")
-    print(f"                          'ensembl_transcript_id_arr', 'ensembl_gene_id_arr',")
-    print(f"                          'genes_arr', 'seq_lens_arr', 'fold_assignment_arr',")
-    print(f"                          'dataset', 'track_name', 'normalization',")
-    print(f"                          'model_checkpoint', 'is_finetuned', 'is_4fold_cv']")
     print("=" * 75 + "\n")
 
     print_memory_profile(device=device, title="ORTHRUS EMBEDDINGS SPEICHER-PROFILING")

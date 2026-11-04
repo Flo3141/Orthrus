@@ -23,7 +23,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from six_track_dataset import SixTrackDatasetLoader
-from util import save_metadata
+from util import save_metadata, ensure_run_config, to_object_array, RUN_CONFIG_FILENAME, TRUNCATION_MODE, truncate_to_max_length, DATA_DIR, DATASET_DIRS, GTF_DB_PATH
 
 DEFAULT_CHANNEL_NAMES = ["A", "C", "G", "U", "CDS", "Splice", "miRNA", "eCLIP"]
 
@@ -31,13 +31,12 @@ DEFAULT_CHANNEL_NAMES = ["A", "C", "G", "U", "CDS", "Splice", "miRNA", "eCLIP"]
 # =============================================================================
 # Fixed Reference File Paths (Cluster Constants)
 # =============================================================================
-GTF_DB_PATH = Path("/beegfs/prj/RNA_NLP/AlphaGenome/data/Homo_sapiens.GRCh38.108.gtf.db")
-TARGETSCAN_FILE_PATH = Path(
-    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/targetscan/Predicted_Targets_Context_Scores.default_predictions.txt"
-)
-ENCODE_ECLIP_FILE_PATH = Path(
-    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/eclip/all_rbp_peaks_merged.bed"
-)
+TARGETSCAN_FILE_PATH = DATA_DIR / "targetscan" / "Predicted_Targets_Context_Scores.default_predictions.txt"
+ENCODE_ECLIP_FILE_PATH = DATA_DIR / "eclip" / "all_rbp_peaks_merged.bed"
+
+# The TargetScan context score file lists sites for all species of the UTR alignment
+# (column 'Gene Tax ID'). Only rows of the target species refer to the transcript's own UTR.
+TARGETSCAN_HUMAN_TAX_ID = 9606
 
 
 # =============================================================================
@@ -127,7 +126,8 @@ class GtfDbHelper:
         if strand == "-":
             exons.reverse()
 
-        return {"chrom": chrom, "strand": strand, "exons": exons}
+        exon_length = sum(end - start + 1 for start, end in exons)
+        return {"chrom": chrom, "strand": strand, "exons": exons, "exon_length": exon_length}
 
 
 def map_genomic_intervals_to_transcript(
@@ -175,12 +175,24 @@ def map_genomic_intervals_to_transcript(
 # 3. Parser for TargetScan and ENCODE eCLIP
 # =============================================================================
 
-def load_targetscan_data(targetscan_path: Path) -> dict:
+def load_targetscan_data(targetscan_path: Path, tax_id: int = TARGETSCAN_HUMAN_TAX_ID) -> dict:
     if not targetscan_path.exists():
         raise FileNotFoundError(f"TargetScan file '{targetscan_path}' not found.")
 
     print(f"Loading TargetScan data from: {targetscan_path}...")
     df_ts = pd.read_csv(targetscan_path, sep="\t", low_memory=False)
+
+    # Keep only sites of the target species. Rows of other species carry the same (human)
+    # transcript ID, but their UTR coordinates refer to the orthologous UTR.
+    tax_col = "Gene Tax ID"
+    if tax_col not in df_ts.columns:
+        raise KeyError(f"[Error] Column '{tax_col}' not found in TargetScan file! Columns: {list(df_ts.columns)}")
+    n_before = len(df_ts)
+    df_ts = df_ts[pd.to_numeric(df_ts[tax_col], errors="coerce") == tax_id]
+    print(f"TargetScan: Retained {len(df_ts):,} of {n_before:,} rows with {tax_col} == {tax_id}.")
+    if df_ts.empty:
+        raise RuntimeError(f"[Error] No TargetScan rows with {tax_col} == {tax_id} found in {targetscan_path}!")
+
     tx_col = "Transcript ID"
     score_col = "weighted context++ score"
     # The two column names have different naming conventions
@@ -298,7 +310,8 @@ def compute_dynamic_quantiles(
         if not clean_tx:
             continue
 
-        l = min(int(row["length"]), max_length)
+        # Signals are mapped on the full transcript; only the kept 3' window (last max_length nt) enters the quantile
+        l = int(row["length"])
 
         # miRNA channel: TargetScan on 3' UTR
         if clean_tx in ts_data:
@@ -310,13 +323,14 @@ def compute_dynamic_quantiles(
                     abs_end = utr3_start + end
                     if abs_start < l:
                         mirna_1d[abs_start:min(abs_end, l)] += score
+                mirna_1d = mirna_1d[-max_length:]
                 nz_mirna = mirna_1d[mirna_1d > 0]
                 if len(nz_mirna) > 0:
                     all_mirna_vals.append(nz_mirna)
 
         # eCLIP channel: ENCODE peaks mapped to exons
         tx_info = gtf_helper.get_transcript_exons(clean_tx)
-        if tx_info is not None:
+        if tx_info is not None and tx_info["exon_length"] == int(row["length"]):
             chrom = str(tx_info["chrom"]).replace("chr", "")
             strand = tx_info["strand"]
             exons = tx_info["exons"]
@@ -324,6 +338,7 @@ def compute_dynamic_quantiles(
 
             if key in eclip_data:
                 eclip_1d = map_genomic_intervals_to_transcript(exons, strand, eclip_data[key], l)
+                eclip_1d = eclip_1d[-max_length:]
                 nz_eclip = eclip_1d[eclip_1d > 0]
                 if len(nz_eclip) > 0:
                     all_eclip_vals.append(nz_eclip)
@@ -362,9 +377,10 @@ def normalize_trans_factor_tracks(
     Methods:
       - 'none': Keep unchanged (raw values)
       - 'log': np.log1p(x) -> log(1 + x)
-      - 'robust_quantile' (or 'minmax'):
-          Log-transformation with Robust Quantile Scaling (State of the Art):
+      - 'minmax': Log-transformation with Robust Quantile Scaling to [0, 1]:
           x_scaled = min(1.0, log(1 + x) / log(1 + q_99))
+          Note: despite the name, this is NOT classic min-max scaling (x - min) / (max - min).
+          The name is kept for compatibility with existing file names and output directories.
           Prevents extreme outliers from compressing normal binding sites towards 0,
           while preserving quantitative differences in the biologically relevant range.
           Uses global dataset q_99 reference bounds (mirna_q99, eclip_q99).
@@ -428,7 +444,7 @@ def save_chunk(
 
     np.savez_compressed(
         chunk_file,
-        tracks=np.array([item["track"] for item in chunk_items], dtype=object),
+        tracks=to_object_array(item["track"] for item in chunk_items),
         target=target_arr,
         target_raw=target_raw_arr,
         ensembl_transcript_id=tx_arr,
@@ -441,6 +457,7 @@ def save_chunk(
         has_mirna=np.array([item["has_mirna"] for item in chunk_items], dtype=bool),
         has_eclip=np.array([item["has_eclip"] for item in chunk_items], dtype=bool),
         has_gtf=np.array([item["has_gtf"] for item in chunk_items], dtype=bool),
+        gtf_length_mismatch=np.array([item["gtf_length_mismatch"] for item in chunk_items], dtype=bool),
         normalization=str(normalization),
         mirna_q99=np.float32(mirna_q99) if mirna_q99 is not None else np.nan,
         eclip_q99=np.float32(eclip_q99) if eclip_q99 is not None else np.nan,
@@ -475,6 +492,7 @@ def merge_all_chunks(
     mirna_flags = []
     eclip_flags = []
     gtf_flags = []
+    gtf_mismatch_flags = []
 
     for cf in tqdm(chunk_files, desc="Merging chunks"):
         data = np.load(cf, allow_pickle=True)
@@ -488,10 +506,11 @@ def merge_all_chunks(
         mirna_flags.extend(data["has_mirna"])
         eclip_flags.extend(data["has_eclip"])
         gtf_flags.extend(data["has_gtf"])
+        gtf_mismatch_flags.extend(data["gtf_length_mismatch"])
 
     np.savez_compressed(
         output_file,
-        tracks=np.array(all_tracks, dtype=object),
+        tracks=to_object_array(all_tracks),
         target=np.array(targets, dtype=np.float32),
         target_raw=np.array(targets_raw, dtype=np.float32),
         ensembl_transcript_id=np.array(tx_ids),
@@ -504,6 +523,7 @@ def merge_all_chunks(
         has_mirna=np.array(mirna_flags, dtype=bool),
         has_eclip=np.array(eclip_flags, dtype=bool),
         has_gtf=np.array(gtf_flags, dtype=bool),
+        gtf_length_mismatch=np.array(gtf_mismatch_flags, dtype=bool),
         normalization=str(normalization),
         mirna_q99=np.float32(mirna_q99) if mirna_q99 is not None else np.nan,
         eclip_q99=np.float32(eclip_q99) if eclip_q99 is not None else np.nan,
@@ -521,6 +541,7 @@ def merge_all_chunks(
         "num_channels": 8,
         "channel_names": list(DEFAULT_CHANNEL_NAMES),
         "max_length": int(max_length),
+        "truncation": TRUNCATION_MODE,
         "total_transcripts": int(n),
         "unique_genes": int(len(set(genes))),
         "seq_len_min": int(min(lens)) if lens else 0,
@@ -533,9 +554,11 @@ def merge_all_chunks(
             "quantile": float(quantile),
             "mirna_q99": float(mirna_q99) if (mirna_q99 is not None and not np.isnan(mirna_q99)) else None,
             "eclip_q99": float(eclip_q99) if (eclip_q99 is not None and not np.isnan(eclip_q99)) else None,
+            "targetscan_tax_id": TARGETSCAN_HUMAN_TAX_ID,
             "transcripts_with_mirna": int(sum(mirna_flags)),
             "transcripts_with_eclip": int(sum(eclip_flags)),
             "transcripts_in_gtf": int(sum(gtf_flags)),
+            "transcripts_gtf_length_mismatch": int(sum(gtf_mismatch_flags)),
         },
     }
     save_metadata(output_file, meta_dict)
@@ -545,6 +568,7 @@ def merge_all_chunks(
     print(f"Dataset:                             {dataset}")
     print(f"Total transcripts:                   {n}")
     print(f"Successfully mapped in GTF DB:       {sum(gtf_flags)} ({sum(gtf_flags)/n*100:.2f} %)")
+    print(f"GTF exon length mismatch:            {sum(gtf_mismatch_flags)} ({sum(gtf_mismatch_flags)/n*100:.2f} %) -> no eCLIP mapping")
     print(f"Transcripts with TargetScan miRNAs:  {sum(mirna_flags)} ({sum(mirna_flags)/n*100:.2f} %)")
     print(f"Transcripts with ENCODE eCLIP peaks: {sum(eclip_flags)} ({sum(eclip_flags)/n*100:.2f} %)")
     print(f"Trans-factor normalization:          {normalization.upper()} (Global Scaling)")
@@ -625,7 +649,7 @@ def main():
         "--max_length",
         type=int,
         default=12288,
-        help="Maximum sequence length (default: 12288 bp)",
+        help="Maximum sequence length; longer transcripts keep their 3' end (default: 12288)",
     )
     parser.add_argument(
         "--recreate",
@@ -638,17 +662,19 @@ def main():
     if args.dataset == "mrna_bench" and not args.species:
         parser.error("--species ('human' or 'mouse') must be specified when --dataset is 'mrna_bench'!")
 
+    # All trans-factor references (GRCh38 GTF, ENCODE eCLIP, TargetScanHuman) are human-only
+    if args.species == "mouse":
+        raise ValueError(
+            "[Error] generate_miRNA_rbp_tracks.py supports only human data: GTF (GRCh38), ENCODE eCLIP peaks and "
+            "TargetScan sites are human references. Use --species human or the 6-track archive for mouse."
+        )
+
     norm_method = args.normalization.lower()
     dataset_key = f"{args.dataset}_{args.species}" if args.species else args.dataset
-    dataset_dirs = {
-        "hipsc_cm": Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/8track_miRNA_rbp"),
-        "mrna_bench_human": Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus/8track_miRNA_rbp"),
-        "mrna_bench_mouse": Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus/8track_miRNA_rbp"),
-    }
-    if dataset_key not in dataset_dirs:
-        raise ValueError(f"[Error] Unknown dataset key '{dataset_key}'! Supported: {list(dataset_dirs.keys())}")
+    if dataset_key not in DATASET_DIRS:
+        raise ValueError(f"[Error] Unknown dataset key '{dataset_key}'! Supported: {list(DATASET_DIRS.keys())}")
 
-    data_dir = dataset_dirs[dataset_key]
+    data_dir = DATASET_DIRS[dataset_key] / "orthrus" / "8track_miRNA_rbp"
     dataset_name = dataset_key
     norm_suffix = f"_{norm_method}" if norm_method != "none" else ""
     file_stem = f"hipsc_cm_8track_miRNA_rbp{norm_suffix}" if args.dataset == "hipsc_cm" else f"mrna_bench_{args.species}_8track_miRNA_rbp{norm_suffix}"
@@ -679,7 +705,33 @@ def main():
             except Exception as e:
                 print(f"[Warning] Could not delete {cf.name}: {e}")
         existing_chunks = []
-    else:
+        (chunks_dir / RUN_CONFIG_FILENAME).unlink(missing_ok=True)
+
+    # Existing chunks may only be resumed if they were generated with identical parameters.
+    # Chunks from before the TargetScan species filter have no run_config.json and are rejected.
+    ensure_run_config(
+        chunks_dir,
+        {
+            "script": Path(__file__).name,
+            "dataset": dataset_key,
+            "normalization": norm_method,
+            "mirna_q99": args.mirna_q99,
+            "eclip_q99": args.eclip_q99,
+            "quantile": args.quantile,
+            "quantile_sample_size": args.quantile_sample_size,
+            "max_length": args.max_length,
+            "truncation": TRUNCATION_MODE,
+            "gtf_db": GTF_DB_PATH,
+            "targetscan_file": TARGETSCAN_FILE_PATH,
+            "targetscan_tax_id": TARGETSCAN_HUMAN_TAX_ID,
+            "eclip_bed": ENCODE_ECLIP_FILE_PATH,
+            "gtf_exon_length_check": True,
+        },
+        has_existing_state=bool(existing_chunks),
+        reset_hint="Please rerun with --recreate.",
+    )
+
+    if not args.recreate:
         for cf in existing_chunks:
             try:
                 c_data = np.load(cf, allow_pickle=True)
@@ -761,11 +813,10 @@ def main():
             # Base 6-tracks directly from SixTrackDatasetLoader
             six_track = row["track"].copy()
             l = int(row["length"])
+            full_len = l  # untruncated length, used to validate the GTF exon structure
             utr3_start = int(row["utr3_start"])
 
-            if l > args.max_length:
-                six_track = six_track[:args.max_length, :]
-                l = args.max_length
+            # All channels are built on the full transcript and truncated together after concatenation
 
             # Channel 6: TargetScan miRNA
             mirna_track = np.zeros((l, 1), dtype=np.float32)
@@ -785,7 +836,9 @@ def main():
             has_gtf = False
 
             tx_info = gtf_helper.get_transcript_exons(clean_tx)
-            if tx_info is not None:
+            # Exon structure must match the dataset sequence, otherwise peaks would be mapped to wrong positions
+            gtf_length_mismatch = tx_info is not None and tx_info["exon_length"] != full_len
+            if tx_info is not None and not gtf_length_mismatch:
                 has_gtf = True
                 chrom = str(tx_info["chrom"]).replace("chr", "")
                 strand = tx_info["strand"]
@@ -810,6 +863,12 @@ def main():
             # Concatenate to (L, 8)
             multi_track = np.concatenate([six_track, mirna_track, eclip_track], axis=1)
 
+            if l > args.max_length:
+                multi_track = truncate_to_max_length(multi_track, args.max_length)  # keeps the 3' end
+                l = args.max_length
+                has_mirna = bool(np.any(multi_track[:, 6] > 0))
+                has_eclip = bool(np.any(multi_track[:, 7] > 0))
+
             # Add to current chunk
             target_val = float(row["target"])
             target_raw_val = float(row["target_raw"])
@@ -826,6 +885,7 @@ def main():
                 "has_mirna": has_mirna,
                 "has_eclip": has_eclip,
                 "has_gtf": has_gtf,
+                "gtf_length_mismatch": gtf_length_mismatch,
             })
             pbar.update(1)
 

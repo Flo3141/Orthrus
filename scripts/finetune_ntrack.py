@@ -5,15 +5,17 @@ on Experimental & Trans-Factor Augmented Datasets.
 
 Features:
 - User-specified channel names via CLI (--channel_names), automatically determining N.
-- Supports both precomputed .npz archives and tabular .tsv/.txt datasets (with Saluki sequence token parsing).
+- Operates exclusively on precomputed .npz track archives (with companion .meta.json); always trains on the 'target' field.
 - Automatically verifies and slices channel dimensions if input data has more channels than requested.
-- Gene-grouped Train / Validation / Test splitting (Standardized 10-fold lookup table).
-- Dynamic length padding with bucketing to minimize padding overhead.
+- Homology-grouped Train / Validation / Test splitting (standardized 10-fold lookup table from create_deterministic_splits.py).
+- Dynamic length padding with megabatch length bucketing (low padding overhead, new batch composition every epoch).
+- Sequences longer than --max_length are truncated keeping their 3' end (3' UTR preserved).
 - Differential learning rates:
     - Backbone Mamba layers: lr_backbone (e.g. 5e-5)
     - Input embedding layer: lr_embedding (e.g. 2e-4) to rapidly adapt new/expanded channels
     - Regression projection head: lr_head (e.g. 3e-4)
 - Mixed-precision training (bf16/fp32) with Cosine Annealing + Linear Warmup + Huber/SmoothL1/MSE loss.
+- AdamW without weight decay (as in the original Orthrus fine-tuning configs).
 - Comprehensive Safeguards against NaN/Inf loss and gradient explosions.
 - Full xAI (Explainable AI) pipeline adapted dynamically for arbitrary N channels:
     - Input * Gradient saliency attributions (%)
@@ -33,9 +35,6 @@ from pathlib import Path
 import random
 import sys
 import numpy as np
-import pandas as pd
-from scipy.stats import pearsonr, spearmanr
-from sklearn.metrics import mean_squared_error, r2_score
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, Sampler
@@ -44,7 +43,11 @@ from datetime import datetime
 from transformers import AutoModel
 from typing import Optional, List, Dict, Any, Union
 
-from util import reset_peak_memory_stats, print_memory_profile, load_metadata, save_metadata
+from util import (
+    reset_peak_memory_stats, print_memory_profile, load_metadata, save_metadata,
+    resolve_dataset_key, truncate_to_max_length, require_truncation_mode,
+    CV_FOLDS, TEST_SPLITS, CHECKPOINTS_DIR, assign_splits, require_meta, regression_metrics,
+)
 
 # Headless backend for cluster servers without display
 import matplotlib
@@ -89,8 +92,7 @@ class MultiTrackDataset(Dataset):
         self.samples = []
         for i in range(len(tracks)):
             tr = tracks[i]
-            if tr.shape[0] > max_length:
-                tr = tr[:max_length, :]
+            tr = truncate_to_max_length(tr, max_length)  # keeps the 3' end
             self.samples.append({
                 "track": torch.from_numpy(tr).float(),
                 "target": float(targets[i]),
@@ -108,25 +110,37 @@ class MultiTrackDataset(Dataset):
 
 class BucketBatchSampler(Sampler):
     """
-    Batches sequences of similar lengths together to dramatically minimize zero-padding overhead.
+    Batches sequences of similar lengths together to minimize zero-padding overhead.
+
+    - shuffle=True (training): megabatch bucketing. Each epoch the indices are shuffled and split into
+      megabatches of megabatch_size * batch_size samples; within each megabatch they are sorted by length
+      and cut into batches, then all batches are shuffled. Batch composition changes every epoch at ~3 %
+      padding overhead (simulated on hIPSC_CM lengths with megabatch_size=50), whereas global sorting
+      yields identical batches in every epoch.
+    - shuffle=False (val/test): globally sorted by length (deterministic, minimal padding).
     """
-    def __init__(self, dataset: MultiTrackDataset, batch_size: int, shuffle: bool = True):
+    def __init__(self, dataset: MultiTrackDataset, batch_size: int, shuffle: bool = True, megabatch_size: int = 50):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.megabatch_size = megabatch_size
+        self.lengths = [s["length"] for s in dataset.samples]
 
-        # Sort indices by sequence length
-        indices_and_lens = [(i, dataset.samples[i]["length"]) for i in range(len(dataset))]
-        indices_and_lens.sort(key=lambda x: x[1])
-        self.sorted_indices = [x[0] for x in indices_and_lens]
+    def _sorted_batches(self, indices: list) -> list:
+        indices = sorted(indices, key=lambda i: self.lengths[i])
+        return [indices[i : i + self.batch_size] for i in range(0, len(indices), self.batch_size)]
 
     def __iter__(self):
-        # Create batches of similar length
-        batches = [
-            self.sorted_indices[i : i + self.batch_size]
-            for i in range(0, len(self.sorted_indices), self.batch_size)
-        ]
-        if self.shuffle:
+        if not self.shuffle:
+            batches = self._sorted_batches(list(range(len(self.dataset))))
+        else:
+            # Python RNG: seeded via --random_seed and restored on --resume
+            indices = list(range(len(self.dataset)))
+            random.shuffle(indices)
+            megabatch_len = self.batch_size * self.megabatch_size
+            batches = []
+            for start in range(0, len(indices), megabatch_len):
+                batches.extend(self._sorted_batches(indices[start : start + megabatch_len]))
             random.shuffle(batches)
         for b in batches:
             yield b
@@ -249,34 +263,18 @@ def evaluate(model: nn.Module, dataloader: DataLoader, device: torch.device, los
         )
 
     avg_loss = total_loss / max(1, len(y_true))
-
-    if len(y_true) > 2 and np.std(y_pred) > 1e-8 and np.std(y_true) > 1e-8:
-        p_corr, p_pval = pearsonr(y_true, y_pred)
-        s_corr, s_pval = spearmanr(y_true, y_pred)
-    else:
-        p_corr, p_pval = 0.0, 1.0
-        s_corr, s_pval = 0.0, 1.0
-
-    mse = float(mean_squared_error(y_true, y_pred))
-    rmse = float(np.sqrt(mse))
-    r2 = float(r2_score(y_true, y_pred)) if len(y_true) > 2 else 0.0
-
-    return {
-        "loss": float(avg_loss),
-        "pearson_r": float(p_corr),
-        "pearson_pval": float(p_pval),
-        "spearman_rho": float(s_corr),
-        "spearman_pval": float(s_pval),
-        "mse": mse,
-        "rmse": rmse,
-        "r2": r2,
-    }
+    return {"loss": float(avg_loss), **regression_metrics(y_true, y_pred)}
 
 
-def plot_and_save_training_curves(history: list, output_file: Path, num_tracks: int = None):
+LOSS_DISPLAY_NAMES = {"huber": "Huber", "mse": "MSE", "smooth_l1": "Smooth L1"}
+
+
+def plot_and_save_training_curves(history: list, output_file: Path, num_tracks: int = None, loss_fn_name: str = "huber"):
     """
     Plots training & validation loss, Pearson r, Spearman rho, and MSE/RMSE across epochs.
+    The loss curves are labelled with the loss function actually used for training (loss_fn_name).
     """
+    loss_label = LOSS_DISPLAY_NAMES.get(loss_fn_name, loss_fn_name)
     epochs = [h["epoch"] for h in history]
     train_loss = [h["train_loss"] for h in history]
     val_loss = [h["val_metrics"]["loss"] for h in history]
@@ -288,11 +286,11 @@ def plot_and_save_training_curves(history: list, output_file: Path, num_tracks: 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
     # 1. Loss curves
-    axes[0, 0].plot(epochs, train_loss, label="Train Loss (MSE)", color="#1f77b4", lw=2, marker="o", markersize=4)
-    axes[0, 0].plot(epochs, val_loss, label="Val Loss (MSE)", color="#ff7f0e", lw=2, linestyle="--", marker="s", markersize=4)
-    axes[0, 0].set_title("Training & Validation Loss", fontsize=13, fontweight="bold")
+    axes[0, 0].plot(epochs, train_loss, label=f"Train Loss ({loss_label})", color="#1f77b4", lw=2, marker="o", markersize=4)
+    axes[0, 0].plot(epochs, val_loss, label=f"Val Loss ({loss_label})", color="#ff7f0e", lw=2, linestyle="--", marker="s", markersize=4)
+    axes[0, 0].set_title(f"Training & Validation Loss ({loss_label})", fontsize=13, fontweight="bold")
     axes[0, 0].set_xlabel("Epoch", fontsize=11)
-    axes[0, 0].set_ylabel("Loss", fontsize=11)
+    axes[0, 0].set_ylabel(f"{loss_label} Loss", fontsize=11)
     axes[0, 0].grid(True, alpha=0.3)
     axes[0, 0].legend(fontsize=11)
 
@@ -478,15 +476,8 @@ def compute_channel_ablation(
                 all_preds.extend(preds.detach().cpu().float().numpy())
                 all_targets.extend(targets.detach().cpu().float().numpy())
 
-        y_true = np.array(all_targets)
-        y_pred = np.array(all_preds)
-        valid_mask = ~np.isnan(y_pred) & ~np.isnan(y_true)
-        if valid_mask.sum() > 2:
-            p_corr, _ = pearsonr(y_true[valid_mask], y_pred[valid_mask])
-            s_corr, _ = spearmanr(y_true[valid_mask], y_pred[valid_mask])
-        else:
-            p_corr, s_corr = 0.0, 0.0
-        mse = float(mean_squared_error(y_true, y_pred))
+        ablated = regression_metrics(np.array(all_targets), np.array(all_preds))
+        p_corr, s_corr, mse = ablated["pearson_r"], ablated["spearman_rho"], ablated["mse"]
 
         drop_r = float(baseline_r - p_corr)
         drop_rho = float(baseline_rho - s_corr)
@@ -848,6 +839,27 @@ def run_xai_analysis(
 # 5. Core Training Loop
 # =============================================================================
 
+def verify_remote_code_export(backbone_dir: Path):
+    """Fails if a module referenced in config.json 'auto_map' is missing as .py file in the exported backbone."""
+    cfg_file = backbone_dir / "config.json"
+    if not cfg_file.exists():
+        raise FileNotFoundError(f"[Error] Exported backbone has no config.json: {backbone_dir}")
+    with open(cfg_file, "r") as f_cfg:
+        auto_map = json.load(f_cfg).get("auto_map", {})
+
+    refs = []
+    for ref in auto_map.values():
+        refs.extend(ref if isinstance(ref, (list, tuple)) else [ref])
+    # References look like 'module.Class' or 'repo_id--module.Class'
+    modules = {str(r).split("--")[-1].rsplit(".", 1)[0] for r in refs if r}
+    missing = sorted(m for m in modules if not (backbone_dir / f"{m}.py").exists())
+    if missing:
+        raise FileNotFoundError(
+            f"[Error] Exported backbone {backbone_dir} is missing remote code module(s) {missing} referenced in auto_map! "
+            f"The checkpoint could not be loaded with trust_remote_code."
+        )
+
+
 def train_model(
     model: nn.Module,
     train_loader: DataLoader,
@@ -858,12 +870,11 @@ def train_model(
     lr_backbone: float,
     lr_embedding: float,
     lr_head: float,
-    weight_decay: float,
     warmup_epochs: int,
     output_dir: Path,
     channel_names: list,
     channel_colors: list,
-    resume: bool = True,
+    resume: bool = False,
     loss_fn_name: str = "huber",
     max_grad_norm: float = 1.0,
     compute_xai: bool = True,
@@ -906,10 +917,12 @@ def train_model(
 
     head_params = [p for p in model.head.parameters() if p.requires_grad]
 
+    # No weight decay, as in the original Orthrus fine-tuning configs ('no_wd' in orthrus/finetune_config/optimizer.yaml).
+    # Must be set explicitly: AdamW defaults to weight_decay=0.01.
     param_groups = [
-        {"params": backbone_params, "lr": lr_backbone, "weight_decay": weight_decay},
-        {"params": embedding_params, "lr": lr_embedding if lr_embedding is not None else lr_backbone, "weight_decay": weight_decay},
-        {"params": head_params, "lr": lr_head, "weight_decay": weight_decay},
+        {"params": backbone_params, "lr": lr_backbone, "weight_decay": 0.0},
+        {"params": embedding_params, "lr": lr_embedding if lr_embedding is not None else lr_backbone, "weight_decay": 0.0},
+        {"params": head_params, "lr": lr_head, "weight_decay": 0.0},
     ]
 
     optimizer = torch.optim.AdamW(param_groups)
@@ -945,6 +958,9 @@ def train_model(
         ckpt = torch.load(latest_ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        # load_state_dict restores the stored hyperparameters; older checkpoints still carry weight_decay=0.01
+        for group in optimizer.param_groups:
+            group["weight_decay"] = 0.0
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         if use_scaler and "scaler_state_dict" in ckpt:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
@@ -1097,16 +1113,15 @@ def train_model(
                 except Exception:
                     pass
 
-            # Copy remote code files (*.py) from source checkpoint and related directories
+            # save_pretrained() already exports the remote code (auto_map) of trust_remote_code models.
+            # Fallback: copy missing *.py files from the source checkpoint only (never from output directories).
             import shutil
             if source_checkpoint and Path(source_checkpoint).is_dir():
                 for py_file in Path(source_checkpoint).glob("*.py"):
-                    shutil.copy2(py_file, best_backbone_dir / py_file.name)
-            for candidate_dir in [output_dir, output_dir.parent, Path(output_dir.parent).parent]:
-                for py_file in candidate_dir.glob("*.py"):
                     dst_file = best_backbone_dir / py_file.name
                     if not dst_file.exists():
                         shutil.copy2(py_file, dst_file)
+            verify_remote_code_export(best_backbone_dir)
 
         # 2. Save Automatic Resume Checkpoint (latest_checkpoint.pt)
         torch.save({
@@ -1129,7 +1144,7 @@ def train_model(
 
         # 3. Update Plots and CSV logs incrementally
         try:
-            plot_and_save_training_curves(history, curves_path, num_tracks=num_channels)
+            plot_and_save_training_curves(history, curves_path, num_tracks=num_channels, loss_fn_name=loss_fn_name)
             save_csv_log(history, csv_log_path)
         except Exception as e:
             print(f"[Warning] Could not update loss curves/CSV: {e}")
@@ -1208,17 +1223,6 @@ def train_model(
 # 6. Main Pipeline
 # =============================================================================
 
-SPLITS_LOOKUP_HIPSC_CM = Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hipsc_cm_10folds_lookup.csv")
-SPLITS_LOOKUP_RNAHL_HUMAN = Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/rnahl-human_10folds_lookup.csv")
-SPLITS_LOOKUP_RNAHL_MOUSE = Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/rnahl-mouse_10folds_lookup.csv")
-
-SPLITS_LOOKUP_TABLES = {
-    "hipsc_cm": SPLITS_LOOKUP_HIPSC_CM,
-    "mrna_bench_human": SPLITS_LOOKUP_RNAHL_HUMAN,
-    "mrna_bench_mouse": SPLITS_LOOKUP_RNAHL_MOUSE,
-}
-
-
 def main():
     parser = argparse.ArgumentParser(description="Supervised Fine-Tuning of Arbitrary N-Track Orthrus Model")
 
@@ -1227,7 +1231,7 @@ def main():
         "--data_path",
         type=str,
         required=True,
-        help="Path to dataset file (.npz archive or .tsv/.txt with Saluki tokens)",
+        help="Path to precomputed N-track .npz archive (companion .meta.json required)",
     )
     parser.add_argument(
         "--model_checkpoint",
@@ -1242,12 +1246,6 @@ def main():
         default="all",
         choices=["all", "0", "1", "2", "3"],
         help="Which fold to train: '0', '1', '2', '3', or 'all' to train all 4 folds. (Default: all)",
-    )
-    parser.add_argument(
-        "--target_col",
-        type=str,
-        default="target",
-        help="Target column in NPZ archive or TSV file (default: target)",
     )
     parser.add_argument(
         "--epochs",
@@ -1280,12 +1278,6 @@ def main():
         help="Learning rate for regression head (default: 3e-4)",
     )
     parser.add_argument(
-        "--weight_decay",
-        type=float,
-        default=1e-2,
-        help="Weight decay for AdamW (default: 0.01)",
-    )
-    parser.add_argument(
         "--warmup_epochs",
         type=int,
         default=3,
@@ -1301,13 +1293,14 @@ def main():
         "--max_length",
         type=int,
         default=12288,
-        help="Maximum sequence length (default: 12288)",
+        help="Maximum sequence length; longer transcripts keep their 3' end (default: 12288)",
     )
     parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Automatically resume training from latest_checkpoint.pt if it exists in output_dir (default: True)",
+        default=False,
+        help="Resume training from latest_checkpoint.pt if it exists in output_dir (default: False; "
+             "without --resume an existing run in output_dir is overwritten)",
     )
     parser.add_argument(
         "--loss_fn",
@@ -1363,33 +1356,22 @@ def main():
     meta = load_metadata(data_file, required=True)
 
     # Strictly extract fields from meta.json - no fallbacks!
-    if "dataset" not in meta:
-        raise KeyError(f"[Error] Required metadata key 'dataset' not found in companion metadata for {data_file}!")
-    dataset_name = str(meta["dataset"]).strip()
-
-    if "track_name" not in meta:
-        raise KeyError(f"[Error] Required metadata key 'track_name' not found in companion metadata for {data_file}!")
+    require_meta(meta, data_file, "dataset", "track_name", "channel_names")
+    dataset_name = resolve_dataset_key(meta["dataset"])
     track_name = str(meta["track_name"]).strip()
-
-    if "channel_names" not in meta:
-        raise KeyError(f"[Error] Required metadata key 'channel_names' not found in companion metadata for {data_file}!")
     channel_names = [str(x) for x in meta["channel_names"]]
     num_channels = len(channel_names)
     if num_channels == 0:
         raise ValueError(f"[Error] 'channel_names' in metadata for {data_file} is empty!")
 
     normalization = str(meta.get("normalization", "none")).strip().lower()
+    require_truncation_mode(meta, data_file)
 
     # Automatically determine output directory based on metadata
-    base_checkpoints_dir = (
-        Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus")
-        if Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code").exists()
-        else Path(__file__).resolve().parent.parent / "checkpoints" / "orthrus"
-    )
     if normalization and normalization != "none":
-        output_dir = base_checkpoints_dir / dataset_name / track_name / normalization
+        output_dir = CHECKPOINTS_DIR / dataset_name / track_name / normalization
     else:
-        output_dir = base_checkpoints_dir / dataset_name / track_name
+        output_dir = CHECKPOINTS_DIR / dataset_name / track_name
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"[Output Directory] Auto-resolved checkpoint output directory: {output_dir}")
 
@@ -1399,9 +1381,10 @@ def main():
             raise KeyError(f"[Error] Key 'tracks' not found in NPZ archive {data_file}! Available: {list(npz_data.files)}")
         tracks = list(npz_data["tracks"])
 
-        if args.target_col not in npz_data:
-            raise KeyError(f"[Error] Target column '{args.target_col}' not found in {data_file}! Available: {list(npz_data.files)}")
-        targets = npz_data[args.target_col].astype(np.float32)
+        # Always train on 'target' (identical to extract_embeddings.py / train_ridge_regression.py)
+        if "target" not in npz_data:
+            raise KeyError(f"[Error] Required field 'target' not found in {data_file}! Available: {list(npz_data.files)}")
+        targets = npz_data["target"].astype(np.float32)
 
         if "gene" not in npz_data:
             raise KeyError(f"[Error] 'gene' not found in dataset {data_file}! Available: {list(npz_data.files)}")
@@ -1449,40 +1432,11 @@ def main():
     print(f"Unique genes:              {len(np.unique(genes))}")
     print(f"Configured tracks (N):     {num_channels}")
     print(f"Channel names:             {channel_names}")
-    print(f"Target column:             {args.target_col}")
 
     # 2. Standardized 10-Fold Lookup Table Verification & Splitting
-    if dataset_name in SPLITS_LOOKUP_TABLES.keys():
-        lookup_path = SPLITS_LOOKUP_TABLES[dataset_name]
-    else:
-        raise ValueError(f"[Error] Unrecognized dataset '{dataset_name}'. Unable to determine standardized splits lookup table. Expected dataset matching {list(SPLITS_LOOKUP_TABLES.keys())}.")
-    if not lookup_path.exists():
-        raise FileNotFoundError(
-            f"[Error] Standardized splits lookup table not found at: {lookup_path}! "
-            f"A valid lookup table is strictly required."
-        )
-
-    print(f"\nUsing Standardized 10-Fold Lookup Table ({dataset_name}): {lookup_path}")
-    lookup_df = pd.read_csv(lookup_path)
-
-    if "ensembl_transcript_id" not in lookup_df.columns:
-        raise KeyError(f"[Error] 'ensembl_transcript_id' column not found in lookup table {lookup_path}. Columns: {list(lookup_df.columns)}")
-    if "split" not in lookup_df.columns:
-        raise KeyError(f"[Error] 'split' column not found in lookup table {lookup_path}. Columns: {list(lookup_df.columns)}")
-
-    available_splits = set(lookup_df["split"].dropna().astype(int).unique())
-    expected_splits = set(range(10))
-    missing_splits = expected_splits - available_splits
-    if missing_splits:
-        raise ValueError(
-            f"[Error] Missing folds in lookup table {lookup_path}! Expected all 10 splits (0-9), but missing: {sorted(missing_splits)}."
-        )
-
-    tx_to_split = dict(zip(lookup_df["ensembl_transcript_id"].astype(str).str.strip(), lookup_df["split"].astype(int)))
-    sample_splits = np.array([tx_to_split.get(str(t).strip(), -1) for t in tx_ids])
-    unmatched_count = int(np.sum(sample_splits == -1))
-    if unmatched_count > 0:
-        print(f"[Warning] {unmatched_count} transcripts not found in lookup table! Filtering them out.")
+    sample_splits = assign_splits(dataset_name, tx_ids)
+    if np.any(sample_splits == -1):
+        print("[Warning] Filtering out transcripts without split assignment.")
         matched_mask = (sample_splits != -1)
         tracks = [t for i, t in enumerate(tracks) if matched_mask[i]]
         targets = targets[matched_mask]
@@ -1490,38 +1444,31 @@ def main():
         tx_ids = tx_ids[matched_mask]
         sample_splits = sample_splits[matched_mask]
 
-    cv_fold_definitions = {
-        0: {"name": "Fold 0", "train": [0, 1, 2, 3, 4, 5], "val": [6, 7], "test": [8, 9]},
-        1: {"name": "Fold 1", "train": [2, 3, 4, 5, 6, 7], "val": [0, 1], "test": [8, 9]},
-        2: {"name": "Fold 2", "train": [0, 1, 4, 5, 6, 7], "val": [2, 3], "test": [8, 9]},
-        3: {"name": "Fold 3", "train": [0, 1, 2, 3, 6, 7], "val": [4, 5], "test": [8, 9]},
-    }
-
-    folds_to_run = [0, 1, 2, 3] if args.fold == "all" else [int(args.fold)]
+    folds_to_run = list(CV_FOLDS) if args.fold == "all" else [int(args.fold)]
     all_fold_summaries = {}
 
     for fold_id in folds_to_run:
-        fold_def = cv_fold_definitions[fold_id]
+        fold_def = CV_FOLDS[fold_id]
         fold_output_dir = output_dir / f"fold_{fold_id}"
         fold_output_dir.mkdir(parents=True, exist_ok=True)
 
         train_idx = np.where(np.isin(sample_splits, fold_def["train"]))[0]
         val_idx = np.where(np.isin(sample_splits, fold_def["val"]))[0]
-        test_idx = np.where(np.isin(sample_splits, fold_def["test"]))[0]
+        test_idx = np.where(np.isin(sample_splits, TEST_SPLITS))[0]
 
         if len(train_idx) == 0:
             raise ValueError(f"[Error] Fold {fold_id} has 0 training samples! Train splits: {fold_def['train']}")
         if len(val_idx) == 0:
             raise ValueError(f"[Error] Fold {fold_id} has 0 validation samples! Val splits: {fold_def['val']}")
         if len(test_idx) == 0:
-            raise ValueError(f"[Error] Fold {fold_id} has 0 test samples! Test splits: {fold_def['test']}")
+            raise ValueError(f"[Error] Fold {fold_id} has 0 test samples! Test splits: {TEST_SPLITS}")
 
         print("\n" + "=" * 70)
-        print(f"       STARTING {num_channels}-TRACK FINE-TUNING: {fold_def['name'].upper()}")
+        print(f"       STARTING {num_channels}-TRACK FINE-TUNING: FOLD {fold_id}")
         print("=" * 70)
         print(f"  Train (Splits {fold_def['train']}): {len(train_idx)} samples ({len(np.unique(genes[train_idx]))} genes, {len(train_idx)/len(targets)*100:.1f}%)")
         print(f"  Val   (Splits {fold_def['val']}):   {len(val_idx)} samples ({len(np.unique(genes[val_idx]))} genes, {len(val_idx)/len(targets)*100:.1f}%)")
-        print(f"  Test  (Splits {fold_def['test']}):  {len(test_idx)} samples ({len(np.unique(genes[test_idx]))} genes, {len(test_idx)/len(targets)*100:.1f}%)")
+        print(f"  Test  (Splits {TEST_SPLITS}):  {len(test_idx)} samples ({len(np.unique(genes[test_idx]))} genes, {len(test_idx)/len(targets)*100:.1f}%)")
         print(f"  Output Directory: {fold_output_dir}")
 
         train_ds = MultiTrackDataset([tracks[i] for i in train_idx], targets[train_idx], genes[train_idx], tx_ids[train_idx], args.max_length)
@@ -1577,7 +1524,6 @@ def main():
             lr_backbone=args.lr_backbone,
             lr_embedding=args.lr_embedding,
             lr_head=args.lr_head,
-            weight_decay=args.weight_decay,
             warmup_epochs=args.warmup_epochs,
             output_dir=fold_output_dir,
             channel_names=channel_names,

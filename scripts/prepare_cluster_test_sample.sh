@@ -2,10 +2,10 @@
 # =============================================================================
 # Helper script to prepare a compact test dataset (20 transcripts) on the Cluster
 # for ALL 4 track generation scripts:
-#   - generate_6track.py
-#   - generate_m6a_tracks.py (7-track m6A)
-#   - generate_2_rbp_tracks.py (8-track RBP Stabilizer/Destabilizer)
-#   - generate_miRNA_rbp_tracks.py (8-track miRNA & eCLIP)
+#   - generate_tracks.py --track 6track
+#   - generate_tracks.py --track 7track_m6a (7-track m6A)
+#   - generate_tracks.py --track 8track_2rbp (8-track RBP Stabilizer/Destabilizer)
+#   - generate_tracks.py --track 8track_miRNA_rbp (8-track miRNA & eCLIP)
 #
 # Usage (run directly on the Slurm cluster):
 #   bash /beegfs/prj/RNA_NLP/FlorianMasterThesis/code/Orthrus/scripts/prepare_cluster_test_sample.sh
@@ -85,7 +85,7 @@ if [ -d "$MRNA_BENCH_SRC" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# 3. Extract Validated m6A Sites (for generate_m6a_tracks.py)
+# 3. Extract Validated m6A Sites (for generate_tracks.py --track 7track_m6a)
 # -----------------------------------------------------------------------------
 echo "[3/7] Extracting m6A records (validated_m6a_sites.tsv)..."
 M6A_SRC="$CLUSTER_BASE/data/m6a/validated_m6a_sites.tsv"
@@ -99,7 +99,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 4. Extract RBP Peaks (for generate_2_rbp_tracks.py)
+# 4. Extract RBP Peaks (for generate_tracks.py --track 8track_2rbp)
 # -----------------------------------------------------------------------------
 echo "[4/7] Copying RBP Stabilizers & Destabilizers BED files..."
 STAB_SRC="$CLUSTER_BASE/data/eclip/curated_candidates/stabilizers_peaks.bed"
@@ -118,7 +118,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 5. Extract miRNA & Merged eCLIP (for generate_miRNA_rbp_tracks.py)
+# 5. Extract miRNA & Merged eCLIP (for generate_tracks.py --track 8track_miRNA_rbp)
 # -----------------------------------------------------------------------------
 echo "[5/7] Extracting TargetScan and merged eCLIP records..."
 TS_SRC="$CLUSTER_BASE/data/targetscan/Predicted_Targets_Context_Scores.default_predictions.txt"

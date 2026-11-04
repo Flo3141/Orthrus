@@ -21,11 +21,10 @@ Features:
       * 'effect_size': Drop in modification rate under METTL3 inhibitor (METTL3 dependency)
       * 'a_pct_modified': Baseline DMR modification frequency in Control
       * 'binary': Discrete flag (1.0 at validated m6A site, 0.0 elsewhere)
-  - Flexible normalization methods:
-      * 'unit': Scales 0-100% modification rate directly to [0.0, 1.0]
-      * 'binary': Binary indicator [0.0, 1.0]
+  - Normalization methods (identical to the other trans-factor track generators):
+      * 'minmax': Log-transformation with robust quantile scaling to [0.0, 1.0] using dynamically estimated q99,
+                  i.e. min(1, log1p(x) / log1p(q99)) (not classic min-max scaling; name kept for compatibility)
       * 'log': np.log1p(score)
-      * 'minmax': Robust quantile scaling to [0.0, 1.0] using dynamically estimated q99
       * 'none': Raw values without scaling
   - Incremental chunk saving and automatic resume (avoids loss of progress on cluster preemptions)
   - Automatic merge into final NPZ file with complete metadata for Orthrus training
@@ -42,7 +41,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from six_track_dataset import SixTrackDatasetLoader
-from util import save_metadata
+from util import save_metadata, ensure_run_config, to_object_array, RUN_CONFIG_FILENAME, TRUNCATION_MODE, truncate_to_max_length, DATA_DIR, DATASET_DIRS
 
 DEFAULT_CHANNEL_NAMES = ["A", "C", "G", "U", "CDS", "Splice", "m6A"]
 
@@ -50,9 +49,14 @@ DEFAULT_CHANNEL_NAMES = ["A", "C", "G", "U", "CDS", "Splice", "m6A"]
 # =============================================================================
 # Fixed Reference File Paths (Cluster Constants)
 # =============================================================================
-VALIDATED_M6A_PATH = Path(
-    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/m6a/validated_m6a_sites.tsv"
-)
+VALIDATED_M6A_PATH = DATA_DIR / "m6a" / "validated_m6a_sites.tsv"
+
+# cDNAstart/cDNAend in validated_m6a_sites.tsv are 1-based and inclusive (cDNAstart == cDNAend for single sites).
+# Part of the run configuration to prevent resuming from chunks built with the former 0-based interpretation.
+CDNA_COORDINATE_CONVENTION = "1-based-inclusive"
+
+# Minimum fraction of mapped m6A sites that must fall on an 'A' in the transcript sequence
+MIN_A_BASE_FRACTION = 0.95
 
 
 # =============================================================================
@@ -220,24 +224,15 @@ def normalize_m6a_track(
 
     Methods:
       - 'none': Keep raw values unchanged
-      - 'unit': Scales 0-100% modification rate directly to [0.0, 1.0] (divided by 100.0)
-      - 'binary': Discretizes to binary flags (1.0 for positive, 0.0 otherwise)
       - 'log': np.log1p(x) -> log(1 + x)
-      - 'minmax': Log-transformation with Robust Quantile Scaling:
+      - 'minmax': Log-transformation with Robust Quantile Scaling to [0, 1]:
                   x_scaled = min(1.0, log(1 + x) / log(1 + q99))
+                  (not classic min-max scaling; name kept for compatibility with existing outputs)
     """
     m6a_track = np.maximum(0.0, m6a_track)
 
     if norm_method == "none":
         return m6a_track
-
-    if norm_method == "unit":
-        # Score is typically 0-100% from modkit/Bambu
-        max_val = max(100.0, float(np.max(m6a_track))) if np.any(m6a_track > 1.0) else 1.0
-        return np.clip(m6a_track / max_val, 0.0, 1.0)
-
-    if norm_method == "binary":
-        return (m6a_track > 0.0).astype(np.float32)
 
     if norm_method == "log":
         return np.log1p(m6a_track)
@@ -250,7 +245,7 @@ def normalize_m6a_track(
 
     raise ValueError(
         f"Unknown normalization method: '{norm_method}'. "
-        "(Allowed: 'none', 'unit', 'binary', 'log', 'minmax')"
+        "(Allowed: 'none', 'log', 'minmax')"
     )
 
 
@@ -278,7 +273,7 @@ def save_chunk(
 
     np.savez_compressed(
         chunk_file,
-        tracks=np.array([item["track"] for item in chunk_items], dtype=object),
+        tracks=to_object_array(item["track"] for item in chunk_items),
         target=target_arr,
         target_raw=target_raw_arr,
         ensembl_transcript_id=tx_arr,
@@ -340,7 +335,7 @@ def merge_all_chunks(
 
     np.savez_compressed(
         output_file,
-        tracks=np.array(all_tracks, dtype=object),
+        tracks=to_object_array(all_tracks),
         target=np.array(targets, dtype=np.float32),
         target_raw=np.array(targets_raw, dtype=np.float32),
         ensembl_transcript_id=np.array(tx_ids),
@@ -372,6 +367,7 @@ def merge_all_chunks(
         "num_channels": 7,
         "channel_names": list(DEFAULT_CHANNEL_NAMES),
         "max_length": int(max_length),
+        "truncation": TRUNCATION_MODE,
         "total_transcripts": int(n_total),
         "unique_genes": int(len(set(genes))),
         "seq_len_min": int(min(lens)) if lens else 0,
@@ -384,6 +380,7 @@ def merge_all_chunks(
             "normalization": str(normalization),
             "m6a_q99": float(m6a_q99) if (m6a_q99 is not None and not np.isnan(m6a_q99)) else None,
             "filter_drach": bool(filter_drach),
+            "cdna_coordinate_convention": CDNA_COORDINATE_CONVENTION,
             "transcripts_with_m6a": int(n_with_m6a),
             "total_m6a_sites": int(total_sites),
         },
@@ -444,8 +441,8 @@ def parse_args():
         "--normalization",
         type=str,
         required=True,
-        choices=["unit", "minmax", "binary", "log", "none"],
-        help="Normalization method for m6A track (channel 6): 'unit', 'minmax', 'binary', 'log', 'none' (required)",
+        choices=["minmax", "log", "none"],
+        help="Normalization method for m6A track (channel 6): 'minmax', 'log', 'none' (required)",
     )
     parser.add_argument(
         "--m6a_q99",
@@ -469,7 +466,7 @@ def parse_args():
         "--max_length",
         type=int,
         default=12288,
-        help="Maximum sequence length for Orthrus (default: 12288 bp)",
+        help="Maximum sequence length; longer transcripts keep their 3' end (default: 12288)",
     )
     parser.add_argument(
         "--filter_drach",
@@ -490,18 +487,20 @@ def main():
     if args.dataset == "mrna_bench" and not args.species:
         raise ValueError("--species ('human' or 'mouse') must be specified when --dataset is 'mrna_bench'!")
 
+    # The validated m6A sites refer to human transcripts (ENST IDs, cDNA coordinates)
+    if args.species == "mouse":
+        raise ValueError(
+            "[Error] generate_m6a_tracks.py supports only human data: the validated m6A sites refer to human "
+            "transcripts. Use --species human or the 6-track archive for mouse."
+        )
+
     norm_method = args.normalization.lower()
 
     dataset_key = f"{args.dataset}_{args.species}" if args.species else args.dataset
-    dataset_dirs = {
-        "hipsc_cm": Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/7track_m6a"),
-        "mrna_bench_human": Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus/7track_m6a"),
-        "mrna_bench_mouse": Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus/7track_m6a"),
-    }
-    if dataset_key not in dataset_dirs:
-        raise ValueError(f"[Error] Unknown dataset key '{dataset_key}'! Supported: {list(dataset_dirs.keys())}")
+    if dataset_key not in DATASET_DIRS:
+        raise ValueError(f"[Error] Unknown dataset key '{dataset_key}'! Supported: {list(DATASET_DIRS.keys())}")
 
-    data_dir = dataset_dirs[dataset_key]
+    data_dir = DATASET_DIRS[dataset_key] / "orthrus" / "7track_m6a"
     dataset_name = dataset_key
     norm_suffix = f"_{norm_method}" if norm_method != "none" else ""
     file_stem = f"hipsc_cm_7track_m6a{norm_suffix}" if args.dataset == "hipsc_cm" else f"mrna_bench_{args.species}_7track_m6a{norm_suffix}"
@@ -535,7 +534,30 @@ def main():
             except Exception as e:
                 print(f"[Warning] Could not delete {cf.name}: {e}")
         existing_chunks = []
-    else:
+        (chunks_dir / RUN_CONFIG_FILENAME).unlink(missing_ok=True)
+
+    # Existing chunks may only be resumed if they were generated with identical parameters.
+    # Chunks from before the cDNA coordinate fix have no run_config.json and are rejected.
+    ensure_run_config(
+        chunks_dir,
+        {
+            "script": Path(__file__).name,
+            "dataset": dataset_key,
+            "score_col": args.score_col,
+            "normalization": norm_method,
+            "m6a_q99": args.m6a_q99,
+            "quantile": args.quantile,
+            "filter_drach": args.filter_drach,
+            "max_length": args.max_length,
+            "truncation": TRUNCATION_MODE,
+            "m6a_file": VALIDATED_M6A_PATH,
+            "cdna_coordinate_convention": CDNA_COORDINATE_CONVENTION,
+        },
+        has_existing_state=bool(existing_chunks),
+        reset_hint="Please rerun with --recreate.",
+    )
+
+    if not args.recreate:
         for cf in existing_chunks:
             try:
                 c_data = np.load(cf, allow_pickle=True)
@@ -591,6 +613,8 @@ def main():
     # 4. Process transcripts (exclusively cDNA mapping)
     chunk_idx = len(existing_chunks)
     current_chunk_items = []
+    n_sites_mapped = 0
+    n_sites_on_a = 0
 
     print("\nProcessing transcripts into 7-track arrays (cDNA mapping)...")
     with tqdm(total=total_transcripts, desc="Progress", initial=len(completed_tx_ids)) as pbar:
@@ -602,30 +626,33 @@ def main():
                 continue
 
             six_track = row["track"]
+            sequence = str(row["sequence"]).upper()
             l = int(row["length"])
-            if l > args.max_length:
-                six_track = six_track[:args.max_length, :]
-                l = args.max_length
+            # All channels are built on the full transcript and truncated together after concatenation
 
             # Channel 6: m6A track via cDNA coordinates
             m6a_1d = np.zeros(l, dtype=np.float32)
             has_m6a = False
             num_sites = 0
+            site_starts = []
 
             # Direct cDNA mapping
             sites = cdna_lookup.get(tx_id) or cdna_lookup.get(clean_tx)
             if sites:
                 for s in sites:
-                    c_start = s["cDNAstart"]
+                    # 1-based inclusive [cDNAstart, cDNAend] -> 0-based half-open [c_start, c_end)
+                    c_start = s["cDNAstart"] - 1
                     c_end = s["cDNAend"]
                     score_val = s["score"]
 
                     if 0 <= c_start < l:
-                        # 0-based half-open interval [c_start, c_end)
                         end_pos = min(l, max(c_start + 1, c_end))
                         m6a_1d[c_start:end_pos] = np.maximum(m6a_1d[c_start:end_pos], score_val)
                         has_m6a = True
                         num_sites += 1
+                        site_starts.append(c_start)
+                        n_sites_mapped += 1
+                        n_sites_on_a += int(sequence[c_start] == "A")
 
             # Apply normalization to channel 6
             m6a_norm = normalize_m6a_track(
@@ -637,6 +664,14 @@ def main():
             # Concatenate to (L, 7)
             m6a_channel = m6a_norm.reshape(-1, 1)
             multi_track = np.concatenate([six_track, m6a_channel], axis=1)
+
+            if l > args.max_length:
+                offset = l - args.max_length  # 5' positions removed by truncation
+                multi_track = truncate_to_max_length(multi_track, args.max_length)  # keeps the 3' end
+                l = args.max_length
+                m6a_1d = m6a_1d[offset:]
+                num_sites = sum(1 for c in site_starts if c >= offset)
+                has_m6a = num_sites > 0
 
             mean_score_val = float(np.mean(m6a_1d[m6a_1d > 0])) if has_m6a else 0.0
 
@@ -683,6 +718,16 @@ def main():
                 normalization=norm_method,
                 score_column=args.score_col,
                 m6a_q99=m6a_q99,
+            )
+
+    # Sanity check: m6A sites must fall on adenosines, otherwise the coordinates are shifted
+    if n_sites_mapped > 0:
+        a_fraction = n_sites_on_a / n_sites_mapped
+        print(f"[Sanity Check] {n_sites_on_a:,} of {n_sites_mapped:,} mapped m6A sites fall on 'A' ({a_fraction * 100:.2f} %).")
+        if a_fraction < MIN_A_BASE_FRACTION:
+            raise RuntimeError(
+                f"[Error] Only {a_fraction * 100:.2f} % of mapped m6A sites fall on 'A' "
+                f"(expected >= {MIN_A_BASE_FRACTION * 100:.0f} %)! cDNA coordinates do not match the transcript sequences."
             )
 
     # 5. Merge all chunks into final NPZ archive

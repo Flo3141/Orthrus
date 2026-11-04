@@ -25,6 +25,8 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+from util import DATASET_DIRS
+
 
 # Standard genetic code for CDS translation
 GENETIC_CODE = {
@@ -325,12 +327,8 @@ class SixTrackDatasetLoader:
     """
 
     # Default Cluster Paths
-    HIPSC_CM_DEFAULT_PATH = Path(
-        "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hIPSC_CM_ej_cds_transformed.txt"
-    )
-    MRNA_BENCH_DEFAULT_DIR = Path(
-        "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench"
-    )
+    HIPSC_CM_DEFAULT_PATH = DATASET_DIRS["hipsc_cm"] / "hIPSC_CM_ej_cds_transformed.txt"
+    MRNA_BENCH_DEFAULT_DIR = DATASET_DIRS["mrna_bench_human"]
 
     def __init__(
         self,

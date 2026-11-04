@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoConfig
 
-from util import reset_peak_memory_stats, print_memory_profile
+from util import reset_peak_memory_stats, print_memory_profile, CHECKPOINTS_DIR
 
 
 def convert_6track_to_ntrack(
@@ -205,7 +205,7 @@ def main():
         "--output_dir",
         type=str,
         default=None,
-        help="Destination path to save the converted checkpoint (default: /beegfs/.../orthrus-large-{n_target_tracks}-track)",
+        help="Destination path to save the converted checkpoint (default: $ORTHRUS_BASE/checkpoints/orthrus/orthrus-large-{n_target_tracks}-track)",
     )
     parser.add_argument(
         "--init_method",
@@ -230,7 +230,7 @@ def main():
 
     # Determine default output_dir based on n_target_tracks if not explicitly set
     if args.output_dir is None:
-        args.output_dir = f"/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/checkpoints/orthrus/orthrus-large-{args.n_target_tracks}-track"
+        args.output_dir = str(CHECKPOINTS_DIR / f"orthrus-large-{args.n_target_tracks}-track")
 
     convert_6track_to_ntrack(
         base_model_name=args.base_model,

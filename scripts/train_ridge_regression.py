@@ -4,31 +4,30 @@ Unified Ridge Regression Training & Evaluation Pipeline on Extracted Orthrus Emb
 
 Features:
 - Unifies hIPSC_CM and mRNABench (Human & Mouse) into a single, standardized pipeline.
-- Automatically infers the correct standardized 10-fold lookup table from NPZ 'dataset' metadata.
-- Custom 4-fold Cross-Validation over training splits [0..7] with RidgeCV:
-    Fold 0: Train [0, 1, 2, 3, 4, 5], Val [6, 7]
-    Fold 1: Train [2, 3, 4, 5, 6, 7], Val [0, 1]
-    Fold 2: Train [0, 1, 4, 5, 6, 7], Val [2, 3]
-    Fold 3: Train [0, 1, 2, 3, 6, 7], Val [4, 5]
-- Strictly held-out Test Set on splits [8, 9] (unseen during training and CV).
-- Automatically calculates and logs metrics for raw targets (target_raw / half-life in hours) if available.
+- Automatically infers the correct standardized 10-fold lookup table from the 'dataset' field of the
+  track metadata (.meta.json) referenced by the embeddings archive ('source_tracks_meta').
+- Custom 4-fold Cross-Validation over training splits [0..7] with GridSearchCV (fold scheme: util.CV_FOLDS).
+- Strictly held-out Test Set on splits [8, 9] (util.TEST_SPLITS, unseen during training and CV).
+- Calculates raw-scale metrics (target_raw / half-life in hours) on back-transformed predictions
+  if target_raw and the target transformation parameters (log + z-score) are available.
 - Saves trained model (.joblib), detailed predictions table (.csv), metrics (.json), and optional publication plots (.png).
 """
 
 import argparse
-from datetime import datetime
 import json
 from pathlib import Path
+from typing import Optional
 import joblib
 import numpy as np
 import pandas as pd
-from scipy.stats import pearsonr, spearmanr
-from sklearn.linear_model import Ridge, RidgeCV
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import GridSearchCV, cross_val_predict
 
-from typing import Optional, Tuple, Dict, Any, Union
-
-from util import load_metadata, save_metadata, get_meta_filepath
+from util import (
+    load_metadata, SPLITS_LOOKUP_TABLES, resolve_dataset_key,
+    CV_FOLDS, CV_POOL_SPLITS, TEST_SPLITS, DATASET_DIRS, RESULTS_DIR,
+    assign_splits, require_meta, regression_metrics, print_metrics,
+)
 
 # Headless backend for cluster servers without display
 import matplotlib
@@ -36,70 +35,54 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-DEFAULT_BASE_RESULTS_DIR = Path(
-    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/results/Orthrus"
-)
+# Embeddings are deliberately not standardized (same protocol as the mRNABench/Orthrus linear probing).
+ALPHA_GRID = np.logspace(-2, 6, 17)
 
-
-# =============================================================================
-# Standardized Cluster File Paths & Lookup Tables
-# =============================================================================
-
-SPLITS_LOOKUP_HIPSC_CM = Path(
-    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/hipsc_cm_10folds_lookup.csv"
-)
-SPLITS_LOOKUP_RNAHL_HUMAN = Path(
-    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/rnahl-human_10folds_lookup.csv"
-)
-SPLITS_LOOKUP_RNAHL_MOUSE = Path(
-    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/rnahl-mouse_10folds_lookup.csv"
-)
-
-SPLITS_LOOKUP_TABLES = {
-    "hipsc_cm": SPLITS_LOOKUP_HIPSC_CM,
-    "mrna_bench_human": SPLITS_LOOKUP_RNAHL_HUMAN,
-    "mrna_bench_mouse": SPLITS_LOOKUP_RNAHL_MOUSE,
+# Target transformation parameters (written by transform_hIPSC_CM_dataset.py):
+#   target = (ln(target_raw + pseudocount) - mu_log) / sigma_log
+# mRNABench targets (PC1 of half-lives) have no invertible raw-scale counterpart.
+TARGET_TRANSFORM_PARAMS = {
+    "hipsc_cm": DATASET_DIRS["hipsc_cm"] / "transformation_params.json",
 }
 
-DEFAULT_ALPHAS = [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0]
 
+def resolve_target_transform(meta: dict, dataset_key: str) -> Optional[dict]:
+    """
+    Returns the log + z-score parameters of the target transformation, or None if unavailable.
+    Priority: 'target_transform' in track metadata -> dataset-specific transformation_params.json.
+    """
+    params = meta.get("target_transform")
+    if params is None:
+        params_path = TARGET_TRANSFORM_PARAMS.get(dataset_key)
+        if params_path is None or not params_path.is_file():
+            return None
+        with open(params_path, "r", encoding="utf-8") as f:
+            params = json.load(f)
+        print(f"[Target Transform] Loaded parameters from: {params_path}")
 
-# =============================================================================
-# Metrics Calculation
-# =============================================================================
-
-def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray, prefix: str = "") -> dict:
-    """Calculates comprehensive regression metrics and correlation statistics."""
-    p_corr, p_val = pearsonr(y_true, y_pred)
-    s_corr, s_val = spearmanr(y_true, y_pred)
-    mse = mean_squared_error(y_true, y_pred)
-    rmse = float(np.sqrt(mse))
-    mae = mean_absolute_error(y_true, y_pred)
-    r2 = r2_score(y_true, y_pred)
-
-    prefix_str = f"{prefix}_" if prefix else ""
     return {
-        f"{prefix_str}pearson_r": float(p_corr),
-        f"{prefix_str}pearson_pvalue": float(p_val),
-        f"{prefix_str}spearman_rho": float(s_corr),
-        f"{prefix_str}spearman_pvalue": float(s_val),
-        f"{prefix_str}mse": float(mse),
-        f"{prefix_str}rmse": rmse,
-        f"{prefix_str}mae": float(mae),
-        f"{prefix_str}r2": float(r2),
+        "pseudocount": float(params["pseudocount"]),
+        "mu_log": float(params["mu_log"]),
+        "sigma_log": float(params["sigma_log"]),
     }
 
 
-def print_metrics(metrics: dict, title: str):
-    """Formatted console output for metrics."""
-    print(f"\n--- {title} ---")
-    for k, v in metrics.items():
-        if "pvalue" in k:
-            print(f"  {k:28s}: {v:.3e}")
-        else:
-            print(f"  {k:28s}: {v:.4f}")
+def inverse_transform_target(y: np.ndarray, transform: dict) -> np.ndarray:
+    """Maps transformed targets / predictions back to raw half-lives (hours)."""
+    return np.exp(y * transform["sigma_log"] + transform["mu_log"]) - transform["pseudocount"]
 
 
+def verify_target_transform(y: np.ndarray, y_raw: np.ndarray, transform: dict, atol: float = 1e-3):
+    """Fails if the transformation parameters do not reproduce the stored targets from target_raw."""
+    mask = np.isfinite(y) & np.isfinite(y_raw) & (y_raw + transform["pseudocount"] > 0)
+    y_expected = (np.log(y_raw[mask] + transform["pseudocount"]) - transform["mu_log"]) / transform["sigma_log"]
+    max_dev = float(np.max(np.abs(y_expected - y[mask]))) if np.any(mask) else 0.0
+    if max_dev > atol:
+        raise ValueError(
+            f"[Error] Target transformation parameters {transform} do not reproduce the stored targets "
+            f"(max. deviation {max_dev:.4e} > {atol})! Raw-scale metrics would be invalid."
+        )
+    print(f"[Target Transform] Verified against target_raw (max. deviation: {max_dev:.2e}).")
 
 
 # =============================================================================
@@ -107,107 +90,67 @@ def print_metrics(metrics: dict, title: str):
 # =============================================================================
 
 def load_embeddings_npz(file_path: Path) -> dict:
-    """Loads an NPZ file containing Orthrus embeddings and strictly requires companion metadata."""
+    """
+    Loads an NPZ file containing Orthrus embeddings.
+    Besides the data arrays, the archive only carries 'source_tracks_meta', 'variant' and 'model_checkpoint';
+    dataset, track name and normalization are read from the referenced track .meta.json (single source).
+    """
     if not file_path.exists():
         raise FileNotFoundError(f"[Error] Embedding file not found: {file_path}")
 
     data = np.load(file_path, allow_pickle=True)
     available_keys = list(data.keys())
-
-    # Find the track .meta.json file (the single source of truth from Track Generation)
-    track_meta_path = None
-    if "source_tracks_meta" in data:
-        cand = file_path.parent / str(data["source_tracks_meta"])
-        if cand.is_file():
-            track_meta_path = cand
-    if track_meta_path is None and "source_tracks_file" in data:
-        cand = get_meta_filepath(file_path.parent / str(data["source_tracks_file"]))
-        if cand.is_file():
-            track_meta_path = cand
-
-    if track_meta_path is None:
-        track_name_raw = str(data.get("track_name", "")).strip()
-        for cand in sorted(file_path.parent.glob("*.meta.json")):
-            if "embeddings" in cand.name or "results" in cand.name or "model" in cand.name:
-                continue
-            if track_name_raw and track_name_raw in cand.name:
-                track_meta_path = cand
-                break
-            elif not track_name_raw:
-                track_meta_path = cand
-                break
-
-    if track_meta_path is None or not track_meta_path.is_file():
-        raise FileNotFoundError(
-            f"[Error] Corresponding track metadata file (.meta.json) from Track Generation not found in: {file_path.parent}!\n"
-            f"Please ensure the track metadata file generated in Step 1 exists alongside the embeddings archive."
+    required_keys = [
+        "embeddings_arr", "targets_arr", "ensembl_transcript_id_arr", "genes_arr",
+        "source_tracks_meta", "variant", "model_checkpoint",
+    ]
+    missing = [k for k in required_keys if k not in data]
+    if missing:
+        raise KeyError(
+            f"[Error] Required fields {missing} not found in {file_path}! Available keys: {available_keys}\n"
+            f"Please re-extract the embeddings with extract_embeddings.py."
         )
 
+    # Track metadata from Track Generation (lies next to the embeddings archive)
+    track_meta_path = file_path.parent / str(data["source_tracks_meta"])
+    if not track_meta_path.is_file():
+        raise FileNotFoundError(
+            f"[Error] Track metadata '{track_meta_path}' referenced by {file_path} not found!"
+        )
     print(f"[Metadata] Using Track Generation metadata from: {track_meta_path}")
     meta = load_metadata(track_meta_path, required=True)
+    require_meta(meta, track_meta_path, "dataset", "track_name")
 
-    if "dataset" not in meta:
-        raise KeyError(f"[Error] Required key 'dataset' not found in track metadata {track_meta_path}!")
-    dataset_name = str(meta["dataset"]).strip()
+    normalization = str(meta.get("normalization", "none")).strip().lower() or "none"
+    variant = str(data["variant"]).strip().lower()
+    if variant not in ("pretrained", "finetuned"):
+        raise ValueError(f"[Error] Unknown variant {variant!r} in {file_path}! Expected 'pretrained' or 'finetuned'.")
 
-    if "track_name" not in meta:
-        raise KeyError(f"[Error] Required key 'track_name' not found in track metadata {track_meta_path}!")
-    track_name = str(meta["track_name"]).strip()
-
-    normalization = str(meta.get("normalization", "none")).strip().lower()
-    if normalization in ["none_not_set", "nan", "none", ""]:
-        normalization = "none"
-
-    is_finetuned = bool(data["is_finetuned"]) if "is_finetuned" in data else ("finetuned" in file_path.stem.lower())
-    variant = str(data.get("variant", "finetuned" if is_finetuned else "pretrained")).strip().lower()
-
-    # 1. Embeddings
-    if "embeddings_arr" not in data:
-        raise KeyError(f"[Error] 'embeddings_arr' not found in {file_path}! Available keys: {available_keys}")
-    embeddings = data["embeddings_arr"].astype(np.float32)
-
-    # 2. Target (Transformed / Model target)
-    if "targets_arr" not in data:
-        raise KeyError(f"[Error] 'targets_arr' not found in {file_path}! Available keys: {available_keys}")
-    targets = data["targets_arr"].astype(np.float32)
-
-    # 3. Target Raw (Unnormalized / Raw half-life in hours)
+    # Target Raw (unnormalized half-life in hours); all-NaN means not available
     targets_raw = None
     if "targets_raw_arr" in data:
         cand_raw = data["targets_raw_arr"].astype(np.float32)
         if not np.all(np.isnan(cand_raw)):
             targets_raw = cand_raw
 
-    # 4. Transcript IDs
-    if "ensembl_transcript_id_arr" not in data:
-        raise KeyError(f"[Error] 'ensembl_transcript_id_arr' not found in {file_path}! Available keys: {available_keys}")
-    tx_ids = data["ensembl_transcript_id_arr"].astype(str)
-
-    # 5. Gene Symbols
-    if "genes_arr" not in data:
-        raise KeyError(f"[Error] 'genes_arr' not found in {file_path}! Available keys: {available_keys}")
-    genes = data["genes_arr"].astype(str)
-
     return {
-        "embeddings": embeddings,
-        "targets": targets,
+        "embeddings": data["embeddings_arr"].astype(np.float32),
+        "targets": data["targets_arr"].astype(np.float32),
         "targets_raw": targets_raw,
-        "transcript_ids": tx_ids,
-        "genes": genes,
-        "dataset": dataset_name,
-        "track_name": track_name,
+        "transcript_ids": data["ensembl_transcript_id_arr"].astype(str),
+        "genes": data["genes_arr"].astype(str),
+        "dataset": str(meta["dataset"]).strip(),
+        "track_name": str(meta["track_name"]).strip(),
         "normalization": normalization,
-        "is_finetuned": is_finetuned,
-        "is_4fold_cv": bool(meta.get("is_4fold_cv", True)),
         "variant": variant,
-        "seq_lens": data.get("seq_lens_arr", None),
-        "archive_keys": available_keys,
+        "model_checkpoint": str(data["model_checkpoint"]),
+        "track_meta_path": track_meta_path,
         "metadata": meta,
     }
 
 
 # =============================================================================
-# Helper: Split Lookup Table & Output Directory
+# Helper: Output Directory
 # =============================================================================
 
 def resolve_output_dir(
@@ -222,41 +165,39 @@ def resolve_output_dir(
     - All other tracks (N-track): <base_dir>/<dataset_key>/<track_type>/<normalization> (e.g. minmax, log, none)
     """
     sub_dir = variant if track_type == "6track" else (normalization if normalization and normalization != "none" else "none")
-    base_dir = (
-        DEFAULT_BASE_RESULTS_DIR
-        if DEFAULT_BASE_RESULTS_DIR.parent.parent.exists()
-        else Path(__file__).resolve().parent.parent / "results" / "Orthrus"
-    )
-    return base_dir / dataset_key / track_type / sub_dir
+    return RESULTS_DIR / dataset_key / track_type / sub_dir
 
 
-def resolve_dataset_key(dataset_name: str) -> str:
-    """Standardizes the dataset identifier from metadata ('hipsc_cm', 'mrna_bench_human', 'mrna_bench_mouse')."""
-    d_clean = str(dataset_name).strip().lower().replace("-", "_")
-    if "hipsc" in d_clean:
-        return "hipsc_cm"
-    elif "mrna_bench_human" in d_clean or "rnahl_human" in d_clean or "human" in d_clean:
-        return "mrna_bench_human"
-    elif "mrna_bench_mouse" in d_clean or "rnahl_mouse" in d_clean or "mouse" in d_clean:
-        return "mrna_bench_mouse"
-    raise KeyError(f"[Error] Unknown dataset '{dataset_name}' in metadata! Known datasets: {list(SPLITS_LOOKUP_TABLES.keys())}.")
+# =============================================================================
+# Helpers: Array Subsets & Scatter Plot
+# =============================================================================
+
+def subset(arrays: dict, mask: np.ndarray) -> dict:
+    """Applies a boolean mask to all sample-aligned arrays; optional arrays stay None."""
+    return {k: None if v is None else v[mask] for k, v in arrays.items()}
 
 
-def resolve_splits_lookup(dataset_key: str) -> Path:
-    """Resolves the 10-fold lookup table path automatically from dataset key."""
-    if dataset_key in SPLITS_LOOKUP_TABLES:
-        table_path = SPLITS_LOOKUP_TABLES[dataset_key]
-        if table_path.exists():
-            return table_path
-        raise FileNotFoundError(
-            f"[Error] Standardized lookup table for '{dataset_key}' not found at: {table_path}! "
-            f"Please verify the cluster file path."
-        )
+def scatter_panel(ax, y_true, y_pred, title, xlabel, ylabel, color="#1f77b4", log_scale=False):
+    """Draws y_true vs. y_pred with the y=x reference line, on log-log axes if log_scale is set."""
+    ax.scatter(y_true, y_pred, alpha=0.35, s=18, color=color, edgecolors="none")
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.set_xlabel(xlabel, fontsize=10)
+    ax.set_ylabel(ylabel, fontsize=10)
+    ax.grid(True, linestyle="--", alpha=0.5)
 
-    raise ValueError(
-        f"[Error] Unable to resolve lookup table for dataset '{dataset_key}'! "
-        f"Known datasets: {list(SPLITS_LOOKUP_TABLES.keys())}."
-    )
+    values = np.concatenate([y_true, y_pred])
+    if log_scale:
+        values = values[values > 0]
+        if len(values) == 0:
+            return
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        low, high = float(values.min()), float(values.max())
+    else:
+        margin = (float(values.max()) - float(values.min())) * 0.05
+        low, high = float(values.min()) - margin, float(values.max()) + margin
+    ax.plot([low, high], [low, high], "r--", linewidth=1.5, label="Ideal (y=x)")
+    ax.legend()
 
 
 # =============================================================================
@@ -272,12 +213,6 @@ def parse_args():
         type=str,
         required=True,
         help="Path to NPZ embeddings archive (required)",
-    )
-    parser.add_argument(
-        "--random_state",
-        type=int,
-        default=42,
-        help="Random seed for reproducibility (default: 42)",
     )
     parser.add_argument(
         "--plot",
@@ -300,7 +235,7 @@ def main():
 
     # 2. Identify Dataset and Auto-resolve Lookup Table
     dataset_key = resolve_dataset_key(data["dataset"])
-    lookup_path = resolve_splits_lookup(dataset_key)
+    lookup_path = SPLITS_LOOKUP_TABLES[dataset_key]
 
     # 3. Determine Track Type, Normalization, Variant & Output Directory strictly from metadata
     track_type = data["track_name"]
@@ -316,95 +251,82 @@ def main():
     print(f"Splits lookup table:   {lookup_path}")
     print(f"Output directory:      {out_dir}")
 
-    # 4. Data Extraction & Target Verification
-    X = data["embeddings"]
-    y = data["targets"]
-    y_raw = data["targets_raw"]
-    genes = data["genes"]
-    tx_ids = data["transcript_ids"]
+    # 4. Target Verification
+    y_all = data["targets"]
+    y_raw_all = data["targets_raw"]
+    print(f"Raw target present:    {'Yes (target_raw)' if y_raw_all is not None else 'No'}")
 
-    # Filter NaN / Inf
-    valid_mask = ~np.isnan(y) & ~np.isinf(y)
-    if not np.all(valid_mask):
-        dropped = int(np.sum(~valid_mask))
-        print(f"[Data Cleaning] Filtered {dropped} samples with invalid target values.")
-        X = X[valid_mask]
-        y = y[valid_mask]
-        genes = genes[valid_mask]
-        tx_ids = tx_ids[valid_mask]
-        if y_raw is not None:
-            y_raw = y_raw[valid_mask]
+    # Target transformation is required to map predictions back to raw half-lives
+    target_transform = None
+    if y_raw_all is not None:
+        target_transform = resolve_target_transform(data["metadata"], dataset_key)
+        if target_transform is None:
+            print("[Target Transform] No transformation parameters found -> raw-scale metrics are skipped.")
+        else:
+            verify_target_transform(y_all, y_raw_all, target_transform)
 
-    print(f"Total valid samples:   {len(y):,}")
-    print(f"Feature dimension:     {X.shape[1]}")
-    print(f"Unique genes:          {len(np.unique(genes)):,}")
-    print(f"Raw target present:    {'Yes (target_raw)' if y_raw is not None else 'No'}")
+    # 5. Assign Standardized 10-Fold Splits (Lookup Table) to samples with a finite target; all others stay -1
+    valid_mask = np.isfinite(y_all)
+    sample_splits = np.full(len(y_all), -1, dtype=int)
+    sample_splits[valid_mask] = assign_splits(dataset_key, data["transcript_ids"][valid_mask])
 
-    # 5. Load Standardized 10-Fold Split Lookup Table
-    print(f"\n[Split Alignment] Reading lookup splits from {lookup_path.name}...")
-    lookup_df = pd.read_csv(lookup_path)
+    keep_mask = sample_splits != -1
+    n_invalid = int(np.sum(~valid_mask))
+    n_unmatched = int(np.sum(valid_mask & ~keep_mask))
+    if n_invalid or n_unmatched:
+        print(f"[Data Cleaning] Filtered {n_invalid} samples with invalid targets, {n_unmatched} without split assignment.")
 
-    lookup_tx_col = "ensembl_transcript_id" if "ensembl_transcript_id" in lookup_df.columns else "transcript_id"
-    if lookup_tx_col not in lookup_df.columns or "split" not in lookup_df.columns:
-        raise KeyError(
-            f"[Error] Required columns ('{lookup_tx_col}', 'split') not found in {lookup_path}! "
-            f"Columns: {list(lookup_df.columns)}"
-        )
+    samples = subset({
+        "X": data["embeddings"],
+        "y": y_all,
+        "y_raw": y_raw_all,
+        "genes": data["genes"],
+        "tx_ids": data["transcript_ids"],
+        "splits": sample_splits,
+    }, keep_mask)
 
-    tx_to_split = dict(zip(lookup_df[lookup_tx_col].astype(str).str.strip(), lookup_df["split"].astype(int)))
-    sample_splits = np.array([tx_to_split.get(str(t).strip(), -1) for t in tx_ids])
+    print(f"Total valid samples:   {len(samples['y']):,}")
+    print(f"Feature dimension:     {samples['X'].shape[1]}")
+    print(f"Unique genes:          {len(np.unique(samples['genes'])):,}")
 
-    unmatched = int(np.sum(sample_splits == -1))
-    if unmatched > 0:
-        print(f"[Warning] {unmatched} transcripts not found in lookup table! Filtering them out.")
-        matched_mask = (sample_splits != -1)
-        X = X[matched_mask]
-        y = y[matched_mask]
-        genes = genes[matched_mask]
-        tx_ids = tx_ids[matched_mask]
-        sample_splits = sample_splits[matched_mask]
-        if y_raw is not None:
-            y_raw = y_raw[matched_mask]
+    # Test Set: Splits 8 & 9 (20% strictly held-out)
+    test_set = subset(samples, np.isin(samples["splits"], TEST_SPLITS))
+    X_test, y_test = test_set["X"], test_set["y"]
+    test_genes = test_set["genes"]
+    y_test_raw_true = test_set["y_raw"]
 
-    # Test Set: Folds 8 & 9 (20% strictly held-out)
-    test_mask = np.isin(sample_splits, [8, 9])
-    X_test, y_test = X[test_mask], y[test_mask]
-    test_genes = genes[test_mask]
-    test_tx = tx_ids[test_mask]
-    y_test_raw_true = y_raw[test_mask] if y_raw is not None else None
-
-    # CV Pool: Folds 0-7 (80% for training & cross-validation)
-    cv_mask = np.isin(sample_splits, [0, 1, 2, 3, 4, 5, 6, 7])
-    X_train_cv, y_train_cv = X[cv_mask], y[cv_mask]
-    cv_splits = sample_splits[cv_mask]
-    train_genes = genes[cv_mask]
+    # CV Pool: Splits 0-7 (80% for training & cross-validation)
+    cv_pool = subset(samples, np.isin(samples["splits"], CV_POOL_SPLITS))
+    X_train_cv, y_train_cv = cv_pool["X"], cv_pool["y"]
+    cv_splits = cv_pool["splits"]
+    train_genes = cv_pool["genes"]
 
     print(f"\n[Dataset Partitioning]")
     print(f"  CV Pool (Folds 0-7): {len(y_train_cv):,} samples ({len(np.unique(train_genes)):,} unique genes)")
     print(f"  Test Set (Folds 8-9): {len(y_test):,} samples ({len(np.unique(test_genes)):,} unique genes)")
 
     # 6. Custom 4-Fold Cross-Validation Setup
-    cv_fold_definitions = [
-        {"name": "Fold 0", "train_splits": [0, 1, 2, 3, 4, 5], "val_splits": [6, 7]},
-        {"name": "Fold 1", "train_splits": [2, 3, 4, 5, 6, 7], "val_splits": [0, 1]},
-        {"name": "Fold 2", "train_splits": [0, 1, 4, 5, 6, 7], "val_splits": [2, 3]},
-        {"name": "Fold 3", "train_splits": [0, 1, 2, 3, 6, 7], "val_splits": [4, 5]},
-    ]
-
     custom_cv = []
-    for fold_def in cv_fold_definitions:
-        tr_idx = np.where(np.isin(cv_splits, fold_def["train_splits"]))[0]
-        val_idx = np.where(np.isin(cv_splits, fold_def["val_splits"]))[0]
+    for fold_def in CV_FOLDS.values():
+        tr_idx = np.where(np.isin(cv_splits, fold_def["train"]))[0]
+        val_idx = np.where(np.isin(cv_splits, fold_def["val"]))[0]
         custom_cv.append((tr_idx, val_idx))
 
-    print(f"\n[Training] Running RidgeCV across 4-fold Cross-Validation (Alphas: {DEFAULT_ALPHAS})...")
-    model = RidgeCV(alphas=DEFAULT_ALPHAS, cv=custom_cv)
-    model.fit(X_train_cv, y_train_cv)
+    print(f"\n[Training] Running GridSearchCV across 4-fold Cross-Validation (Alphas: {ALPHA_GRID.tolist()})...")
+    grid_search = GridSearchCV(
+        Ridge(), {"alpha": ALPHA_GRID}, cv=custom_cv, scoring="neg_mean_squared_error", refit=True
+    )
+    grid_search.fit(X_train_cv, y_train_cv)
+    model = grid_search.best_estimator_  # refitted on the entire CV pool (0-7)
 
-    best_alpha = float(model.alpha_)
+    best_alpha = float(grid_search.best_params_["alpha"])
     print(f"\n>>> Selected Optimal Alpha: {best_alpha:.4e} <<<")
+    if best_alpha in (ALPHA_GRID[0], ALPHA_GRID[-1]):
+        print(f"[Warning] Selected alpha lies on the edge of the grid ({ALPHA_GRID[0]:.0e} to {ALPHA_GRID[-1]:.0e}); the optimum may lie outside.")
 
-    # Evaluate Individual CV Folds
+    # Evaluate Individual CV Folds on out-of-fold predictions
+    oof_pred = cross_val_predict(model, X_train_cv, y_train_cv, cv=custom_cv)
+
     print("\n" + "-" * 72)
     print("          4-FOLD CROSS-VALIDATION DIAGNOSTICS (VAL FOLDS)         ")
     print("-" * 72)
@@ -414,19 +336,14 @@ def main():
     fold_evaluations = []
     val_pearsons = []
     val_rmses = []
-    val_spearmans = []
 
-    for f_idx, fold_def in enumerate(cv_fold_definitions):
-        tr_idx, val_idx = custom_cv[f_idx]
-        fold_ridge = Ridge(alpha=best_alpha, random_state=args.random_state)
-        fold_ridge.fit(X_train_cv[tr_idx], y_train_cv[tr_idx])
-        val_pred = fold_ridge.predict(X_train_cv[val_idx])
-
-        f_metrics = calculate_metrics(y_train_cv[val_idx], val_pred, prefix=f"fold_{f_idx}")
+    for f_idx, fold_def in CV_FOLDS.items():
+        _, val_idx = custom_cv[f_idx]
+        f_metrics = regression_metrics(y_train_cv[val_idx], oof_pred[val_idx], prefix=f"fold_{f_idx}")
         fold_evaluations.append({
-            "fold_name": fold_def["name"],
-            "train_splits": fold_def["train_splits"],
-            "val_splits": fold_def["val_splits"],
+            "fold_name": f"Fold {f_idx}",
+            "train_splits": fold_def["train"],
+            "val_splits": fold_def["val"],
             "val_samples": int(len(val_idx)),
             **f_metrics,
         })
@@ -434,11 +351,10 @@ def main():
         rmse_val = f_metrics[f"fold_{f_idx}_rmse"]
         val_pearsons.append(r_val)
         val_rmses.append(rmse_val)
-        val_spearmans.append(f_metrics[f"fold_{f_idx}_spearman_rho"])
 
-        tr_str = ",".join(map(str, fold_def["train_splits"]))
-        val_str = ",".join(map(str, fold_def["val_splits"]))
-        print(f"{fold_def['name']:<10} | {tr_str:<18} | {val_str:<12} | {r_val:>12.4f}  | {rmse_val:>8.4f}")
+        tr_str = ",".join(map(str, fold_def["train"]))
+        val_str = ",".join(map(str, fold_def["val"]))
+        print(f"{'Fold ' + str(f_idx):<10} | {tr_str:<18} | {val_str:<12} | {r_val:>12.4f}  | {rmse_val:>8.4f}")
 
     print("-" * 72)
     mean_cv_r = float(np.mean(val_pearsons))
@@ -450,23 +366,34 @@ def main():
 
     # Train predictions on entire CV pool (0-7)
     y_train_pred = model.predict(X_train_cv)
-    train_metrics = calculate_metrics(y_train_cv, y_train_pred, prefix="train_cv_pool")
+    train_metrics = regression_metrics(y_train_cv, y_train_pred, prefix="train_cv_pool")
 
     # 7. Test Set Evaluation (Unseen Folds 8 & 9)
     y_test_pred = model.predict(X_test)
-    test_metrics = calculate_metrics(y_test, y_test_pred, prefix="test")
+    test_metrics = regression_metrics(y_test, y_test_pred, prefix="test")
 
-    # 8. Optional Raw Target Evaluation (target_raw)
+    # 8. Optional Raw Target Evaluation (target_raw, half-life in hours)
+    # Predictions are back-transformed to the raw scale before comparison with target_raw.
     test_raw_metrics = {}
-    has_valid_raw = y_test_raw_true is not None and not np.all(np.isnan(y_test_raw_true))
+    y_test_pred_raw = None
+    has_valid_raw = (
+        target_transform is not None
+        and y_test_raw_true is not None
+        and not np.all(np.isnan(y_test_raw_true))
+    )
     if has_valid_raw:
-        valid_raw_mask = ~np.isnan(y_test_raw_true) & ~np.isinf(y_test_raw_true)
+        y_test_pred_raw = inverse_transform_target(y_test_pred, target_transform)
+        valid_raw_mask = np.isfinite(y_test_raw_true)
         if np.any(valid_raw_mask):
-            print("\n[Target Raw] Computing direct correlation metrics against target_raw...")
-            test_raw_metrics = calculate_metrics(
+            print("\n[Target Raw] Computing metrics on back-transformed predictions vs. target_raw (hours)...")
+            test_raw_metrics = regression_metrics(
                 y_test_raw_true[valid_raw_mask],
-                y_test_pred[valid_raw_mask],
+                y_test_pred_raw[valid_raw_mask],
                 prefix="test_raw"
+            )
+            # Robust error measure (raw half-lives are extremely right-skewed)
+            test_raw_metrics["test_raw_median_ae"] = float(
+                np.median(np.abs(y_test_raw_true[valid_raw_mask] - y_test_pred_raw[valid_raw_mask]))
             )
 
     # Print Summary Diagnostics
@@ -482,7 +409,7 @@ def main():
 
     # 10. Save Predictions CSV
     pred_dict = {
-        "transcript_id": test_tx,
+        "transcript_id": test_set["tx_ids"],
         "gene": test_genes,
         "true_target": y_test,
         "predicted_target": y_test_pred,
@@ -490,6 +417,7 @@ def main():
     }
     if has_valid_raw:
         pred_dict["true_target_raw"] = y_test_raw_true
+        pred_dict["predicted_target_raw"] = y_test_pred_raw
 
     pred_df = pd.DataFrame(pred_dict)
     pred_file = out_dir / f"predictions_{dataset_key}.csv"
@@ -504,10 +432,11 @@ def main():
         "normalization": normalization,
         "variant": variant,
         "raw_dataset_meta": data["dataset"],
-        "is_finetuned": data["is_finetuned"],
-        "is_4fold_cv": data["is_4fold_cv"],
+        "model_checkpoint": data["model_checkpoint"],
         "embeddings_path": str(emb_path),
+        "track_meta_path": str(data["track_meta_path"]),
         "splits_lookup_path": str(lookup_path),
+        "target_transform": target_transform,
         "best_alpha": best_alpha,
         "cv_pool_size": int(len(y_train_cv)),
         "test_size": int(len(y_test)),
@@ -530,76 +459,34 @@ def main():
     # 12. Optional Scatter Plot
     if args.plot:
         try:
-            has_raw_plot = y_test_raw_true is not None and not np.all(np.isnan(y_test_raw_true))
-            if has_raw_plot:
-                # Dual subplot: Left = Transformed Target, Right = Raw Target
+            test_stats = (
+                f"Pearson r = {test_metrics['test_pearson_r']:.3f} | Spearman rho = {test_metrics['test_spearman_rho']:.3f} | "
+                f"RMSE = {test_metrics['test_rmse']:.3f} | R² = {test_metrics['test_r2']:.3f}"
+            )
+            if test_raw_metrics:
+                # Left = Transformed Target, Right = Raw half-life vs. back-transformed prediction (right-skewed -> log-log)
                 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-
-                # Subplot 1: Transformed Target
-                ax1.scatter(y_test, y_test_pred, alpha=0.35, s=18, color="#1f77b4", edgecolors="none")
-                p_r = test_metrics["test_pearson_r"]
-                s_rho = test_metrics["test_spearman_rho"]
-                rmse = test_metrics["test_rmse"]
-                r2 = test_metrics["test_r2"]
-                ax1.set_title(
-                    f"Transformed Target\n"
-                    f"Pearson r = {p_r:.3f} | Spearman rho = {s_rho:.3f} | RMSE = {rmse:.3f} | R² = {r2:.3f}",
-                    fontsize=10,
-                    fontweight="bold",
+                scatter_panel(
+                    ax1, y_test, y_test_pred, f"Transformed Target\n{test_stats}",
+                    "True Value (Transformed)", "Predicted Value (Transformed)",
                 )
-                ax1.set_xlabel("True Value (Transformed)", fontsize=10)
-                ax1.set_ylabel("Predicted Value (Transformed)", fontsize=10)
-                min_v1 = min(float(np.min(y_test)), float(np.min(y_test_pred)))
-                max_v1 = max(float(np.max(y_test)), float(np.max(y_test_pred)))
-                margin1 = (max_v1 - min_v1) * 0.05
-                ax1.plot([min_v1 - margin1, max_v1 + margin1], [min_v1 - margin1, max_v1 + margin1], "r--", linewidth=1.5, label="Ideal (y=x)")
-                ax1.legend()
-                ax1.grid(True, linestyle="--", alpha=0.5)
-
-                # Subplot 2: Raw Target vs. Prediction (filtered for non-finite values)
-                valid_raw_mask = ~np.isnan(y_test_raw_true) & ~np.isinf(y_test_raw_true)
-                ax2.scatter(
-                    y_test_raw_true[valid_raw_mask],
-                    y_test_pred[valid_raw_mask],
-                    alpha=0.35, s=18, color="#2ca02c", edgecolors="none"
+                scatter_panel(
+                    ax2, y_test_raw_true[valid_raw_mask], y_test_pred_raw[valid_raw_mask],
+                    f"Raw Half-Life (back-transformed)\n"
+                    f"Pearson r = {test_raw_metrics['test_raw_pearson_r']:.3f} | "
+                    f"Spearman rho = {test_raw_metrics['test_raw_spearman_rho']:.3f} | "
+                    f"Median AE = {test_raw_metrics['test_raw_median_ae']:.2f} h",
+                    "True Half-Life (h, target_raw)", "Predicted Half-Life (h)",
+                    color="#2ca02c", log_scale=True,
                 )
-                p_r_raw = test_raw_metrics.get("test_raw_pearson_r", np.nan)
-                s_rho_raw = test_raw_metrics.get("test_raw_spearman_rho", np.nan)
-                ax2.set_title(
-                    f"Raw Target vs. Predicted Value\n"
-                    f"Pearson r = {p_r_raw:.3f} | Spearman rho = {s_rho_raw:.3f}",
-                    fontsize=10,
-                    fontweight="bold",
-                )
-                ax2.set_xlabel("True Raw Value (target_raw)", fontsize=10)
-                ax2.set_ylabel("Predicted Value", fontsize=10)
-                ax2.grid(True, linestyle="--", alpha=0.5)
-
                 fig.suptitle(f"Orthrus Ridge Regression -> {dataset_key} Test Set Evaluation", fontsize=12, fontweight="bold")
-                plt.tight_layout()
             else:
-                # Single plot
                 fig, ax = plt.subplots(figsize=(7, 6))
-                ax.scatter(y_test, y_test_pred, alpha=0.35, s=18, color="#1f77b4", edgecolors="none")
-                p_r = test_metrics["test_pearson_r"]
-                s_rho = test_metrics["test_spearman_rho"]
-                r2 = test_metrics["test_r2"]
-                rmse = test_metrics["test_rmse"]
-                ax.set_title(
-                    f"Orthrus Ridge Regression -> {dataset_key}\n"
-                    f"Test Pearson r = {p_r:.3f} | Spearman rho = {s_rho:.3f} | RMSE = {rmse:.3f} | R² = {r2:.3f}",
-                    fontsize=11,
-                    fontweight="bold",
+                scatter_panel(
+                    ax, y_test, y_test_pred, f"Orthrus Ridge Regression -> {dataset_key}\nTest {test_stats}",
+                    "True Value", "Predicted Value",
                 )
-                ax.set_xlabel("True Value", fontsize=10)
-                ax.set_ylabel("Predicted Value", fontsize=10)
-                min_val = min(float(np.min(y_test)), float(np.min(y_test_pred)))
-                max_val = max(float(np.max(y_test)), float(np.max(y_test_pred)))
-                margin = (max_val - min_val) * 0.05
-                ax.plot([min_val - margin, max_val + margin], [min_val - margin, max_val + margin], "r--", linewidth=1.5, label="Ideal (y=x)")
-                ax.legend()
-                ax.grid(True, linestyle="--", alpha=0.5)
-                plt.tight_layout()
+            plt.tight_layout()
 
             plot_file = out_dir / f"scatter_{dataset_key}.png"
             fig.savefig(plot_file, dpi=300)

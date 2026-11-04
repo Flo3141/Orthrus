@@ -218,6 +218,91 @@ def save_metadata(output_path: Union[str, Path], meta_dict: Dict[str, Any]) -> P
     return meta_file
 
 
+def to_object_array(tracks) -> "np.ndarray":
+    """
+    Packs variable-length (L, C) tracks into a 1D object array of float32 arrays.
+    np.array(list_of_arrays, dtype=object) would instead create an (n, L, C) object array whenever all
+    tracks share the same length (e.g. a chunk with a single transcript), breaking torch.from_numpy later.
+    """
+    import numpy as np
+    tracks = list(tracks)
+    arr = np.empty(len(tracks), dtype=object)
+    for i, t in enumerate(tracks):
+        arr[i] = np.asarray(t, dtype=np.float32)
+    return arr
+
+
+# Transcripts longer than max_length keep their 3' end, i.e. the 3' UTR with most miRNA / RBP signal is preserved
+TRUNCATION_MODE = "keep_3prime"
+
+
+def truncate_to_max_length(track, max_length: int):
+    """Truncates an (L, C) track to its last max_length positions (see TRUNCATION_MODE)."""
+    return track[-max_length:] if track.shape[0] > max_length else track
+
+
+def require_truncation_mode(meta: Dict[str, Any], source: Union[str, Path]) -> None:
+    """Rejects track archives that were generated with a different truncation convention (e.g. 5' end kept)."""
+    found = meta.get("truncation")
+    if found != TRUNCATION_MODE:
+        raise ValueError(
+            f"[Error] Track archive {source} was generated with truncation={found!r}, expected {TRUNCATION_MODE!r}! "
+            f"Older archives kept the 5' end of long transcripts. Please regenerate the tracks with --recreate."
+        )
+
+
+RUN_CONFIG_FILENAME = "run_config.json"
+
+
+def normalize_run_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Converts a run configuration to plain JSON types (Path -> str, NumPy -> Python) for comparison."""
+    return json.loads(json.dumps(config, cls=_NumpyMetadataEncoder, sort_keys=True))
+
+
+def diff_run_config(stored: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
+    """Returns {key: (stored_value, current_value)} for all keys whose values differ."""
+    stored, current = normalize_run_config(stored), normalize_run_config(current)
+    return {
+        k: (stored.get(k), current.get(k))
+        for k in sorted(set(stored) | set(current))
+        if stored.get(k) != current.get(k)
+    }
+
+
+def ensure_run_config(state_dir: Union[str, Path], config: Dict[str, Any], has_existing_state: bool, reset_hint: str) -> Path:
+    """
+    Guards resumable intermediate state (e.g. chunk directories) against mixing runs with different parameters.
+    - run_config.json present: must match `config`, otherwise RuntimeError.
+    - No run_config.json but existing state: state cannot be verified -> RuntimeError.
+    - Otherwise: writes run_config.json.
+    """
+    cfg_file = Path(state_dir) / RUN_CONFIG_FILENAME
+
+    if cfg_file.is_file():
+        with open(cfg_file, "r", encoding="utf-8") as f:
+            stored = json.load(f)
+        diffs = diff_run_config(stored, config)
+        if diffs:
+            diff_str = "\n".join(f"  - {k}: existing={v[0]!r} | current={v[1]!r}" for k, v in diffs.items())
+            raise RuntimeError(
+                f"[Error] Existing state in '{state_dir}' was created with a different configuration:\n{diff_str}\n"
+                f"Resuming would mix both runs. {reset_hint}"
+            )
+        print(f"[Resume] Run configuration matches: {cfg_file}")
+        return cfg_file
+
+    if has_existing_state:
+        raise RuntimeError(
+            f"[Error] Existing state in '{state_dir}' has no {RUN_CONFIG_FILENAME} and cannot be verified. {reset_hint}"
+        )
+
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(cfg_file, "w", encoding="utf-8") as f:
+        json.dump(normalize_run_config(config), f, indent=2, ensure_ascii=False)
+    print(f"[Run Config] Saved run configuration: {cfg_file}")
+    return cfg_file
+
+
 def load_metadata(file_path: Union[str, Path], required: bool = True) -> Dict[str, Any]:
     """
     Strictly loads companion metadata (.meta.json / model_meta.json / results.meta.json).
@@ -252,3 +337,151 @@ def load_metadata(file_path: Union[str, Path], required: bool = True) -> Dict[st
 
     return {}
 
+
+
+# =============================================================================
+# Base Paths (override with the environment variables ORTHRUS_BASE / ORTHRUS_GTF_DB)
+# =============================================================================
+
+BASE_DIR = Path(os.environ.get("ORTHRUS_BASE", "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code"))
+DATA_DIR = BASE_DIR / "data"
+CHECKPOINTS_DIR = BASE_DIR / "checkpoints" / "orthrus"
+RESULTS_DIR = BASE_DIR / "results" / "Orthrus"
+GTF_DB_PATH = Path(os.environ.get("ORTHRUS_GTF_DB", "/beegfs/prj/RNA_NLP/AlphaGenome/data/Homo_sapiens.GRCh38.108.gtf.db"))
+
+
+# =============================================================================
+# Dataset Registry (single source of truth for dataset keys & split lookup tables)
+# =============================================================================
+
+# Data directory of each dataset; generated tracks are stored in <dir>/orthrus/<track_name>/
+DATASET_DIRS = {
+    "hipsc_cm": DATA_DIR / "hIPSC_CM",
+    "mrna_bench_human": DATA_DIR / "mrna_bench",
+    "mrna_bench_mouse": DATA_DIR / "mrna_bench",
+}
+
+SPLITS_LOOKUP_TABLES = {
+    "hipsc_cm": DATASET_DIRS["hipsc_cm"] / "hipsc_cm_10folds_lookup.csv",
+    "mrna_bench_human": DATASET_DIRS["mrna_bench_human"] / "rnahl-human_10folds_lookup.csv",
+    "mrna_bench_mouse": DATASET_DIRS["mrna_bench_mouse"] / "rnahl-mouse_10folds_lookup.csv",
+}
+
+
+def resolve_dataset_key(dataset_name: str) -> str:
+    """
+    Maps the 'dataset' field of the track metadata to a canonical dataset key (see SPLITS_LOOKUP_TABLES).
+    Only case and '-' vs. '_' are normalized; any other name raises a KeyError instead of being guessed.
+    """
+    key = str(dataset_name).strip().lower().replace("-", "_")
+    if key not in SPLITS_LOOKUP_TABLES:
+        raise KeyError(
+            f"[Error] Unknown dataset '{dataset_name}' in metadata! Known datasets: {list(SPLITS_LOOKUP_TABLES.keys())}."
+        )
+    return key
+
+
+# =============================================================================
+# Cross-Validation Scheme (single source of truth for fine-tuning, extraction & ridge regression)
+# =============================================================================
+
+# Splits 8-9 are held out as test set in every fold; splits 0-7 form the CV pool.
+TEST_SPLITS = [8, 9]
+CV_FOLDS = {
+    0: {"train": [0, 1, 2, 3, 4, 5], "val": [6, 7]},
+    1: {"train": [2, 3, 4, 5, 6, 7], "val": [0, 1]},
+    2: {"train": [0, 1, 4, 5, 6, 7], "val": [2, 3]},
+    3: {"train": [0, 1, 2, 3, 6, 7], "val": [4, 5]},
+}
+CV_POOL_SPLITS = sorted({s for fold in CV_FOLDS.values() for s in fold["train"] + fold["val"]})
+
+# Abort if more transcripts than this are missing from the lookup table (e.g. wrong or outdated table)
+MAX_UNMATCHED_FRACTION = 0.01
+
+
+def assign_splits(dataset_key: str, tx_ids, max_unmatched_frac: float = MAX_UNMATCHED_FRACTION) -> "np.ndarray":
+    """
+    Maps each transcript ID to its split (0-9) from the dataset's 10-fold lookup table; unmatched transcripts get -1.
+    Raises if the lookup table is missing/incomplete or more than max_unmatched_frac of the transcripts are unmatched.
+    """
+    import numpy as np
+    import pandas as pd
+
+    lookup_path = SPLITS_LOOKUP_TABLES[dataset_key]
+    if not lookup_path.exists():
+        raise FileNotFoundError(f"[Error] Standardized 10-fold lookup table for '{dataset_key}' not found at: {lookup_path}!")
+
+    print(f"\n[Splits Lookup] Loading lookup table ({dataset_key}): {lookup_path}")
+    lookup_df = pd.read_csv(lookup_path)
+    missing_cols = {"ensembl_transcript_id", "split"} - set(lookup_df.columns)
+    if missing_cols:
+        raise KeyError(f"[Error] Columns {sorted(missing_cols)} not found in lookup table {lookup_path}. Columns: {list(lookup_df.columns)}")
+
+    missing_splits = set(range(10)) - set(lookup_df["split"].dropna().astype(int).unique())
+    if missing_splits:
+        raise ValueError(f"[Error] Missing splits in lookup table {lookup_path}! Expected all 10 splits (0-9), but missing: {sorted(missing_splits)}.")
+
+    tx_to_split = dict(zip(lookup_df["ensembl_transcript_id"].astype(str).str.strip(), lookup_df["split"].astype(int)))
+    sample_splits = np.array([tx_to_split.get(str(t).strip(), -1) for t in tx_ids], dtype=int)
+
+    n_unmatched = int(np.sum(sample_splits == -1))
+    if n_unmatched > max_unmatched_frac * len(sample_splits):
+        raise ValueError(
+            f"[Error] {n_unmatched:,} of {len(sample_splits):,} transcripts ({n_unmatched / len(sample_splits):.1%}) are missing "
+            f"from the lookup table {lookup_path} (allowed: {max_unmatched_frac:.0%}). Wrong or outdated lookup table?"
+        )
+    if n_unmatched > 0:
+        print(f"[Warning] {n_unmatched} transcripts not found in lookup table (split = -1).")
+    return sample_splits
+
+
+def require_meta(meta: Dict[str, Any], source: Union[str, Path], *keys: str) -> None:
+    """Raises a KeyError if any of the required keys is missing in the companion metadata of 'source'."""
+    missing = [k for k in keys if k not in meta]
+    if missing:
+        raise KeyError(f"[Error] Required metadata key(s) {missing} not found in companion metadata for {source}!")
+
+
+# =============================================================================
+# Regression Metrics (shared by fine-tuning, channel ablation & ridge regression)
+# =============================================================================
+
+def regression_metrics(y_true, y_pred, prefix: str = "") -> Dict[str, float]:
+    """
+    Pearson r, Spearman rho (with p-values), MSE, RMSE, MAE and R2.
+    Correlations are reported as 0 (p = 1) if fewer than 3 samples or a constant prediction/target make them undefined.
+    """
+    import numpy as np
+    from scipy.stats import pearsonr, spearmanr
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    if len(y_true) > 2 and np.std(y_pred) > 1e-8 and np.std(y_true) > 1e-8:
+        p_corr, p_val = pearsonr(y_true, y_pred)
+        s_corr, s_val = spearmanr(y_true, y_pred)
+    else:
+        p_corr, p_val, s_corr, s_val = 0.0, 1.0, 0.0, 1.0
+    mse = float(mean_squared_error(y_true, y_pred))
+
+    prefix_str = f"{prefix}_" if prefix else ""
+    return {
+        f"{prefix_str}pearson_r": float(p_corr),
+        f"{prefix_str}pearson_pvalue": float(p_val),
+        f"{prefix_str}spearman_rho": float(s_corr),
+        f"{prefix_str}spearman_pvalue": float(s_val),
+        f"{prefix_str}mse": mse,
+        f"{prefix_str}rmse": float(np.sqrt(mse)),
+        f"{prefix_str}mae": float(mean_absolute_error(y_true, y_pred)),
+        f"{prefix_str}r2": float(r2_score(y_true, y_pred)) if len(y_true) > 2 else 0.0,
+    }
+
+
+def print_metrics(metrics: Dict[str, float], title: str) -> None:
+    """Formatted console output for metrics."""
+    print(f"\n--- {title} ---")
+    for k, v in metrics.items():
+        if "pvalue" in k:
+            print(f"  {k:28s}: {v:.3e}")
+        else:
+            print(f"  {k:28s}: {v:.4f}")

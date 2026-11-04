@@ -26,7 +26,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from six_track_dataset import SixTrackDatasetLoader
-from util import save_metadata
+from util import save_metadata, ensure_run_config, to_object_array, RUN_CONFIG_FILENAME, TRUNCATION_MODE, truncate_to_max_length, DATA_DIR, DATASET_DIRS, GTF_DB_PATH
 
 DEFAULT_CHANNEL_NAMES = [
     "A", "C", "G", "U", "CDS", "Splice", "RBP_Stabilizer", "RBP_Destabilizer"
@@ -36,13 +36,8 @@ DEFAULT_CHANNEL_NAMES = [
 # =============================================================================
 # Fixed Reference File Paths (Cluster Constants)
 # =============================================================================
-GTF_DB_PATH = Path("/beegfs/prj/RNA_NLP/AlphaGenome/data/Homo_sapiens.GRCh38.108.gtf.db")
-STABILIZERS_BED_PATH = Path(
-    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/eclip/curated_candidates/stabilizers_peaks.bed"
-)
-DESTABILIZERS_BED_PATH = Path(
-    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/eclip/curated_candidates/destabilizers_peaks.bed"
-)
+STABILIZERS_BED_PATH = DATA_DIR / "eclip" / "curated_candidates" / "stabilizers_peaks.bed"
+DESTABILIZERS_BED_PATH = DATA_DIR / "eclip" / "curated_candidates" / "destabilizers_peaks.bed"
 
 
 # =============================================================================
@@ -132,7 +127,8 @@ class GtfDbHelper:
         if strand == "-":
             exons.reverse()
 
-        return {"chrom": chrom, "strand": strand, "exons": exons}
+        exon_length = sum(end - start + 1 for start, end in exons)
+        return {"chrom": chrom, "strand": strand, "exons": exons, "exon_length": exon_length}
 
 
 def map_genomic_intervals_to_transcript(
@@ -189,6 +185,7 @@ def load_bed_indexed(bed_path: Path, label: str = "BED") -> dict:
 
     print(f"Loading {label} intervals from: {bed_path}...")
     raw_data = {}
+    n_no_score = 0
     with open(bed_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             if line.startswith("#") or line.startswith("track") or not line.strip():
@@ -211,17 +208,19 @@ def load_bed_indexed(bed_path: Path, label: str = "BED") -> dict:
             if strand not in ["+", "-"]:
                 continue
 
-            # SignalValue (column 6 in narrowPeak / BED): default to 1.0 if missing
-            score = 1.0
-            if len(parts) >= 7 and parts[6] not in [".", "-1", "nan", "NaN", ""]:
-                try:
-                    s_val = float(parts[6])
-                    if s_val > 0.0:
-                        score = s_val
-                    else:
-                        continue
-                except ValueError:
-                    score = 1.0
+            # SignalValue (column 6 in narrowPeak / BED) must be present, positive, and a valid number.
+            # Peaks without a score are discarded: a default value would mix an arbitrary scale with log2FC values.
+            # Negative signal values indicate de-enrichment (less signal than input control) and do not represent binding.
+            if len(parts) < 7 or parts[6] in [".", "-1", "nan", "NaN", ""]:
+                n_no_score += 1
+                continue
+            try:
+                score = float(parts[6])
+            except ValueError:
+                n_no_score += 1
+                continue
+            if score <= 0.0:
+                continue
 
             key = (chrom, strand)
             raw_data.setdefault(key, []).append((start, end, score))
@@ -232,7 +231,8 @@ def load_bed_indexed(bed_path: Path, label: str = "BED") -> dict:
         indexed_data[key] = FastIntervalIndex(intervals)
 
     total_peaks = sum(len(v) for v in raw_data.values())
-    print(f"{label}: Indexed {total_peaks:,} peaks across {len(indexed_data)} (chrom, strand) contigs.")
+    print(f"{label}: Indexed {total_peaks:,} peaks across {len(indexed_data)} (chrom, strand) contigs "
+          f"(discarded {n_no_score:,} peaks without valid signalValue).")
     return indexed_data
 
 
@@ -269,10 +269,11 @@ def compute_dynamic_quantiles(
     for _, row in tqdm(eval_df.iterrows(), total=len(eval_df), desc="Estimating quantiles"):
         tx_id = str(row["ensembl_transcript_id"])
         clean_tx = tx_id.split(".")[0]
-        l = min(int(row["length"]), max_length)
+        # Signals are mapped on the full transcript; only the kept 3' window (last max_length nt) enters the quantile
+        l = int(row["length"])
 
         tx_info = gtf_helper.get_transcript_exons(clean_tx)
-        if tx_info is not None:
+        if tx_info is not None and tx_info["exon_length"] == int(row["length"]):
             chrom = str(tx_info["chrom"]).replace("chr", "")
             strand = tx_info["strand"]
             exons = tx_info["exons"]
@@ -280,12 +281,14 @@ def compute_dynamic_quantiles(
 
             if key in stab_data:
                 stab_1d = map_genomic_intervals_to_transcript(exons, strand, stab_data[key], l)
+                stab_1d = stab_1d[-max_length:]
                 nz_stab = stab_1d[stab_1d > 0]
                 if len(nz_stab) > 0:
                     all_stab_vals.append(nz_stab)
 
             if key in destab_data:
                 destab_1d = map_genomic_intervals_to_transcript(exons, strand, destab_data[key], l)
+                destab_1d = destab_1d[-max_length:]
                 nz_destab = destab_1d[destab_1d > 0]
                 if len(nz_destab) > 0:
                     all_destab_vals.append(nz_destab)
@@ -324,8 +327,9 @@ def normalize_rbp_tracks(
     Methods:
       - 'none': Keep raw values (>= 0)
       - 'log': np.log1p(x) -> log(1 + x)
-      - 'minmax': Log-transformation with Robust Quantile Scaling:
+      - 'minmax': Log-transformation with Robust Quantile Scaling to [0, 1]:
                   x_scaled = min(1.0, log(1 + x) / log(1 + q_99))
+                  (not classic min-max scaling; name kept for compatibility with existing outputs)
     """
     # Clamp negative noise cleanly to 0
     stab_track = np.maximum(0.0, stab_track)
@@ -381,7 +385,7 @@ def save_chunk(
 
     np.savez_compressed(
         chunk_file,
-        tracks=np.array([item["track"] for item in chunk_items], dtype=object),
+        tracks=to_object_array(item["track"] for item in chunk_items),
         target=target_arr,
         target_raw=target_raw_arr,
         ensembl_transcript_id=tx_arr,
@@ -394,6 +398,7 @@ def save_chunk(
         has_stab_rbp=np.array([item["has_stab_rbp"] for item in chunk_items], dtype=bool),
         has_destab_rbp=np.array([item["has_destab_rbp"] for item in chunk_items], dtype=bool),
         has_gtf=np.array([item["has_gtf"] for item in chunk_items], dtype=bool),
+        gtf_length_mismatch=np.array([item["gtf_length_mismatch"] for item in chunk_items], dtype=bool),
         normalization=str(normalization),
         stab_q99=np.float32(stab_q99) if stab_q99 is not None else np.nan,
         destab_q99=np.float32(destab_q99) if destab_q99 is not None else np.nan,
@@ -428,6 +433,7 @@ def merge_all_chunks(
     stab_flags = []
     destab_flags = []
     gtf_flags = []
+    gtf_mismatch_flags = []
 
     for cf in tqdm(chunk_files, desc="Merging chunks"):
         data = np.load(cf, allow_pickle=True)
@@ -441,10 +447,11 @@ def merge_all_chunks(
         stab_flags.extend(data["has_stab_rbp"])
         destab_flags.extend(data["has_destab_rbp"])
         gtf_flags.extend(data["has_gtf"])
+        gtf_mismatch_flags.extend(data["gtf_length_mismatch"])
 
     np.savez_compressed(
         output_file,
-        tracks=np.array(all_tracks, dtype=object),
+        tracks=to_object_array(all_tracks),
         target=np.array(targets, dtype=np.float32),
         target_raw=np.array(targets_raw, dtype=np.float32),
         ensembl_transcript_id=np.array(tx_ids),
@@ -457,6 +464,7 @@ def merge_all_chunks(
         has_stab_rbp=np.array(stab_flags, dtype=bool),
         has_destab_rbp=np.array(destab_flags, dtype=bool),
         has_gtf=np.array(gtf_flags, dtype=bool),
+        gtf_length_mismatch=np.array(gtf_mismatch_flags, dtype=bool),
         normalization=str(normalization),
         stab_q99=np.float32(stab_q99) if stab_q99 is not None else np.nan,
         destab_q99=np.float32(destab_q99) if destab_q99 is not None else np.nan,
@@ -474,6 +482,7 @@ def merge_all_chunks(
         "num_channels": 8,
         "channel_names": list(DEFAULT_CHANNEL_NAMES),
         "max_length": int(max_length),
+        "truncation": TRUNCATION_MODE,
         "total_transcripts": int(n),
         "unique_genes": int(len(set(genes))),
         "seq_len_min": int(min(lens)) if lens else 0,
@@ -489,6 +498,7 @@ def merge_all_chunks(
             "transcripts_with_stab": int(sum(stab_flags)),
             "transcripts_with_destab": int(sum(destab_flags)),
             "transcripts_in_gtf": int(sum(gtf_flags)),
+            "transcripts_gtf_length_mismatch": int(sum(gtf_mismatch_flags)),
         },
     }
     save_metadata(output_file, meta_dict)
@@ -498,6 +508,7 @@ def merge_all_chunks(
     print(f"Dataset:                               {dataset}")
     print(f"Total transcripts:                     {n}")
     print(f"Successfully mapped in GTF DB:         {sum(gtf_flags)} ({sum(gtf_flags)/n*100:.2f} %)")
+    print(f"GTF exon length mismatch:              {sum(gtf_mismatch_flags)} ({sum(gtf_mismatch_flags)/n*100:.2f} %) -> no eCLIP mapping")
     print(f"Transcripts with Stabilizer RBP peaks: {sum(stab_flags)} ({sum(stab_flags)/n*100:.2f} %)")
     print(f"Transcripts with Destabilizer peaks:   {sum(destab_flags)} ({sum(destab_flags)/n*100:.2f} %)")
     print(f"RBP Normalization:                     {normalization.upper()} (Global Scaling)")
@@ -574,7 +585,7 @@ def main():
         "--max_length",
         type=int,
         default=12288,
-        help="Maximum sequence length (default: 12288 bp)",
+        help="Maximum sequence length; longer transcripts keep their 3' end (default: 12288)",
     )
     parser.add_argument(
         "--recreate",
@@ -586,17 +597,19 @@ def main():
     if args.dataset == "mrna_bench" and not args.species:
         parser.error("--species ('human' or 'mouse') must be specified when --dataset is 'mrna_bench'!")
 
+    # All trans-factor references (GRCh38 GTF, ENCODE eCLIP peaks of curated RBPs) are human-only
+    if args.species == "mouse":
+        raise ValueError(
+            "[Error] generate_2_rbp_tracks.py supports only human data: GTF (GRCh38) and ENCODE eCLIP peaks "
+            "are human references. Use --species human or the 6-track archive for mouse."
+        )
+
     norm_method = args.normalization.lower()
     dataset_key = f"{args.dataset}_{args.species}" if args.species else args.dataset
-    dataset_dirs = {
-        "hipsc_cm": Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/8track_2rbp"),
-        "mrna_bench_human": Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus/8track_2rbp"),
-        "mrna_bench_mouse": Path("/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus/8track_2rbp"),
-    }
-    if dataset_key not in dataset_dirs:
-        raise ValueError(f"[Error] Unknown dataset key '{dataset_key}'! Supported: {list(dataset_dirs.keys())}")
+    if dataset_key not in DATASET_DIRS:
+        raise ValueError(f"[Error] Unknown dataset key '{dataset_key}'! Supported: {list(DATASET_DIRS.keys())}")
 
-    data_dir = dataset_dirs[dataset_key]
+    data_dir = DATASET_DIRS[dataset_key] / "orthrus" / "8track_2rbp"
     dataset_name = dataset_key
     norm_suffix = f"_{norm_method}" if norm_method != "none" else ""
     file_stem = f"hipsc_cm_8track_2rbp{norm_suffix}" if args.dataset == "hipsc_cm" else f"mrna_bench_{args.species}_8track_2rbp{norm_suffix}"
@@ -627,7 +640,32 @@ def main():
             except Exception as e:
                 print(f"[Warning] Could not delete {cf.name}: {e}")
         existing_chunks = []
-    else:
+        (chunks_dir / RUN_CONFIG_FILENAME).unlink(missing_ok=True)
+
+    # Existing chunks may only be resumed if they were generated with identical parameters
+    ensure_run_config(
+        chunks_dir,
+        {
+            "script": Path(__file__).name,
+            "dataset": dataset_key,
+            "normalization": norm_method,
+            "stab_q99": args.stab_q99,
+            "destab_q99": args.destab_q99,
+            "quantile": args.quantile,
+            "quantile_sample_size": args.quantile_sample_size,
+            "max_length": args.max_length,
+            "truncation": TRUNCATION_MODE,
+            "gtf_db": GTF_DB_PATH,
+            "stabilizers_bed": STABILIZERS_BED_PATH,
+            "destabilizers_bed": DESTABILIZERS_BED_PATH,
+            "peaks_without_score": "discarded",
+            "gtf_exon_length_check": True,
+        },
+        has_existing_state=bool(existing_chunks),
+        reset_hint="Please rerun with --recreate.",
+    )
+
+    if not args.recreate:
         for cf in existing_chunks:
             try:
                 c_data = np.load(cf, allow_pickle=True)
@@ -707,9 +745,8 @@ def main():
 
             six_track = row["track"]
             l = int(row["length"])
-            if l > args.max_length:
-                six_track = six_track[:args.max_length, :]
-                l = args.max_length
+            full_len = l  # untruncated length, used to validate the GTF exon structure
+            # All channels are built on the full transcript and truncated together after concatenation
 
             # Channel 6: Stabilizers RBP
             # Channel 7: Destabilizers RBP
@@ -720,7 +757,9 @@ def main():
             has_gtf = False
 
             tx_info = gtf_helper.get_transcript_exons(clean_tx)
-            if tx_info is not None:
+            # Exon structure must match the dataset sequence, otherwise peaks would be mapped to wrong positions
+            gtf_length_mismatch = tx_info is not None and tx_info["exon_length"] != full_len
+            if tx_info is not None and not gtf_length_mismatch:
                 has_gtf = True
                 chrom = str(tx_info["chrom"]).replace("chr", "")
                 strand = tx_info["strand"]
@@ -753,6 +792,12 @@ def main():
             # Concatenate to (L, 8)
             multi_track = np.concatenate([six_track, stab_track, destab_track], axis=1)
 
+            if l > args.max_length:
+                multi_track = truncate_to_max_length(multi_track, args.max_length)  # keeps the 3' end
+                l = args.max_length
+                has_stab_rbp = bool(np.any(multi_track[:, 6] > 0))
+                has_destab_rbp = bool(np.any(multi_track[:, 7] > 0))
+
             target_val = float(row["target"])
             target_raw_val = float(row["target_raw"])
             gene_name = str(row["gene"])
@@ -769,6 +814,7 @@ def main():
                 "has_stab_rbp": has_stab_rbp,
                 "has_destab_rbp": has_destab_rbp,
                 "has_gtf": has_gtf,
+                "gtf_length_mismatch": gtf_length_mismatch,
             })
             pbar.update(1)
 

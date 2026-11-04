@@ -2,7 +2,7 @@
 """
 Recursive Metrics Aggregator & Summary Table Generator for Orthrus Ridge Regression.
 
-Recursively scans a results directory (default: /beegfs/prj/RNA_NLP/FlorianMasterThesis/code/results/Orthrus)
+Recursively scans a results directory (default: $ORTHRUS_BASE/results/Orthrus)
 for files matching 'metrics_*.json' and compiles them into a structured comparison table where:
   - Rows: Regression metrics (CV Val, Test Holdout, Train CV-Pool, Overfitting Gap, Hyperparameters)
   - Columns: Datasets and Tracks (e.g. mrna_bench_human | 7track_m6a)
@@ -23,20 +23,17 @@ from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
 
+from util import RESULTS_DIR
+
 # Safe UTF-8 console output on Windows
 if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 
-DEFAULT_CLUSTER_RESULTS_DIR = Path(
-    "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/results/Orthrus"
-)
-
-
 def get_default_results_dir() -> Path:
     """Returns cluster default dir if it exists, otherwise falls back to local downloaded results."""
-    if DEFAULT_CLUSTER_RESULTS_DIR.exists():
-        return DEFAULT_CLUSTER_RESULTS_DIR
+    if RESULTS_DIR.exists():
+        return RESULTS_DIR
     
     # Try workspace relative path: downloaded_results/results/Orthrus
     repo_root = Path(__file__).resolve().parent.parent
@@ -49,7 +46,7 @@ def get_default_results_dir() -> Path:
     for cand in local_candidates:
         if cand.exists():
             return cand
-    return DEFAULT_CLUSTER_RESULTS_DIR
+    return RESULTS_DIR
 
 
 def extract_metadata_from_path_and_json(file_path: Path, data: dict) -> Tuple[str, str, str, str]:
@@ -127,6 +124,36 @@ def _get_val(d: dict, *keys: str, default: Any = None) -> Any:
         if k in d and d[k] is not None:
             return d[k]
     return default
+
+
+def format_float(val: Any, decimals: int = 4) -> str:
+    """Formats a float value or returns '-' if None/missing/invalid."""
+    if val is None or str(val).lower() == "none" or str(val) == "-":
+        return "-"
+    try:
+        f_val = float(val)
+        if np.isnan(f_val):
+            return "-"
+        return f"{f_val:.{decimals}f}"
+    except (ValueError, TypeError):
+        return "-"
+
+
+def format_pvalue(val: Any) -> str:
+    """Formats a p-value cleanly (e.g. 0.0 or 2.189e-27), returning '-' if missing."""
+    if val is None or str(val).lower() == "none" or str(val) == "-":
+        return "-"
+    try:
+        f_val = float(val)
+        if np.isnan(f_val):
+            return "-"
+        if f_val == 0.0:
+            return "0.0"
+        if f_val < 0.001:
+            return f"{f_val:.3e}"
+        return f"{f_val:.4f}"
+    except (ValueError, TypeError):
+        return "-"
 
 
 def collect_metrics_files(base_dir: Path, pattern: str = "metrics_*.json") -> List[Tuple[Path, dict]]:
@@ -220,6 +247,16 @@ def build_summary_dataframe(
             if _get_val(d, 'test_mae', 'mouse_test_mae') is not None else "-"
         )),
         
+        # Held-out Test Set - Raw Target (Raw Target / Target in Hours)
+        ("Test Raw Pearson r", lambda d: format_float(d.get("test_raw_pearson_r"))),
+        ("Test Raw Pearson p-value", lambda d: format_pvalue(d.get("test_raw_pearson_pvalue"))),
+        ("Test Raw Spearman ρ", lambda d: format_float(d.get("test_raw_spearman_rho"))),
+        ("Test Raw Spearman p-value", lambda d: format_pvalue(d.get("test_raw_spearman_pvalue"))),
+        ("Test Raw R²", lambda d: format_float(d.get("test_raw_r2"))),
+        ("Test Raw RMSE", lambda d: format_float(d.get("test_raw_rmse"))),
+        ("Test Raw MAE", lambda d: format_float(d.get("test_raw_mae"))),
+        ("Test Raw MSE", lambda d: format_float(d.get("test_raw_mse"))),
+        
         # Training / CV-Pool Set (Splits 0 - 7)
         ("Train Pearson r", lambda d: (
             f"{float(_get_val(d, 'train_cv_pool_pearson_r', 'train_pearson_r', 'human_train_pearson_r')):.4f}"
@@ -250,7 +287,7 @@ def build_summary_dataframe(
         )),
         
         # Hyperparameters & Sample sizes
-        ("Best Alpha", lambda d: f"{d['best_alpha']}" if "best_alpha" in d else "-"),
+        ("Best Alpha", lambda d: f"{d['best_alpha']:.4g}" if "best_alpha" in d else "-"),
         ("Samples (Train / Test)", lambda d: (
             f"{_get_val(d, 'cv_pool_size', 'train_size', 'train_size_human', default='-')} / {_get_val(d, 'test_size', 'test_size_mouse', default='-')}"
         )),
@@ -288,6 +325,14 @@ def build_summary_dataframe(
         "test_rmse",
         "test_mae",
         "test_r2",
+        "test_raw_pearson_r",
+        "test_raw_pearson_pvalue",
+        "test_raw_spearman_rho",
+        "test_raw_spearman_pvalue",
+        "test_raw_mse",
+        "test_raw_rmse",
+        "test_raw_mae",
+        "test_raw_r2",
         "best_alpha",
         "cv_pool_size",
         "test_size",
@@ -295,12 +340,20 @@ def build_summary_dataframe(
 
     raw_rows = {}
     for k in raw_metric_keys:
-        raw_rows[k] = {col: cols_data[col].get(k, np.nan) for col in sorted_cols}
+        raw_rows[k] = {
+            col: (
+                "-"
+                if cols_data[col].get(k) is None or (isinstance(cols_data[col].get(k), float) and np.isnan(cols_data[col].get(k)))
+                else cols_data[col].get(k)
+            )
+            for col in sorted_cols
+        }
 
     raw_df = pd.DataFrame(raw_rows).T
     raw_df.index.name = "Metric_Key"
 
     return summary_df, raw_df
+
 
 
 # =============================================================================

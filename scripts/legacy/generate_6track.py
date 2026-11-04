@@ -25,23 +25,13 @@ import pandas as pd
 from tqdm import tqdm
 
 from six_track_dataset import SixTrackDatasetLoader
-from util import save_metadata
+from util import save_metadata, ensure_run_config, to_object_array, RUN_CONFIG_FILENAME, TRUNCATION_MODE, truncate_to_max_length, DATASET_DIRS
 
 
 # =============================================================================
 # Default Cluster Output Paths
 # =============================================================================
-DEFAULT_OUTPUT_PATHS = {
-    "hipsc_cm": Path(
-        "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/hIPSC_CM/orthrus/6track/hipsc_cm_6tracks.npz"
-    ),
-    "mrna_bench_human": Path(
-        "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus/6track/mrna_bench_human_6tracks.npz"
-    ),
-    "mrna_bench_mouse": Path(
-        "/beegfs/prj/RNA_NLP/FlorianMasterThesis/code/data/mrna_bench/orthrus/6track/mrna_bench_mouse_6tracks.npz"
-    ),
-}
+DEFAULT_OUTPUT_PATHS = {key: d / "orthrus" / "6track" / f"{key}_6tracks.npz" for key, d in DATASET_DIRS.items()}
 
 DEFAULT_CHANNEL_NAMES = ["A", "C", "G", "U", "CDS", "Splice"]
 
@@ -59,7 +49,7 @@ def save_chunk(
     """Saves a batch of processed transcripts to a temporary chunk NPZ file."""
     chunk_file = chunks_dir / f"chunk_{chunk_idx:05d}.npz"
 
-    tracks_arr = np.array([item["track"] for item in chunk_items], dtype=object)
+    tracks_arr = to_object_array(item["track"] for item in chunk_items)
     targets_arr = np.array([item["target"] for item in chunk_items], dtype=np.float32)
     targets_raw_arr = np.array([item["target_raw"] for item in chunk_items], dtype=np.float32)
     tx_arr = np.array([item["ensembl_transcript_id"] for item in chunk_items])
@@ -116,7 +106,7 @@ def merge_all_chunks(
     output_file.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_file,
-        tracks=np.array(all_tracks, dtype=object),
+        tracks=to_object_array(all_tracks),
         target=np.array(targets, dtype=np.float32),
         target_raw=np.array(targets_raw, dtype=np.float32),
         ensembl_transcript_id=np.array(tx_ids),
@@ -140,6 +130,7 @@ def merge_all_chunks(
         "num_channels": 6,
         "channel_names": list(DEFAULT_CHANNEL_NAMES),
         "max_length": int(max_length),
+        "truncation": TRUNCATION_MODE,
         "total_transcripts": int(n),
         "unique_genes": int(len(set(genes))),
         "seq_len_min": int(min(lens)) if lens else 0,
@@ -198,7 +189,7 @@ def parse_args():
         "--max_length",
         type=int,
         default=12288,
-        help="Maximum sequence length (default: 12288 bp)",
+        help="Maximum sequence length; longer transcripts keep their 3' end (default: 12288)",
     )
     parser.add_argument(
         "--recreate",
@@ -246,7 +237,22 @@ def main():
             except Exception as e:
                 print(f"[Warning] Could not delete {cf.name}: {e}")
         existing_chunks = []
-    else:
+        (chunks_dir / RUN_CONFIG_FILENAME).unlink(missing_ok=True)
+
+    # Existing chunks may only be resumed if they were generated with identical parameters
+    ensure_run_config(
+        chunks_dir,
+        {
+            "script": Path(__file__).name,
+            "dataset": dataset_key,
+            "max_length": args.max_length,
+            "truncation": TRUNCATION_MODE,
+        },
+        has_existing_state=bool(existing_chunks),
+        reset_hint="Please rerun with --recreate.",
+    )
+
+    if not args.recreate:
         for cf in existing_chunks:
             try:
                 c_data = np.load(cf, allow_pickle=True)
@@ -279,7 +285,7 @@ def main():
             l = int(row["length"])
 
             if l > args.max_length:
-                six_track = six_track[:args.max_length, :]
+                six_track = truncate_to_max_length(six_track, args.max_length)  # keeps the 3' end
                 l = args.max_length
 
             target_val = float(row["target"])
