@@ -431,7 +431,7 @@ def restore_random_states(states: dict) -> None:
 
 
 def verify_remote_code_export(backbone_dir: Path):
-    """Fails if a module referenced in config.json 'auto_map' is missing as .py file in the exported backbone."""
+    """Fails if a local module referenced in config.json 'auto_map' is missing as .py file in the exported backbone."""
     cfg_file = backbone_dir / "config.json"
     if not cfg_file.exists():
         raise FileNotFoundError(f"[Error] Exported backbone has no config.json: {backbone_dir}")
@@ -441,8 +441,8 @@ def verify_remote_code_export(backbone_dir: Path):
     refs = []
     for ref in auto_map.values():
         refs.extend(ref if isinstance(ref, (list, tuple)) else [ref])
-    # References look like 'module.Class' or 'repo_id--module.Class'
-    modules = {str(r).split("--")[-1].rsplit(".", 1)[0] for r in refs if r}
+    # 'module.Class' must lie next to the weights; transformers loads 'repo_id--module.Class' from the Hugging Face repo
+    modules = {str(r).rsplit(".", 1)[0] for r in refs if r and "--" not in str(r)}
     missing = sorted(m for m in modules if not (backbone_dir / f"{m}.py").exists())
     if missing:
         raise FileNotFoundError(
