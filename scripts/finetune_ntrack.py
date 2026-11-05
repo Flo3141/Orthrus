@@ -21,7 +21,7 @@ Features:
 - Saves best checkpoint and exports fine-tuned backbone in Hugging Face format.
 - Records the resolved arguments of each fold in fold_k/run_config.json.
 
-The channel attribution analysis of the trained checkpoints lives in xai_analysis.py.
+The channel ablation analysis of the trained checkpoints lives in xai_analysis.py.
 
 Arguments can come from a YAML file whose keys are the argument names; the command line overrides it:
   python finetune_ntrack.py --config run.yaml --epochs 5
@@ -720,6 +720,8 @@ class TrackData:
     genes: np.ndarray
     tx_ids: np.ndarray
     sample_splits: np.ndarray
+    # 3' UTR start in the coordinates of the stored (truncated) track; -1 = no annotation, None = archive has no such fields
+    utr3_start: Optional[np.ndarray] = None
 
 
 def load_track_data(data_file: Path) -> TrackData:
@@ -769,6 +771,14 @@ def load_track_data(data_file: Path) -> TrackData:
     else:
         valid_mask &= np.array([len(t) > 0 for t in tracks])
 
+    # 3' UTR start relative to the stored track: the tracks keep the 3' end, so the cut-off 5' part has to be subtracted.
+    # utr3_start == 0 in the archive means "no annotation", not "starts at 0".
+    utr3_start = None
+    if {"utr3_start", "full_length", "seq_lens"} <= set(npz_data.files):
+        raw_start = npz_data["utr3_start"].astype(np.int64)
+        cut_off = npz_data["full_length"].astype(np.int64) - npz_data["seq_lens"].astype(np.int64)
+        utr3_start = np.where(raw_start > 0, np.maximum(raw_start - cut_off, 0), -1)
+
     # Clean invalid samples
     n_invalid = int(np.sum(~valid_mask))
     if n_invalid > 0:
@@ -777,6 +787,8 @@ def load_track_data(data_file: Path) -> TrackData:
         targets = targets[valid_mask]
         genes = genes[valid_mask]
         tx_ids = tx_ids[valid_mask]
+        if utr3_start is not None:
+            utr3_start = utr3_start[valid_mask]
 
     # Check and align channel dimensions
     data_channels = tracks[0].shape[1]
@@ -807,8 +819,10 @@ def load_track_data(data_file: Path) -> TrackData:
         genes = genes[matched_mask]
         tx_ids = tx_ids[matched_mask]
         sample_splits = sample_splits[matched_mask]
+        if utr3_start is not None:
+            utr3_start = utr3_start[matched_mask]
 
-    return TrackData(dataset_name, track_name, normalization, channel_names, tracks, targets, genes, tx_ids, sample_splits)
+    return TrackData(dataset_name, track_name, normalization, channel_names, tracks, targets, genes, tx_ids, sample_splits, utr3_start)
 
 
 def make_loader(data: TrackData, indices: np.ndarray, batch_size: int, max_length: int, shuffle: bool, device: torch.device) -> DataLoader:
