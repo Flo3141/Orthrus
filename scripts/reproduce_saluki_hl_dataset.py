@@ -18,7 +18,8 @@ Steps
                 via HTTP range requests, the full archive is 18.7 GB), Ensembl cDNA (v83 human, v90 mouse),
                 GENCODE annotation (v41 / vM31, as used by mRNABench) and, for the comparison, the Orthrus
                 npz files and the mRNABench parquet files.
-  2. target     genes with >= 10 (human) / >= 5 (mouse) measured samples; z-score per sample; number of
+  2. target     human: negate the five degradation-rate datasets (stored un-negated in all_HLs_human.txt.gz);
+                genes with >= 10 (human) / >= 5 (mouse) measured samples; z-score per sample; number of
                 components by GCV (missMDA::estim_ncpPCA); regularized iterative PCA imputation
                 (missMDA::imputePCA); quantile normalization (preprocessCore::normalize.quantiles);
                 human: drop the outlier study Gejman (Duan et al. 2013, 15 LCL samples); PC1 (prcomp).
@@ -73,6 +74,11 @@ SPECIES = {
         "min_samples": 10,
         "ncp_max": 20,
         "outlier_prefix": "Gejman_",
+        # Saluki methods: five datasets from four studies (refs. 29, 38, 42, 48) report degradation rates, "so their
+        # transformed half-life values were negated". all_HLs_human.txt.gz stores them NOT negated (Spearman with
+        # PC1 between -0.67 and -0.78); negating them reproduces the Saluki PC1 exactly.
+        "negate_samples": ["Bazzini_ActD_HeLa_1", "Bazzini_ActD_RPE_1", "Darnell_ActD_HepG2_1",
+                           "Akimitsu2_BrU4sU_HeLa_1", "Marks_ActD_HeLa_1"],
         "datapack_gtf": "datasets/human/Homo_sapiens.GRCh38.83.chosenTranscript.gtf",
         "datapack_feat": "datasets/human/all_HLs_human_featTable.txt.gz",
         "datapack_genes": "datasets/deeplearning/train_gru/f0_c0/data0/genes.tsv",
@@ -83,6 +89,7 @@ SPECIES = {
         "min_samples": 5,
         "ncp_max": 10,
         "outlier_prefix": None,
+        "negate_samples": [],
         "datapack_gtf": "datasets/mouse/Mus_musculus.GRCm3.90.chosenTranscript.gtf.gz",
         "datapack_feat": "datasets/mouse/all_HLs_mouse_featTable.txt.gz",
         "datapack_genes": "datasets/deeplearning/train_gru/f0_c0/data1/genes.tsv",
@@ -312,7 +319,7 @@ def first_pc(X):
     return scores, float(s[0] ** 2 / np.sum(s ** 2))
 
 
-def sample_metadata(columns, outlier_prefix):
+def sample_metadata(columns, outlier_prefix, negated=()):
     rows = []
     for c in columns:
         lab, method, cell, rep = (c.split("_", 3) + ["", "", "", ""])[:4]
@@ -321,14 +328,22 @@ def sample_metadata(columns, outlier_prefix):
             "cell_group": "LCL" if cell.startswith(LCL_PREFIX) else cell,  # as in Saluki Fig1_S1.R
             "replicate": rep,
             "used_for_pc1": not (outlier_prefix and c.startswith(outlier_prefix)),
+            "negated_rate_dataset": c in negated,
         })
     return pd.DataFrame(rows)
 
 
 def compute_target(hl, cfg, args, report, sp):
     """Saluki PC1 for all genes passing the sample filter."""
-    values = hl.drop(columns="external_gene_name")
-    meta = sample_metadata(values.columns, cfg["outlier_prefix"])
+    values = hl.drop(columns="external_gene_name").copy()
+    neg = [c for c in cfg["negate_samples"] if not args.no_negate]
+    values[neg] = -values[neg]  # degradation rates -> half-life orientation (see SPECIES)
+    meta = sample_metadata(values.columns, cfg["outlier_prefix"], neg)
+    report["negated_samples"] = neg
+    rho = values.rank().corrwith(values.mean(1).rank())
+    report["samples_anticorrelated_with_mean"] = rho[rho < 0].round(3).to_dict()
+    if (rho < 0).any():
+        log(f"  [Warning] samples anti-correlated with the mean half-life: {rho[rho < 0].round(2).to_dict()}")
     n_meas = values.notna().sum(1)
     M = values[n_meas >= cfg["min_samples"]]
     report["n_genes_matrix"] = int(len(values))
@@ -733,7 +748,8 @@ def write_markdown(reports, path):
                   f"| ohne GENCODE-Namen | {r['names']['without_gencode_name']} |",
                   f"| Ausgabe | {r['n_rows_output']} |", "",
                   f"PCA: ncp={p['ncp']}, {p['n_samples_pc1']} Proben, PC1 erklärt {p['pc1_variance_explained']:.3f}; "
-                  f"imputePCA konvergiert: {p['impute_converged']}.", "",
+                  f"imputePCA konvergiert: {p['impute_converged']}. "
+                  f"Negierte Abbauraten-Datensätze: {', '.join(r['negated_samples']) or 'keine'}.", "",
                   f"PC1 gegen Saluki-featTable: r={r['pc1_vs_saluki']['pearson']:.6f}, "
                   f"max. Abweichung {r['pc1_vs_saluki']['max_abs_diff']:.4f}.", "",
                   f"Ziel gegen Saluki genes.tsv: r={r['target_vs_saluki_genes_tsv']['pearson']:.6f}, "
@@ -762,6 +778,8 @@ def parse_args(argv=None):
                          "last 12,288 nt; none: full length")
     ap.add_argument("--splice_track", default="orthrus", choices=["orthrus", "exon_end"])
     ap.add_argument("--keep_unnamed", action="store_true", help="keep rows without GENCODE gene name")
+    ap.add_argument("--no_negate", action="store_true",
+                    help="do not negate the five human degradation-rate datasets (deviates from Saluki)")
     ap.add_argument("--datapack_zip", default=None, help="local copy of the Saluki datasets.zip (optional)")
     ap.add_argument("--skip_compare", action="store_true", help="skip the comparison with Orthrus/mRNABench")
     ap.add_argument("--download_only", action="store_true",
