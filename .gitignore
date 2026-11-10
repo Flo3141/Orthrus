@@ -9,5 +9,6 @@ slurm/slurm_out
 __pycache__
 *.pdf
 *.sh
+*.md
 review
 docs
