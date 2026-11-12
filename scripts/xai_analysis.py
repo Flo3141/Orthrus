@@ -20,9 +20,9 @@ Outputs:
 - <run_dir>/xai_aggregated.{json,png,pdf}: mean and standard deviation across folds (ablation, more than one fold)
 - <run_dir>/fold_k/drach_summary.json, drach_predictions.csv, drach_effects.{png,pdf}, drach_scatter.{png,pdf}  (drach)
 - <run_dir>/drach_aggregated.{json,png,pdf}: mean and standard deviation across folds (drach, more than one fold)
-- <run_dir>/fold_k/drach_shift_summary.json, drach_shift_predictions.csv, drach_shift_effects.{png,pdf},
+- <run_dir>/fold_k/drach_shift/drach_shift_summary.json, drach_shift_predictions.csv, drach_shift_effects.{png,pdf},
   drach_shift_scatter.{png,pdf}  (drach_shift)
-- <run_dir>/drach_shift_aggregated.{json,png,pdf}: mean and standard deviation across folds (drach_shift, more than one fold)
+- <run_dir>/drach_shift/drach_shift_aggregated.{json,png,pdf}: mean and standard deviation across folds (drach_shift, more than one fold)
 
 Usage:
   python xai_analysis.py --data_path <tracks.npz>
@@ -173,7 +173,7 @@ def analyze_fold(
     """
     Runs the requested analyses for one fold with a single loaded model. Returns {"ablation": ..., "motif": ...,
     "shift": ...} with the summaries of the analyses that ran. The ablation writes xai_channel_summary.{json,png,pdf}
-    into fold_dir, the motif analysis drach_summary.json, the shift analysis drach_shift_summary.json and their plots.
+    into fold_dir, the motif analysis drach_summary.json and its plots, the shift analysis everything into fold_dir/drach_shift/.
     """
     channel_names = data.channel_names
     model, best_epoch, ckpt_path = load_fold_model(fold_dir, channel_names, device)

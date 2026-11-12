@@ -50,6 +50,8 @@ from finetune_ntrack import TrackData
 
 
 FILE_PREFIX = "drach_shift"
+# All outputs go into this subdirectory of fold_k/ and of the run directory, so they do not mix with the other analyses
+OUTPUT_SUBDIR = "drach_shift"
 EFFECT_YLABEL = "Effect: prediction(A shifted) - prediction(control swapped)"
 
 
@@ -123,10 +125,12 @@ def run_shift_analysis(
 ) -> dict:
     """
     Runs the DRACH shift for one fold on the given test samples and writes drach_shift_summary.json,
-    drach_shift_predictions.csv and the plots into fold_dir. Returns the summary.
+    drach_shift_predictions.csv and the plots into fold_dir/drach_shift/. Returns the summary.
     """
     model.eval()
     rng = np.random.default_rng(BOOTSTRAP_SEED)
+    out_dir = fold_dir / OUTPUT_SUBDIR
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     inputs = prepare_utr3_inputs(data, test_idx, max_length)
     n_analyzed = len(inputs.tracks)
@@ -194,12 +198,12 @@ def run_shift_analysis(
         "directions": directions,
         "agreement_between_directions": substitution_agreement(tables),
     }
-    with open(fold_dir / f"{FILE_PREFIX}_summary.json", "w") as f:
+    with open(out_dir / f"{FILE_PREFIX}_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
     if rows:
         pd.concat(rows).drop(columns="group").rename(columns={"pred_base": "pred_wt", "pred_motif": "pred_shifted"}) \
-            .to_csv(fold_dir / f"{FILE_PREFIX}_predictions.csv", index=False)
-    print(f"[Shift] Saved shift summary to: {fold_dir / f'{FILE_PREFIX}_summary.json'}")
+            .to_csv(out_dir / f"{FILE_PREFIX}_predictions.csv", index=False)
+    print(f"[Shift] Saved shift summary to: {out_dir / f'{FILE_PREFIX}_summary.json'}")
 
     analyzed = [s for s in shifts if directions[s.name]["n_transcripts"] > 0]
     if analyzed:
@@ -210,11 +214,11 @@ def run_shift_analysis(
         plot_motif_effects(
             [s.label.replace(": ", "\n") for s in analyzed], {DRACH.name: (means, lower, upper)}, ylabel=EFFECT_YLABEL,
             title=f"{fold_dir.name}: group mean, 95 % bootstrap CI",
-            output_png=fold_dir / f"{FILE_PREFIX}_effects.png",
+            output_png=out_dir / f"{FILE_PREFIX}_effects.png",
         )
         plot_prediction_scatter(
             scatter_data, {s.label: directions[s.name] for s in analyzed},
-            f"{fold_dir.name}: WT against shifted prediction", fold_dir / f"{FILE_PREFIX}_scatter.png",
+            f"{fold_dir.name}: WT against shifted prediction", out_dir / f"{FILE_PREFIX}_scatter.png",
             variant_labels=("A shifted", "control swapped"),
         )
     return summary
@@ -224,11 +228,14 @@ def aggregate_shift_folds(fold_summaries: dict, run_dir: Path, title: str) -> di
     """
     Mean and standard deviation (np.std) of the per-fold results. All folds share one test set, so the spread shows
     the sensitivity to the fold and is not a confidence interval; the intervals are in the per-fold summaries.
+    Writes drach_shift_aggregated.{json,png,pdf} into run_dir/drach_shift/.
     """
     def stats(values: list) -> Optional[dict]:
         values = [v for v in values if v is not None]
         return {"mean": float(np.mean(values)), "std": float(np.std(values)), "per_fold": values} if values else None
 
+    out_dir = run_dir / OUTPUT_SUBDIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     folds = sorted(fold_summaries)
     aggregated = {"folds": folds, "motif": DRACH.name, "directions": {}}
     for name, entry in fold_summaries[folds[0]]["directions"].items():
@@ -247,7 +254,7 @@ def aggregate_shift_folds(fold_summaries: dict, run_dir: Path, title: str) -> di
             "pearson_r_target_control": stats([d["pearson_r_with_measured_target"]["control"] for d in per_fold]),
         }
 
-    out = run_dir / f"{FILE_PREFIX}_aggregated.json"
+    out = out_dir / f"{FILE_PREFIX}_aggregated.json"
     with open(out, "w") as f:
         json.dump(aggregated, f, indent=2)
     print(f"[Shift] Saved aggregated shift report across folds to: {out}")
@@ -259,6 +266,6 @@ def aggregate_shift_folds(fold_summaries: dict, run_dir: Path, title: str) -> di
             [e["label"].replace(": ", "\n") for e in entries],
             {DRACH.name: ([e["mean"] for e in effects], [e["std"] for e in effects], [e["std"] for e in effects])},
             ylabel=EFFECT_YLABEL, title=f"{title}: mean ± std over {len(folds)} folds",
-            output_png=run_dir / f"{FILE_PREFIX}_aggregated.png",
+            output_png=out_dir / f"{FILE_PREFIX}_aggregated.png",
         )
     return aggregated
