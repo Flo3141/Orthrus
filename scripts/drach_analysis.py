@@ -45,6 +45,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# Motif definitions live in drach_motifs.py (no model dependencies), shared with the shift analysis and the Saluki files
+from drach_motifs import MOTIFS, Motif
 from finetune_ntrack import BucketBatchSampler, MultiTrackDataset, TrackData, pad_collate_fn, predict
 from util import SPLITS_LOOKUP_TABLES, truncate_to_max_length
 
@@ -70,26 +72,6 @@ def substitution_label(base: str) -> str:
 # =============================================================================
 # 1. Motifs, sequence and perturbations
 # =============================================================================
-
-@dataclass(frozen=True)
-class Motif:
-    name: str
-    pattern: str
-    length: int
-    mutated_offset: int               # position of the A that is replaced within the pattern
-    control_next_base: Optional[str]  # base that has to follow a control A; None = any
-
-    def sites(self, seq: str, utr3_start: int) -> list:
-        """Start positions of all (also overlapping) sites that begin in the 3' UTR."""
-        return [m.start() for m in re.finditer(f"(?={self.pattern})", seq) if m.start() >= utr3_start]
-
-
-MOTIFS = (
-    Motif("DRACH", "[AGU][AG]AC[ACU]", length=5, mutated_offset=2, control_next_base="C"),
-    Motif("AUUUA", "AUUUA", length=5, mutated_offset=0, control_next_base="U"),
-    Motif("UGUANAUA", "UGUA[ACGU]AUA", length=8, mutated_offset=3, control_next_base=None),
-)
-
 
 def decode_sequence(track: np.ndarray) -> str:
     """One-hot base channels to a string; positions without any base become N (argmax would silently give A)."""
@@ -211,6 +193,17 @@ def predict_tracks(model: nn.Module, tracks: list, tx_ids: np.ndarray, device: t
     return result
 
 
+def check_batch_invariance(model: nn.Module, tracks: list, tx_ids: np.ndarray, base: np.ndarray, device: torch.device, batch_size: int, max_length: int) -> float:
+    """Largest difference between `base` (predicted with batch_size) and batch size 1 on up to INVARIANCE_CHECK_SIZE transcripts."""
+    check_idx = np.unique(np.linspace(0, len(tracks) - 1, min(INVARIANCE_CHECK_SIZE, len(tracks))).astype(int))
+    single = predict_tracks(model, [tracks[k] for k in check_idx], tx_ids[check_idx], device, 1, max_length)
+    diff = float(np.max(np.abs(single - base[check_idx])))
+    print(f"[Check] Largest difference between batch size {batch_size} and 1: {diff:.2e} ({len(check_idx)} transcripts)")
+    if diff > MAX_INVARIANCE_DIFF:
+        print(f"[Warning] Difference above {MAX_INVARIANCE_DIFF:.0e}: the predictions depend on the batch composition, effects of this size are noise.")
+    return diff
+
+
 def load_homology_groups(dataset_key: str, tx_ids: np.ndarray) -> np.ndarray:
     """
     Homology group of each transcript from the split lookup table. Isoforms of one gene (and homologous genes)
@@ -229,6 +222,50 @@ def load_homology_groups(dataset_key: str, tx_ids: np.ndarray) -> np.ndarray:
         group = mapping.get(str(tx).strip())
         groups.append(f"tx:{tx}" if group is None or pd.isna(group) else f"hg:{group}")
     return np.array(groups)
+
+
+@dataclass
+class Utr3Inputs:
+    """Test transcripts with an annotated 3' UTR. Tracks are truncated to max_length, `utr3` refers to the truncated track."""
+    n_test: int
+    n_unannotated: int
+    tracks: list
+    seqs: list
+    utr3: list
+    tx_ids: np.ndarray
+    genes: np.ndarray
+    groups: np.ndarray
+    targets: np.ndarray
+    n_without_base: int
+
+
+def prepare_utr3_inputs(data: TrackData, test_idx: np.ndarray, max_length: int) -> Utr3Inputs:
+    """Selects the test transcripts with an annotated 3' UTR, truncates them like the dataset and decodes the sequences."""
+    if data.utr3_start is None:
+        raise ValueError("[Error] The track archive has no 'utr3_start', 'full_length' and 'seq_lens' fields; the 3' UTR cannot be located.")
+
+    # Only transcripts with an annotated 3' UTR; positions refer to the track after truncation to max_length
+    annotated = np.array([i for i in test_idx if data.utr3_start[i] >= 0], dtype=np.int64)
+    if len(annotated) == 0:
+        raise ValueError("[Error] No test transcript has an annotated 3' UTR (utr3_start == 0 means no annotation).")
+
+    tracks, seqs, utr3 = [], [], []
+    for i in annotated:
+        track = truncate_to_max_length(data.tracks[i], max_length)
+        cut = len(data.tracks[i]) - len(track)
+        tracks.append(track)
+        seqs.append(decode_sequence(track))
+        utr3.append(max(int(data.utr3_start[i]) - cut, 0))
+    n_without_base = int(sum(s.count("N") for s in seqs))
+    if n_without_base > 0:
+        print(f"[Warning] {n_without_base} positions without any base channel (decoded as N) in the analyzed transcripts.")
+
+    tx_ids = data.tx_ids[annotated]
+    return Utr3Inputs(
+        n_test=int(len(test_idx)), n_unannotated=int(len(test_idx) - len(annotated)),
+        tracks=tracks, seqs=seqs, utr3=utr3, tx_ids=tx_ids, genes=data.genes[annotated],
+        groups=load_homology_groups(data.dataset_name, tx_ids), targets=data.targets[annotated], n_without_base=n_without_base,
+    )
 
 
 # =============================================================================
@@ -371,7 +408,7 @@ def plot_motif_effects(motif_names: list, series: dict, ylabel: str, title: str,
     print(f"[DRACH] Saved plot to: {output_png} and {output_png.with_suffix('.pdf')}")
 
 
-def plot_prediction_scatter(variants: dict, summaries: dict, title: str, output_png: Path):
+def plot_prediction_scatter(variants: dict, summaries: dict, title: str, output_png: Path, variant_labels: tuple = ("motif mutated", "control mutated")):
     """Row per motif: original prediction against the prediction with mutated motif (left) and mutated control (right)."""
     names = list(variants)
     fig, axes = plt.subplots(len(names), 2, figsize=(9, 4.2 * len(names)), squeeze=False)
@@ -379,7 +416,7 @@ def plot_prediction_scatter(variants: dict, summaries: dict, title: str, output_
         base, motif_pred, control_pred = variants[name]
         lo, hi = float(min(base.min(), motif_pred.min(), control_pred.min())), float(max(base.max(), motif_pred.max(), control_pred.max()))
         corr = summaries[name]["correlation_of_predictions"]
-        for col, (label, mutated, key) in enumerate((("motif mutated", motif_pred, "base_vs_motif"), ("control mutated", control_pred, "base_vs_control"))):
+        for col, (label, mutated, key) in enumerate(((variant_labels[0], motif_pred, "base_vs_motif"), (variant_labels[1], control_pred, "base_vs_control"))):
             ax = axes[row, col]
             ax.scatter(base, mutated, s=6, alpha=0.4, color=BAR_COLORS[0], linewidths=0, rasterized=True)
             ax.plot([lo, hi], [lo, hi], color="#666666", linewidth=0.8)
@@ -415,45 +452,20 @@ def run_motif_analysis(
     Runs the motif perturbation for one fold on the given test samples and writes drach_summary.json,
     drach_predictions.csv and the plots into fold_dir. Returns the summary.
     """
-    if data.utr3_start is None:
-        raise ValueError("[Error] The track archive has no 'utr3_start', 'full_length' and 'seq_lens' fields; the 3' UTR cannot be located.")
-
     model.eval()
     rng = np.random.default_rng(BOOTSTRAP_SEED)
 
-    # Only transcripts with an annotated 3' UTR; positions refer to the track after truncation to max_length
-    annotated = np.array([i for i in test_idx if data.utr3_start[i] >= 0], dtype=np.int64)
-    n_unannotated = int(len(test_idx) - len(annotated))
-    if len(annotated) == 0:
-        raise ValueError("[Error] No test transcript has an annotated 3' UTR (utr3_start == 0 means no annotation).")
-
-    tracks, seqs, utr3 = [], [], []
-    for i in annotated:
-        track = truncate_to_max_length(data.tracks[i], max_length)
-        cut = len(data.tracks[i]) - len(track)
-        tracks.append(track)
-        seqs.append(decode_sequence(track))
-        utr3.append(max(int(data.utr3_start[i]) - cut, 0))
-    n_without_base = int(sum(s.count("N") for s in seqs))
-    if n_without_base > 0:
-        print(f"[Warning] {n_without_base} positions without any base channel (decoded as N) in the analyzed transcripts.")
-
-    tx_ids = data.tx_ids[annotated]
-    genes = data.genes[annotated]
-    groups = load_homology_groups(data.dataset_name, tx_ids)
-    targets = data.targets[annotated]
-    print(f"[DRACH] {len(annotated)} of {len(test_idx)} test transcripts have an annotated 3' UTR, {len(np.unique(groups))} homology groups. "
+    inputs = prepare_utr3_inputs(data, test_idx, max_length)
+    tracks, seqs, utr3 = inputs.tracks, inputs.seqs, inputs.utr3
+    tx_ids, genes, groups, targets = inputs.tx_ids, inputs.genes, inputs.groups, inputs.targets
+    n_analyzed = len(tracks)
+    print(f"[DRACH] {n_analyzed} of {inputs.n_test} test transcripts have an annotated 3' UTR, {len(np.unique(groups))} homology groups. "
           f"Precision: float32, substitutions: {[substitution_label(b) for b in substitutions]}")
 
     base = predict_tracks(model, tracks, tx_ids, device, batch_size, max_length)
 
     # The result must not depend on how the batches are put together
-    check_idx = np.unique(np.linspace(0, len(annotated) - 1, min(INVARIANCE_CHECK_SIZE, len(annotated))).astype(int))
-    single = predict_tracks(model, [tracks[k] for k in check_idx], tx_ids[check_idx], device, 1, max_length)
-    invariance_diff = float(np.max(np.abs(single - base[check_idx])))
-    print(f"[Check] Largest difference between batch size {batch_size} and 1: {invariance_diff:.2e} ({len(check_idx)} transcripts)")
-    if invariance_diff > MAX_INVARIANCE_DIFF:
-        print(f"[Warning] Difference above {MAX_INVARIANCE_DIFF:.0e}: the predictions depend on the batch composition, effects of this size are noise.")
+    invariance_diff = check_batch_invariance(model, tracks, tx_ids, base, device, batch_size, max_length)
 
     motif_summaries = {}
     scatter_data = {b: {} for b in substitutions}   # substitution -> motif -> (base, motif, control)
@@ -464,7 +476,7 @@ def run_motif_analysis(
             label = substitution_label(sub)
             exclusions = {"no_site": 0, "no_safe_site": 0, "not_enough_controls": 0}
             included, perturbations = [], []
-            for k in tqdm(range(len(annotated)), desc=f"[DRACH] Planning {motif.name} {label}"):
+            for k in tqdm(range(n_analyzed), desc=f"[DRACH] Planning {motif.name} {label}"):
                 perturbation, reason = build_perturbation(seqs[k], utr3[k], motif, sub)
                 if perturbation is None:
                     exclusions[reason] += 1
@@ -504,9 +516,9 @@ def run_motif_analysis(
         "batch_size": batch_size,
         "max_length": max_length,
         "n_test_transcripts": int(len(test_idx)),
-        "n_without_utr3_annotation": n_unannotated,
-        "n_analyzed_transcripts": int(len(annotated)),
-        "positions_without_base": n_without_base,
+        "n_without_utr3_annotation": inputs.n_unannotated,
+        "n_analyzed_transcripts": n_analyzed,
+        "positions_without_base": inputs.n_without_base,
         "batch_invariance_max_abs_diff": invariance_diff,
         "motifs": motif_summaries,
     }

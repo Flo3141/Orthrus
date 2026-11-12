@@ -11,15 +11,23 @@ The drop in Pearson r shows how much the model relies on that channel.
 --analyses drach: motif perturbation (DRACH, AUUUA, UGUANAUA) in float32, see drach_analysis.py. Compares the
 predicted half-lives with mutated motifs and with mutated control positions to the original predictions.
 
+--analyses drach_shift: the central A of every DRACH site in the 3' UTR is moved one position to the left and to the
+right (swap with the neighbouring base) in float32, see drach_shift_analysis.py. Compares WT, both shifts and swapped
+control dinucleotides.
+
 Outputs:
 - <run_dir>/fold_k/xai_channel_summary.{json,png,pdf}                (ablation)
 - <run_dir>/xai_aggregated.{json,png,pdf}: mean and standard deviation across folds (ablation, more than one fold)
 - <run_dir>/fold_k/drach_summary.json, drach_predictions.csv, drach_effects.{png,pdf}, drach_scatter.{png,pdf}  (drach)
 - <run_dir>/drach_aggregated.{json,png,pdf}: mean and standard deviation across folds (drach, more than one fold)
+- <run_dir>/fold_k/drach_shift_summary.json, drach_shift_predictions.csv, drach_shift_effects.{png,pdf},
+  drach_shift_scatter.{png,pdf}  (drach_shift)
+- <run_dir>/drach_shift_aggregated.{json,png,pdf}: mean and standard deviation across folds (drach_shift, more than one fold)
 
 Usage:
   python xai_analysis.py --data_path <tracks.npz>
   python xai_analysis.py --data_path <tracks.npz> --analyses ablation drach
+  python xai_analysis.py --data_path <tracks.npz> --analyses drach_shift
   python xai_analysis.py --data_path <tracks.npz> --fold 0
   python xai_analysis.py --data_path <tracks.npz> --run_name lr_test
   python xai_analysis.py --data_path <tracks.npz> --checkpoint_dir /path/to/run_dir
@@ -163,9 +171,9 @@ def analyze_fold(
     args: argparse.Namespace,
 ) -> dict:
     """
-    Runs the requested analyses for one fold with a single loaded model. Returns {"ablation": ..., "motif": ...}
-    with the summaries of the analyses that ran. The ablation writes xai_channel_summary.{json,png,pdf} into
-    fold_dir, the motif analysis drach_summary.json and its plots.
+    Runs the requested analyses for one fold with a single loaded model. Returns {"ablation": ..., "motif": ...,
+    "shift": ...} with the summaries of the analyses that ran. The ablation writes xai_channel_summary.{json,png,pdf}
+    into fold_dir, the motif analysis drach_summary.json, the shift analysis drach_shift_summary.json and their plots.
     """
     channel_names = data.channel_names
     model, best_epoch, ckpt_path = load_fold_model(fold_dir, channel_names, device)
@@ -213,6 +221,14 @@ def analyze_fold(
             substitutions=tuple(args.drach_substitutions),
         )
 
+    if "drach_shift" in analyses:
+        from drach_shift_analysis import SHIFTS, run_shift_analysis
+        results["shift"] = run_shift_analysis(
+            model, data, test_idx, fold_dir, device,
+            batch_size=args.drach_batch_size or args.batch_size, max_length=args.max_length,
+            shifts=tuple(s for s in SHIFTS if s.name in args.shift_directions),
+        )
+
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -253,12 +269,16 @@ def main():
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size (default: 16)")
     parser.add_argument("--max_length", type=int, default=12288, help="Maximum sequence length; longer transcripts keep their 3' end (default: 12288)")
     parser.add_argument(
-        "--analyses", nargs="+", default=["ablation"], choices=["ablation", "drach"],
-        help="Analyses to run (default: ablation). 'drach' is the motif perturbation.",
+        "--analyses", nargs="+", default=["ablation"], choices=["ablation", "drach", "drach_shift"],
+        help="Analyses to run (default: ablation). 'drach' is the motif perturbation, 'drach_shift' moves the central A of DRACH by one position.",
     )
     parser.add_argument(
         "--drach_batch_size", type=int, default=None,
-        help="Batch size of the float32 motif analysis (default: --batch_size). Needs about 6.6 GB for 16 x 12288 nt, so use 4 to 8 on 8 GB of VRAM",
+        help="Batch size of the float32 motif and shift analyses (default: --batch_size). Needs about 6.6 GB for 16 x 12288 nt, so use 4 to 8 on 8 GB of VRAM",
+    )
+    parser.add_argument(
+        "--shift_directions", nargs="+", default=["left", "right"], choices=["left", "right"],
+        help="Directions of the DRACH shift analysis (default: left right)",
     )
     parser.add_argument(
         "--drach_substitutions", nargs="+", default=["G", "C", "U"], choices=["G", "C", "U"],
@@ -296,6 +316,10 @@ def main():
     if len(folds) > 1 and "drach" in analyses:
         from drach_analysis import aggregate_motif_folds
         aggregate_motif_folds({k: r["motif"] for k, r in fold_results.items()}, run_dir, f"{data.track_name}")
+
+    if len(folds) > 1 and "drach_shift" in analyses:
+        from drach_shift_analysis import aggregate_shift_folds
+        aggregate_shift_folds({k: r["shift"] for k, r in fold_results.items()}, run_dir, f"{data.track_name}")
 
     if len(folds) > 1 and "ablation" in analyses:
         fold_summaries = {k: r["ablation"] for k, r in fold_results.items()}
